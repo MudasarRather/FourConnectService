@@ -5,6 +5,8 @@ from app.database import get_db
 from app.utils.dependencies import get_current_active_user
 from app.models.user import User
 from app.models.drive_document import DriveDocument, DriveActivity, DriveFolder
+from app.models.notification import Notification
+from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone
 import uuid
@@ -19,7 +21,60 @@ STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
 
-# ─── HELPER ───
+# ─── HELPERS ───
+def _apply_access_filter(query, current_user):
+    """Restrict a DriveDocument query to rows the current user is allowed to see.
+
+    Rules:
+      - Superusers see everything.
+      - The uploader always sees their own document (any status).
+      - Everyone else sees a doc only if it's reachable via Organization,
+        explicit share, or matching Department — AND its status is NOT
+        'Pending Approval'. Pending docs stay hidden from share recipients
+        until an admin approves.
+    """
+    if getattr(current_user, 'is_superuser', False):
+        return query
+    return query.filter(
+        or_(
+            DriveDocument.uploaded_by == current_user.id,
+            and_(
+                DriveDocument.status != 'Pending Approval',
+                or_(
+                    DriveDocument.access_level == 'Organization',
+                    cast(DriveDocument.shared_with, String).contains(str(current_user.id)),
+                    and_(
+                        DriveDocument.access_level == 'Department',
+                        DriveDocument.department == current_user.department,
+                    ),
+                ),
+            ),
+        )
+    )
+
+
+def _drive_action_url(is_admin: bool = False) -> str:
+    """Where the bell click sends the recipient. Admin-target notifications point to the
+    admin portal; user-target notifications point to the user portal."""
+    return "/admin/documents/document-drive" if is_admin else "/user/documents/document-drive"
+
+
+def _notify(db: Session, user_id, type_: str, title: str, message: str, action_url: str):
+    """Append a Notification row. Caller is responsible for db.commit()."""
+    db.add(Notification(
+        user_id=user_id,
+        type=type_,
+        title=title,
+        message=message,
+        action_url=action_url,
+    ))
+
+
+def _admin_recipient_ids(db: Session) -> List:
+    """All active superuser ids — recipients for 'pending approval' notifications."""
+    return [u.id for u in db.query(User).filter(User.is_superuser == True, User.is_active == True).all()]
+
+
 def log_activity(db: Session, doc_id, user_id, user_name, action, details=None):
     activity = DriveActivity(
         document_id=doc_id,
@@ -38,26 +93,39 @@ def get_drive_stats(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get dashboard stats for document drive"""
-    base = db.query(DriveDocument).filter(DriveDocument.is_deleted == False)
-    
-    total = base.count()
-    total_size = db.query(func.sum(DriveDocument.file_size)).filter(DriveDocument.is_deleted == False).scalar() or 0
-    favorites = base.filter(DriveDocument.is_favorite == True).count()
-    shared = base.filter(DriveDocument.shared_with != None, DriveDocument.shared_with != '[]').count()
-    
+    """Get dashboard stats for document drive — scoped to documents the user can see."""
+    def _scoped():
+        return _apply_access_filter(
+            db.query(DriveDocument).filter(DriveDocument.is_deleted == False),
+            current_user,
+        )
+
+    total = _scoped().count()
+    total_size = _scoped().with_entities(func.sum(DriveDocument.file_size)).scalar() or 0
+    favorites = _scoped().filter(DriveDocument.is_favorite == True).count()
+    shared = _scoped().filter(
+        DriveDocument.shared_with != None, DriveDocument.shared_with != '[]'
+    ).count()
+
     # Category breakdown
-    categories = db.query(
+    categories = _scoped().with_entities(
         DriveDocument.category, func.count(DriveDocument.id)
-    ).filter(DriveDocument.is_deleted == False).group_by(DriveDocument.category).all()
-    
+    ).group_by(DriveDocument.category).all()
+
     # File type breakdown
-    type_stats = db.query(
+    type_stats = _scoped().with_entities(
         DriveDocument.file_type, func.count(DriveDocument.id), func.sum(DriveDocument.file_size)
-    ).filter(DriveDocument.is_deleted == False).group_by(DriveDocument.file_type).all()
-    
-    # Recent activity (last 10)
-    recent_activity = db.query(DriveActivity).order_by(desc(DriveActivity.created_at)).limit(10).all()
+    ).group_by(DriveDocument.file_type).all()
+
+    # Recent activity (last 10) — limited to documents the user can see
+    visible_doc_ids = _scoped().with_entities(DriveDocument.id).subquery()
+    recent_activity = (
+        db.query(DriveActivity)
+        .filter(DriveActivity.document_id.in_(db.query(visible_doc_ids)))
+        .order_by(desc(DriveActivity.created_at))
+        .limit(10)
+        .all()
+    )
     
     return {
         "total_documents": total,
@@ -111,9 +179,31 @@ async def upload_document(
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in allowed_extensions:
         raise HTTPException(status_code=400, detail=f"File type {ext} not allowed.")
-    
+
+    # Mandatory metadata
+    allowed_categories = {'Finance', 'Legal', 'Compliance', 'HR', 'Project', 'Other'}
+    allowed_access_levels = {'Private', 'User', 'Organization'}
+
+    if not category or category not in allowed_categories:
+        raise HTTPException(
+            status_code=400,
+            detail="Category is required and must be one of: " + ", ".join(sorted(allowed_categories)),
+        )
+    if not access_level or access_level not in allowed_access_levels:
+        raise HTTPException(
+            status_code=400,
+            detail="Access level is required and must be one of: Private, User, Organization",
+        )
+    if access_level == 'User':
+        shared_list_check = [s.strip() for s in (shared_with or '').split(',') if s.strip()]
+        if not shared_list_check:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one user must be selected when access level is 'User'.",
+            )
+
     file_content = await file.read()
-    
+
     # 50MB max
     if len(file_content) > 50 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
@@ -165,9 +255,39 @@ async def upload_document(
     db.add(doc)
     db.commit()
     db.refresh(doc)
-    
+
     log_activity(db, doc.id, current_user.id, current_user.full_name, "uploaded", f"Uploaded {file.filename}")
-    
+
+    # Notifications:
+    #   - Confidential upload  → notify all admins to approve (recipients see it under /admin/...).
+    #   - Non-confidential + shared_with → notify each recipient now (they can see it immediately).
+    #   - Confidential + shared_with → defer share notifications until admin approves.
+    if is_confidential:
+        for admin_id in _admin_recipient_ids(db):
+            if admin_id == current_user.id:
+                continue  # don't ping the uploader if they happen to be admin
+            _notify(
+                db, admin_id,
+                type_="drive_pending_approval",
+                title="Document awaiting approval",
+                message=f"{current_user.full_name or 'A user'} uploaded confidential document '{doc.title}' — review required.",
+                action_url=_drive_action_url(is_admin=True),
+            )
+    elif shared_list:
+        for recipient_id_str in shared_list:
+            try:
+                recipient_id = uuid.UUID(recipient_id_str)
+            except (ValueError, TypeError):
+                continue
+            _notify(
+                db, recipient_id,
+                type_="drive_shared",
+                title="A document was shared with you",
+                message=f"{current_user.full_name or 'Someone'} shared '{doc.title}' with you.",
+                action_url=_drive_action_url(is_admin=False),
+            )
+    db.commit()
+
     return {
         "success": True,
         "document": _serialize_doc(doc, db)
@@ -198,26 +318,9 @@ def list_documents(
     else:
         query = query.filter(DriveDocument.status != "Deleted")
         
-    # Access Control Logic
-    # 1. Admins can see everything
-    # 2. Uploaders can see their own documents
-    # 3. Organization level docs can be seen by everyone
-    # 4. Department level docs can be seen by same department
-    # 5. Docs shared explicitly with the user
-    
-    is_admin = getattr(current_user, 'is_superuser', False)
-    
-    if not is_admin:
-        query = query.filter(
-            or_(
-                DriveDocument.uploaded_by == current_user.id,
-                DriveDocument.access_level == 'Organization',
-                cast(DriveDocument.shared_with, String).contains(str(current_user.id)),
-                # Assuming current_user.department exists
-                and_(DriveDocument.access_level == 'Department', DriveDocument.department == current_user.department)
-            )
-        )
-        
+    # Access scoping (single source of truth) — see _apply_access_filter
+    query = _apply_access_filter(query, current_user)
+
     if shared_with_me:
         query = query.filter(
             cast(DriveDocument.shared_with, String).contains(str(current_user.id))
@@ -271,11 +374,11 @@ def get_recent_documents(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get recent documents"""
-    docs = db.query(DriveDocument).filter(
-        DriveDocument.is_deleted == False
-    ).order_by(desc(DriveDocument.created_at)).limit(limit).all()
-    
+    """Get recent documents — scoped to what the current user can see."""
+    base = db.query(DriveDocument).filter(DriveDocument.is_deleted == False)
+    base = _apply_access_filter(base, current_user)
+    docs = base.order_by(desc(DriveDocument.created_at)).limit(limit).all()
+
     return [_serialize_doc(d, db) for d in docs]
 
 
@@ -286,17 +389,19 @@ def get_document(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get single document details"""
-    doc = db.query(DriveDocument).filter(DriveDocument.id == doc_id).first()
+    """Get single document details (scoped: 404 if user can't see it)."""
+    query = db.query(DriveDocument).filter(DriveDocument.id == doc_id)
+    query = _apply_access_filter(query, current_user)
+    doc = query.first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     # Increment view count
     doc.view_count = (doc.view_count or 0) + 1
     doc.last_accessed_at = datetime.now(timezone.utc)
     doc.last_accessed_by = current_user.id
     db.commit()
-    
+
     return _serialize_doc(doc, db)
 
 
@@ -312,23 +417,53 @@ def update_document(
     doc = db.query(DriveDocument).filter(DriveDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
-    updatable = ["title", "description", "category", "tags", "status", "is_favorite", 
+
+    # Capture pre-update state to detect approval transitions.
+    prev_status = doc.status
+
+    updatable = ["title", "description", "category", "tags", "status", "is_favorite",
                  "is_locked", "is_confidential", "access_level", "expiry_date", "project_name"]
-    
+
     changes = []
     for key in updatable:
         if key in payload:
             old_val = getattr(doc, key)
             setattr(doc, key, payload[key])
             changes.append(f"{key}: {old_val} → {payload[key]}")
-    
+
     db.commit()
     db.refresh(doc)
-    
+
     if changes:
         log_activity(db, doc.id, current_user.id, current_user.full_name, "updated", "; ".join(changes))
-    
+
+    # Approval transition: status went from "Pending Approval" → anything else (e.g. "Active").
+    # Notify the uploader and each share recipient that they can now see/download the doc.
+    if prev_status == "Pending Approval" and doc.status != "Pending Approval":
+        if doc.uploaded_by and doc.uploaded_by != current_user.id:
+            _notify(
+                db, doc.uploaded_by,
+                type_="drive_approved",
+                title="Your document was approved",
+                message=f"'{doc.title}' has been approved and is now active.",
+                action_url=_drive_action_url(is_admin=False),
+            )
+        for recipient_id_str in (doc.shared_with or []):
+            try:
+                recipient_id = uuid.UUID(recipient_id_str)
+            except (ValueError, TypeError):
+                continue
+            if recipient_id == doc.uploaded_by or recipient_id == current_user.id:
+                continue
+            _notify(
+                db, recipient_id,
+                type_="drive_shared",
+                title="A document was shared with you",
+                message=f"'{doc.title}' has been approved and shared with you.",
+                action_url=_drive_action_url(is_admin=False),
+            )
+        db.commit()
+
     return _serialize_doc(doc, db)
 
 
@@ -342,14 +477,84 @@ def toggle_favorite(
     doc = db.query(DriveDocument).filter(DriveDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     doc.is_favorite = not doc.is_favorite
     db.commit()
-    
+
     action = "favorited" if doc.is_favorite else "unfavorited"
     log_activity(db, doc.id, current_user.id, current_user.full_name, action, f"Document {action}")
-    
+
     return {"success": True, "is_favorite": doc.is_favorite}
+
+
+# ─── SHARE DOCUMENT ───
+class ShareRequest(BaseModel):
+    user_ids: List[str]
+
+
+@router.post("/documents/{doc_id}/share")
+def share_document(
+    doc_id: str,
+    payload: ShareRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Add users to the document's shared_with list. Only the uploader or a superuser
+    can share. Recipients are notified immediately, unless the document is still
+    Pending Approval — in which case the share is recorded but no notifications fire
+    until the admin approves (PUT /documents/{id} status=Active)."""
+    doc = db.query(DriveDocument).filter(DriveDocument.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    is_admin = getattr(current_user, 'is_superuser', False)
+    if doc.uploaded_by != current_user.id and not is_admin:
+        raise HTTPException(status_code=403, detail="Only the uploader or an admin can share this document.")
+
+    # Validate + normalize incoming user ids
+    new_ids: List[str] = []
+    for raw in payload.user_ids or []:
+        try:
+            new_ids.append(str(uuid.UUID(raw)))
+        except (ValueError, TypeError):
+            continue
+    if not new_ids:
+        raise HTTPException(status_code=400, detail="At least one valid user_id is required.")
+
+    existing = list(doc.shared_with or [])
+    added: List[str] = []
+    for nid in new_ids:
+        if nid not in existing and nid != str(doc.uploaded_by):
+            existing.append(nid)
+            added.append(nid)
+    doc.shared_with = existing
+    db.commit()
+    db.refresh(doc)
+
+    # Activity log
+    if added:
+        log_activity(
+            db, doc.id, current_user.id, current_user.full_name,
+            "shared", f"Shared with {len(added)} user(s)"
+        )
+
+    # Notify newly-added recipients only if the doc is already approved.
+    # Otherwise, the notification is deferred until admin approval (handled in PUT).
+    if added and doc.status != "Pending Approval":
+        for nid in added:
+            try:
+                _notify(
+                    db, uuid.UUID(nid),
+                    type_="drive_shared",
+                    title="A document was shared with you",
+                    message=f"{current_user.full_name or 'Someone'} shared '{doc.title}' with you.",
+                    action_url=_drive_action_url(is_admin=False),
+                )
+            except (ValueError, TypeError):
+                continue
+        db.commit()
+
+    return {"success": True, "shared_with": doc.shared_with, "added_count": len(added)}
 
 
 # ─── SOFT DELETE (TRASH) ───
@@ -362,15 +567,20 @@ def soft_delete_document(
     doc = db.query(DriveDocument).filter(DriveDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
+    # Ownership: only the uploader or a superuser can delete. Share recipients
+    # cannot delete docs that are merely shared with them.
+    if doc.uploaded_by != current_user.id and not getattr(current_user, 'is_superuser', False):
+        raise HTTPException(status_code=403, detail="Only the uploader or an admin can delete this document.")
+
     doc.is_deleted = True
     doc.deleted_at = datetime.now(timezone.utc)
     doc.deleted_by = current_user.id
     doc.status = "Deleted"
     db.commit()
-    
+
     log_activity(db, doc.id, current_user.id, current_user.full_name, "deleted", "Moved to trash")
-    
+
     return {"success": True}
 
 # ─── PERMANENT DELETE ───
@@ -378,19 +588,33 @@ def soft_delete_document(
 def permanent_delete_document(
     doc_id: str,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     doc = db.query(DriveDocument).filter(DriveDocument.id == doc_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
-    # Optional: Delete file from disk
-    # file_path = os.path.join(STORAGE_DIR, doc.file_url.split('/')[-1])
-    # if os.path.exists(file_path): os.remove(file_path)
-    
+
+    # Ownership: uploader or superuser only
+    if doc.uploaded_by != current_user.id and not getattr(current_user, 'is_superuser', False):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # 1. Remove dependent activity rows (FK has no ON DELETE CASCADE)
+    db.query(DriveActivity).filter(DriveActivity.document_id == doc.id).delete(synchronize_session=False)
+
+    # 2. Best-effort: delete the physical file from /storage/drive/
+    if doc.file_url:
+        file_name = os.path.basename(doc.file_url)
+        file_path = os.path.join(STORAGE_DIR, file_name)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass  # don't fail the request if the file is locked or already gone
+
+    # 3. Now safe to delete the document row
     db.delete(doc)
     db.commit()
-    
+
     return {"success": True}
 
 
@@ -422,10 +646,10 @@ def list_trash(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    docs = db.query(DriveDocument).filter(
-        DriveDocument.is_deleted == True
-    ).order_by(desc(DriveDocument.deleted_at)).all()
-    
+    base = db.query(DriveDocument).filter(DriveDocument.is_deleted == True)
+    base = _apply_access_filter(base, current_user)
+    docs = base.order_by(desc(DriveDocument.deleted_at)).all()
+
     return [_serialize_doc(d, db) for d in docs]
 
 
@@ -437,10 +661,18 @@ def list_activity(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    query = db.query(DriveActivity)
+    # Restrict to activity rows for documents the current user can see
+    visible_doc_ids = _apply_access_filter(
+        db.query(DriveDocument).filter(DriveDocument.is_deleted == False),
+        current_user,
+    ).with_entities(DriveDocument.id).subquery()
+
+    query = db.query(DriveActivity).filter(
+        DriveActivity.document_id.in_(db.query(visible_doc_ids))
+    )
     if document_id:
         query = query.filter(DriveActivity.document_id == document_id)
-    
+
     activities = query.order_by(desc(DriveActivity.created_at)).limit(limit).all()
     
     return [

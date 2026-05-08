@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none">
+  <style>
+    .fc-logo { color: #0a0a0a; }
+    @media (prefers-color-scheme: dark) {
+      .fc-logo { color: #ffffff; }
+    }
+  </style>
+  <g class="fc-logo">
+    <mask id="m1" fill="white"><rect x="2" y="2" width="16" height="16" rx="4"/></mask>
+    <rect x="2" y="2" width="16" height="16" rx="4" stroke="currentColor" stroke-width="8" mask="url(#m1)"/>
+
+    <mask id="m2" fill="white"><rect x="22" y="2" width="16" height="16" rx="4"/></mask>
+    <rect x="22" y="2" width="16" height="16" rx="4" stroke="currentColor" stroke-width="8" mask="url(#m2)" opacity="0.6"/>
+
+    <mask id="m3" fill="white"><rect x="2" y="22" width="16" height="16" rx="4"/></mask>
+    <rect x="2" y="22" width="16" height="16" rx="4" stroke="currentColor" stroke-width="8" mask="url(#m3)" opacity="0.6"/>
+
+    <rect x="22" y="22" width="16" height="16" rx="4" fill="currentColor"/>
+  </g>
+</svg>

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 import traceback
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
@@ -12,8 +13,8 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.API_VERSION,
     description="Internal employee management application for Fourreck",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
+    docs_url=None,
+    redoc_url=None,
     openapi_url="/api/openapi.json"
 )
 
@@ -116,6 +117,33 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 os.makedirs("storage", exist_ok=True)
 app.mount("/storage", StaticFiles(directory="storage"), name="storage")
+
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# Custom Swagger UI and ReDoc with Fourconnect favicon
+@app.get("/api/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{settings.PROJECT_NAME} - Swagger UI",
+        swagger_favicon_url="/static/favicon.svg",
+    )
+
+
+@app.get("/api/redoc", include_in_schema=False)
+async def custom_redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{settings.PROJECT_NAME} - ReDoc",
+        redoc_favicon_url="/static/favicon.svg",
+    )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.svg", media_type="image/svg+xml")
 
 
 # Health check endpoint

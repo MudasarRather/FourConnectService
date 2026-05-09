@@ -32,10 +32,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Step 5: Compress the app files
+      # Remove this step entirely
       - name: Archive the app
         run: tar -czf build.tar.gz --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='build.tar.gz' .
-
+        
       # Step 6: Create .ssh directory and known_hosts file
       - name: Create .ssh directory and known_hosts file
         run: |

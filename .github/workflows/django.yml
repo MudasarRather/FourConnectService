@@ -26,40 +26,36 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # Step 4: Install dependencies and test
+      # Step 4: Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Remove this step entirely
-      - name: Archive the app
-        run: tar -czf build.tar.gz --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='build.tar.gz' .
-        
-      # Step 6: Create .ssh directory and known_hosts file
+      # Step 5: Create .ssh directory and known_hosts file
       - name: Create .ssh directory and known_hosts file
         run: |
           mkdir -p ~/.ssh
           touch ~/.ssh/known_hosts
 
-      # Step 7: Add server to known hosts
+      # Step 6: Add server to known hosts
       - name: Add SSH Key to Known Hosts
         run: ssh-keyscan ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
 
-      # Step 8: Set up SSH
+      # Step 7: Set up SSH
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      # Step 9: Ensure remote temp directory exists
+      # Step 8: Ensure remote temp directory exists
       - name: Ensure remote directories exist
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
             mkdir -p ~/htdocs/${{ secrets.DEPLOY_DOMAIN }}-temp
           EOF
 
-      # Step 10: Sync files to temp directory
+      # Step 9: Sync files to temp directory
       - name: Sync files to temp directory
         run: |
           rsync -avz --delete \
@@ -69,7 +65,7 @@ jobs:
             --exclude='venv/' \
             ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }}:~/htdocs/${{ secrets.DEPLOY_DOMAIN }}-temp
 
-      # Step 11: Finalize deployment
+      # Step 10: Finalize deployment
       - name: Finalize deployment safely
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
@@ -122,7 +118,7 @@ jobs:
             find ~/htdocs -name "*-backup-*" -mtime +7 -exec rm -rf {} \; || true
           EOF
 
-      # Step 12: Rollback on failure
+      # Step 11: Rollback on failure
       - name: Rollback on failure
         if: failure()
         run: |

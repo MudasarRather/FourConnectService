@@ -75,6 +75,7 @@ from app.routers import (
     dpr,
     notes,
     drive,
+    archive,
 )
 
 
@@ -96,6 +97,7 @@ app.include_router(sla.router, prefix="/api")
 app.include_router(handover.router, prefix="/api")
 app.include_router(dpr.router, prefix="/api")
 app.include_router(drive.router, prefix="/api")
+app.include_router(archive.router, prefix="/api")
 
 # Root endpoint
 @app.get("/")

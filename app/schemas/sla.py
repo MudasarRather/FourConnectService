@@ -73,7 +73,7 @@ class SlaSignatoryResponse(SlaSignatoryBase):
 # Main Agreement
 
 class SlaAgreementBase(BaseModel):
-    project_id: UUID
+    project_id: Optional[UUID] = None
     
     # Step 1
     client_organization_name: Optional[str] = None

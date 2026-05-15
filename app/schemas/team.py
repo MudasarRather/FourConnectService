@@ -95,12 +95,10 @@ class ApprovedProjectResponse(BaseModel):
     # Details for modal
     project_type: Optional[str] = None
     organization: Optional[str] = None
-    cost_center: Optional[str] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     budget_amount: float = 0.0
     currency: str = "USD"
-    budget_type: Optional[str] = None
 
     class Config:
         from_attributes = True

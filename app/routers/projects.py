@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
 import string
 
@@ -23,6 +23,25 @@ def generate_project_code():
     suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"PRJ-{timestamp}-{suffix}"
 
+
+@router.get("/suggest-code")
+def suggest_project_code(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Server-authoritative code suggestion for the Create Project form's 'Suggest'
+    button. Generates a fresh PRJ-YYYYMM-XXXX value and retries on the very rare
+    collision so the value returned is guaranteed unique at this instant."""
+    for _ in range(8):
+        candidate = generate_project_code()
+        if not db.query(Project).filter(Project.code == candidate).first():
+            return {"code": candidate}
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Could not generate a unique project code; please type one manually.",
+    )
+
+
 @router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_project(
     project: ProjectCreate,
@@ -32,7 +51,7 @@ def create_project(
     # Auto-generate code if missing
     if not project.code:
         project.code = generate_project_code()
-    
+
     # Check uniqueness
     existing = db.query(Project).filter(Project.code == project.code).first()
     if existing:
@@ -335,48 +354,41 @@ def get_project(
     
     # Populate extra user details for team members from joined relationship
     for tm in team_members:
-        user = tm.user 
+        user = tm.user
         if user:
             tm.user_name = user.full_name
             tm.user_email = user.email
             tm.user_phone = user.phone
             tm.user_avatar = user.avatar_url
             tm.is_superuser = user.is_superuser
-            
-        # Calculate Budget Utilized (Sum of all milestone budgets)
-        # We use all milestones (completed, pending, active) as these represent "Allocated" budget
-        from app.utils.currency import get_rate
 
-        total_allocated = 0
-        total_consumed = 0
-        project_currency = project.currency or 'USD'
-        for m in project.milestones:
-            # Use stored percentage for consistency (Creation Time Rate)
-            val = 0.0
-            if m.contribution_percentage and m.contribution_percentage > 0 and (project.budget_amount or 0) > 0:
-                 from decimal import Decimal
-                 # Calculate from percentage
-                 val = (m.contribution_percentage / 100.0) * (project.budget_amount or 0)
-            else:
-                 # Fallback to Dynamic Rate
-                 rate = get_rate(m.currency, project_currency)
-                 val = (m.budget_amount or 0) * rate
-            
-            # Attach for Schema Response
-            setattr(m, 'budget_amount_converted', val)
-            
-            total_allocated += val
-            
-            if m.status == 'completed':
-                total_consumed += val
-        
-        total_allocated = round(total_allocated, 2)
-        total_consumed = round(total_consumed, 2)
-        
-        # Calculate Completion %
-        total_ms = len(project.milestones)
-        completed_ms = sum(1 for m in project.milestones if m.status == 'completed')
-        completion_pct = round((completed_ms / total_ms) * 100, 1) if total_ms > 0 else 0.0
+    # Calculate Budget Utilized + Consumed + Completion % from milestones
+    # (Pulled OUT of the team-members loop so it always runs — even when there are
+    #  zero accepted team members, the response still has these values.)
+    from app.utils.currency import get_rate
+
+    total_allocated = 0
+    total_consumed = 0
+    project_currency = project.currency or 'USD'
+    for m in project.milestones:
+        val = 0.0
+        if m.contribution_percentage and m.contribution_percentage > 0 and (project.budget_amount or 0) > 0:
+            val = (m.contribution_percentage / 100.0) * (project.budget_amount or 0)
+        else:
+            rate = get_rate(m.currency, project_currency)
+            val = (m.budget_amount or 0) * rate
+        setattr(m, 'budget_amount_converted', val)
+        total_allocated += val
+        if m.status == 'completed':
+            total_consumed += val
+
+    total_allocated = round(total_allocated, 2)
+    total_consumed = round(total_consumed, 2)
+
+    # Completion %
+    total_ms = len(project.milestones)
+    completed_ms = sum(1 for m in project.milestones if m.status == 'completed')
+    completion_pct = round((completed_ms / total_ms) * 100, 1) if total_ms > 0 else 0.0
             
     # Create Response Model Manually to inject computed fields
     project_resp = ProjectResponse.model_validate(project)
@@ -564,9 +576,9 @@ def list_archived_projects(
     """
     from app.models.milestone import Milestone
     from app.utils.currency import get_rate
-    from dateutil.relativedelta import relativedelta
 
-    six_months_ago = datetime.utcnow() - relativedelta(months=6)
+    # 180 days approximates "6 calendar months" without requiring python-dateutil
+    six_months_ago = datetime.utcnow() - timedelta(days=180)
 
     # Base query: not deleted
     query = db.query(Project).filter(Project.is_deleted == False)

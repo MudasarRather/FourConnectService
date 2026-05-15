@@ -8,30 +8,72 @@ class ProjectBase(BaseModel):
     description: str
     project_type: str
     organization: Optional[str] = None
-    cost_center: str
     start_date: datetime
     end_date: datetime
     budget_amount: float
     currency: str = "USD"
-    budget_type: str
 
 class ProjectCreate(ProjectBase):
     code: Optional[str] = None
     status: Optional[str] = None
     project_order_path: Optional[str] = None  # Path to uploaded Project Order PDF
 
+    # --- Government Order Details ---
+    government_order_no:  Optional[str] = None
+    order_date:           Optional[datetime] = None
+    issuing_authority:    Optional[str] = None
+    order_received_date:  Optional[datetime] = None
+
+    # --- Project Information additions ---
+    department: Optional[str] = None
+    category:   Optional[str] = None
+    priority:   Optional[str] = None
+
+    # --- Location ---
+    state:    Optional[str] = None
+    district: Optional[str] = None
+
+    # --- Budget additions ---
+    funding_type: Optional[str] = None
+
+    # --- Team & Responsibility ---
+    project_head_name:        Optional[str] = None
+    project_head_designation: Optional[str] = None
+    project_head_contact:     Optional[str] = None
+    nodal_officer:            Optional[str] = None
+    contractor:               Optional[str] = None
+
+    # --- Operational lifecycle ---
+    lifecycle_status: Optional[str] = None
+
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     project_type: Optional[str] = None
     organization: Optional[str] = None
-    cost_center: Optional[str] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     budget_amount: Optional[float] = None
     currency: Optional[str] = None
-    budget_type: Optional[str] = None
     status: Optional[str] = None
+
+    # --- New government fields (all optional on update) ---
+    government_order_no:  Optional[str] = None
+    order_date:           Optional[datetime] = None
+    issuing_authority:    Optional[str] = None
+    order_received_date:  Optional[datetime] = None
+    department: Optional[str] = None
+    category:   Optional[str] = None
+    priority:   Optional[str] = None
+    state:    Optional[str] = None
+    district: Optional[str] = None
+    funding_type: Optional[str] = None
+    project_head_name:        Optional[str] = None
+    project_head_designation: Optional[str] = None
+    project_head_contact:     Optional[str] = None
+    nodal_officer:            Optional[str] = None
+    contractor:               Optional[str] = None
+    lifecycle_status: Optional[str] = None
 
 from app.schemas.team import TeamMemberResponse
 
@@ -42,12 +84,10 @@ class ProjectResponse(BaseModel):
     description: Optional[str] = None  # Optional for existing data
     project_type: str
     organization: Optional[str] = None
-    cost_center: str
     start_date: Optional[datetime] = None  # Optional for existing data
     end_date: Optional[datetime] = None  # Optional for existing data
     budget_amount: float = 0.0
     currency: str = "USD"
-    budget_type: Optional[str] = None  # Optional for existing data
     status: str
     is_approved: bool
     created_at: datetime
@@ -67,6 +107,24 @@ class ProjectResponse(BaseModel):
     budget_utilized: Optional[float] = 0
     budget_consumed: Optional[float] = 0 # New: Cost of COMPLETED milestones.0
     completion_percentage: float = 0.0 # New: Based on milestone completion
+
+    # --- Government Order fields (surfaced read-only on response) ---
+    government_order_no:  Optional[str] = None
+    order_date:           Optional[datetime] = None
+    issuing_authority:    Optional[str] = None
+    order_received_date:  Optional[datetime] = None
+    department: Optional[str] = None
+    category:   Optional[str] = None
+    priority:   Optional[str] = None
+    state:    Optional[str] = None
+    district: Optional[str] = None
+    funding_type: Optional[str] = None
+    project_head_name:        Optional[str] = None
+    project_head_designation: Optional[str] = None
+    project_head_contact:     Optional[str] = None
+    nodal_officer:            Optional[str] = None
+    contractor:               Optional[str] = None
+    lifecycle_status: Optional[str] = None
 
     class Config:
         from_attributes = True

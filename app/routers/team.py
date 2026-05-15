@@ -274,12 +274,10 @@ def get_approved_projects(
                 "team_members": team_members_data,
                 "project_type": p.project_type,
                 "organization": p.organization or "Fourconnect",
-                "cost_center": p.cost_center,
                 "start_date": p.start_date,
-            "end_date": p.end_date,
-            "budget_amount": p.budget_amount or 0.0,
-            "currency": p.currency,
-                "budget_type": p.budget_type
+                "end_date": p.end_date,
+                "budget_amount": p.budget_amount or 0.0,
+                "currency": p.currency,
             })
     except Exception as e:
         with open("debug_error.log", "a") as f:

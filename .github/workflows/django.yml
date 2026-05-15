@@ -1,0 +1,147 @@
+name: Build and Deploy Python App
+on:
+  push:
+    branches: [master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Step 3: Cache pip packages
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # Step 4: Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 5: Create .ssh directory and known_hosts file
+      - name: Create .ssh directory and known_hosts file
+        run: |
+          mkdir -p ~/.ssh
+          touch ~/.ssh/known_hosts
+
+      # Step 6: Add server to known hosts
+      - name: Add SSH Key to Known Hosts
+        run: ssh-keyscan ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      # Step 7: Set up SSH
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      # Step 8: Ensure remote temp directory exists
+      - name: Ensure remote directories exist
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            mkdir -p ~/htdocs/${{ secrets.DEPLOY_DOMAIN }}-temp
+          EOF
+
+      # Step 9: Sync files to temp directory
+      - name: Sync files to temp directory
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='venv/' \
+            ./ ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }}:~/htdocs/${{ secrets.DEPLOY_DOMAIN }}-temp
+
+      # Step 10: Finalize deployment
+      - name: Finalize deployment safely
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            set -x
+            set -e
+
+            echo "Navigating to htdocs directory..."
+            cd ~/htdocs || { echo "Failed to change directory to ~/htdocs"; exit 1; }
+
+            # Backup old version
+            if [ -d ${{ secrets.DEPLOY_DOMAIN }} ]; then
+              echo "Backing up old version..."
+              mv ${{ secrets.DEPLOY_DOMAIN }} ${{ secrets.DEPLOY_DOMAIN }}-backup-$(date +%Y%m%d%H%M%S) || { echo "Failed to backup"; exit 1; }
+            else
+              echo "No previous version found; skipping backup."
+            fi
+
+            # Move new version into place
+            echo "Moving new version into place..."
+            mv ${{ secrets.DEPLOY_DOMAIN }}-temp ${{ secrets.DEPLOY_DOMAIN }} || { echo "Failed to move new version"; exit 1; }
+
+            # Navigate to app directory
+            cd ~/htdocs/${{ secrets.DEPLOY_DOMAIN }} || { echo "Failed to change to app directory"; exit 1; }
+
+            # Create virtual environment if not exists
+            if [ ! -d "venv" ]; then
+              echo "Creating virtual environment..."
+              python3 -m venv venv
+            fi
+
+            # Install/update dependencies
+            echo "Installing dependencies..."
+            ./venv/bin/pip install -r requirements.txt
+
+            # Start or reload pm2
+            if pm2 list | grep -q ${{ secrets.APP_NAME }}; then
+              echo "Reloading ${{ secrets.APP_NAME }}..."
+              pm2 reload ${{ secrets.APP_NAME }} --update-env || { echo "Failed to reload"; exit 1; }
+            else
+              echo "Starting ${{ secrets.APP_NAME }}..."
+              pm2 start ./venv/bin/uvicorn \
+                --name ${{ secrets.APP_NAME }} \
+                --cwd ~/htdocs/${{ secrets.DEPLOY_DOMAIN }} \
+                --interpreter ./venv/bin/python3 \
+                -- app.main:app --host 0.0.0.0 --port ${{ secrets.APP_PORT }} || { echo "Failed to start"; exit 1; }
+            fi
+
+            # Clean up old backups (older than 7 days)
+            echo "Cleaning up old backups..."
+            find ~/htdocs -name "*-backup-*" -mtime +7 -exec rm -rf {} \; || true
+          EOF
+
+      # Step 11: Rollback on failure
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.DEPLOY_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+            cd ~/htdocs || { echo "Failed to change directory to ~/htdocs"; exit 1; }
+            LATEST_BACKUP=$(ls -d ${{ secrets.DEPLOY_DOMAIN }}-backup-* 2>/dev/null | tail -n 1)
+            if [ -d "$LATEST_BACKUP" ]; then
+              echo "Rolling back to previous version..."
+              rm -rf ${{ secrets.DEPLOY_DOMAIN }}
+              mv "$LATEST_BACKUP" ${{ secrets.DEPLOY_DOMAIN }}
+              cd ~/htdocs/${{ secrets.DEPLOY_DOMAIN }}
+              pm2 reload ${{ secrets.APP_NAME }} --update-env || true
+            else
+              echo "No backup found, manual intervention required!"
+            fi
+          EOF
+
+      # Notify on failure
+      - name: Notify on failure
+        if: failure()
+        run: echo "Deployment failed! Please check the logs for details."
+
+      # Notify on success
+      - name: Notify on success
+        if: success()
+        run: echo "Deployment succeeded! Everything is up and running."

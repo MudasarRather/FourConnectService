@@ -38,6 +38,21 @@ from app.models.dpr import (
     DprAttachment, DprApproval
 )
 from app.models.drive_document import DriveDocument, DriveActivity, DriveFolder
+from app.models.hr import (
+    Department,
+    Grade,
+    WorkLocation,
+    WorkLocationType,
+    Designation,
+    Employee,
+    EmploymentType,
+    EmployeeCategory,
+    MaritalStatus,
+    LifecycleState,
+    TaxRegime,
+    EmployeeHistory,
+    EmployeeChangeType,
+)
 
 __all__ = [
     "User",
@@ -86,5 +101,19 @@ __all__ = [
     "DprApproval",
     "DriveDocument",
     "DriveActivity",
-    "DriveFolder"
+    "DriveFolder",
+    # HR Phase 1.0
+    "Department",
+    "Grade",
+    "WorkLocation",
+    "WorkLocationType",
+    "Designation",
+    "Employee",
+    "EmploymentType",
+    "EmployeeCategory",
+    "MaritalStatus",
+    "LifecycleState",
+    "TaxRegime",
+    "EmployeeHistory",
+    "EmployeeChangeType",
 ]

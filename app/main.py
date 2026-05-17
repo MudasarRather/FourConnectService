@@ -77,6 +77,7 @@ from app.routers import (
     drive,
     archive,
     documents_hub,
+    hr,
 )
 
 
@@ -100,6 +101,7 @@ app.include_router(dpr.router, prefix="/api")
 app.include_router(drive.router, prefix="/api")
 app.include_router(archive.router, prefix="/api")
 app.include_router(documents_hub.router, prefix="/api")
+app.include_router(hr.router, prefix="/api")
 
 # Root endpoint
 @app.get("/")

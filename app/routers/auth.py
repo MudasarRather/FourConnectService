@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.models.allowed_employee import AllowedEmployee
-from app.schemas.user import UserCreate, UserLogin, UserResponse, UserUpdate, Token, PasswordChange, UserAdminResponse, ActivationCodeRequest
+from app.schemas.user import UserCreate, UserLogin, UserResponse, UserUpdate, UserSelfUpdate, Token, PasswordChange, UserAdminResponse, ActivationCodeRequest
 from app.utils.auth import verify_password, get_password_hash, create_access_token
 from app.utils.dependencies import get_current_user
 from app.config import get_settings
@@ -237,7 +237,32 @@ def update_user_profile(
         
     for field, value in update_data.items():
         setattr(current_user, field, value)
-    
+
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.patch("/me", response_model=UserResponse)
+def patch_user_profile(
+    payload: UserSelfUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Self-service profile update. Strictly whitelists editable fields via
+    UserSelfUpdate (extra='ignore'), so fields like is_superuser, is_active,
+    is_activated, email, employee_code, hashed_password, and organisation
+    can never be modified via this endpoint, regardless of request payload.
+    """
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if not update_data:
+        return current_user
+
+    for field, value in update_data.items():
+        setattr(current_user, field, value)
+
     db.commit()
     db.refresh(current_user)
     return current_user

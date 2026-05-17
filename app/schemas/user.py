@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, EmailStr, UUID4, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, UUID4, field_validator
 import re
 
 
@@ -58,6 +58,41 @@ class UserUpdate(BaseModel):
     city: Optional[str] = None
     gender: Optional[str] = None
     avatar_url: Optional[str] = None
+
+
+class UserSelfUpdate(BaseModel):
+    """Self-service update — explicit whitelist of fields a user can edit on themselves.
+
+    Deliberately excludes: is_superuser, is_active, is_activated, activation_code,
+    email, employee_code, hashed_password, organisation. Any unknown fields in
+    the request body are silently ignored (extra='ignore'), so a malicious
+    client cannot escalate by posting {"is_superuser": true}.
+    """
+    model_config = ConfigDict(extra='ignore')
+
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    country_code: Optional[str] = None
+    address: Optional[str] = None
+    job_title: Optional[str] = None
+    department: Optional[str] = None
+    bio: Optional[str] = None
+    location: Optional[str] = None
+    country: Optional[str] = None
+    state: Optional[str] = None
+    city: Optional[str] = None
+    gender: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+    @field_validator('full_name')
+    @classmethod
+    def validate_full_name(cls, v):
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError('Full name cannot be empty')
+        return stripped
 
 
 class UserLogin(BaseModel):

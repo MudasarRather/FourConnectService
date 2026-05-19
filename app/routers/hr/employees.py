@@ -274,6 +274,22 @@ def create_employee(
     create_email = data.pop("create_email", None)
     create_full_name = data.pop("create_full_name", None)
 
+    # ── Optional back-link to a recruitment Offer ──────────────────────────
+    # Validate eagerly so the new employee row isn't half-created on failure.
+    offer_id = data.pop("offer_id", None)
+    offer_obj = None
+    if offer_id:
+        from app.models.hr.recruitment import Offer, OfferStatus
+        offer_obj = db.query(Offer).filter(Offer.id == offer_id).first()
+        if not offer_obj:
+            raise HTTPException(404, "Linked offer not found")
+        if offer_obj.status != OfferStatus.ACCEPTED:
+            raise HTTPException(
+                409, f"Offer must be accepted to onboard (current status: {offer_obj.status})"
+            )
+        if offer_obj.employee_id is not None:
+            raise HTTPException(409, "Offer is already linked to another employee")
+
     if not user_id:
         if not create_email or not create_full_name:
             raise HTTPException(400, "Provide either user_id, or create_email + create_full_name to provision a new User.")
@@ -318,6 +334,14 @@ def create_employee(
         db.rollback()
         raise HTTPException(400, f"Integrity error: {exc.orig}") from exc
 
+    # Set the back-link on the offer once we have the employee's id.
+    if offer_obj is not None:
+        offer_obj.employee_id = emp.id
+
+    history_reason = "Created via HR Employees"
+    if offer_obj is not None:
+        history_reason = f"Onboarded from offer {offer_obj.offer_code}"
+
     _write_history(
         db,
         employee=emp,
@@ -325,7 +349,7 @@ def create_employee(
         before=None,
         after=_serialise_employee_snapshot(emp),
         actor_id=admin.id,
-        reason="Created via HR Employees",
+        reason=history_reason,
         effective_date=emp.joining_date or datetime.utcnow().date(),
     )
     db.commit()

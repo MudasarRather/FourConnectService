@@ -112,6 +112,12 @@ class EmployeeCreate(_EmployeeBaseFields):
     """Either provide user_id (link existing User) or create_email + create_full_name (create a new shell)."""
     model_config = ConfigDict(extra="ignore", use_enum_values=True)
 
+    # Optional back-link: when supplied, the employee is being onboarded from
+    # a recruitment Offer. The endpoint will set Offer.employee_id = <new employee.id>
+    # after the row is created, rejecting if the offer is not ACCEPTED or is
+    # already linked.
+    offer_id: Optional[UUID] = None
+
 
 class EmployeeUpdate(BaseModel):
     """Self-contained Update schema; strict whitelist (no lifecycle/employee_id mutation here).

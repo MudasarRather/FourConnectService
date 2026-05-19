@@ -12,6 +12,7 @@ from app.routers.hr.departments import router as _departments_router
 from app.routers.hr.designations import router as _designations_router
 from app.routers.hr.grades import router as _grades_router
 from app.routers.hr.locations import router as _locations_router
+from app.routers.hr.recruitment import router as _recruitment_router
 
 router = APIRouter()
 router.include_router(_dashboard_router)
@@ -20,3 +21,4 @@ router.include_router(_departments_router)
 router.include_router(_designations_router)
 router.include_router(_grades_router)
 router.include_router(_locations_router)
+router.include_router(_recruitment_router)

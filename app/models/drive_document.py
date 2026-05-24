@@ -43,6 +43,7 @@ class DriveDocument(Base):
     # Linking
     project_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     project_name = Column(String(300), nullable=True)
+    employee_id = Column(UUID(as_uuid=True), nullable=True, index=True)  # links to hr_employees.id when used in HR onboarding
     
     # Expiry
     expiry_date = Column(DateTime(timezone=True), nullable=True)

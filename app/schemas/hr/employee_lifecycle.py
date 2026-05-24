@@ -16,6 +16,12 @@ class LifecycleConfirmBody(_BaseLifecycle):
     pass
 
 
+class LifecyclePutOnProbationBody(_BaseLifecycle):
+    """Move an ACTIVE employee onto probation (e.g. for a performance review window)."""
+    probation_months: Optional[int] = Field(default=6, ge=1, le=24)
+    confirmation_date: Optional[date] = None  # if not set, joining_date + probation_months is used
+
+
 class LifecyclePromoteBody(_BaseLifecycle):
     new_designation_id: UUID
     new_grade_id: Optional[UUID] = None

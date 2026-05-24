@@ -32,9 +32,11 @@ from app.schemas.hr.employee_lifecycle import (
     LifecycleConfirmBody, LifecyclePromoteBody, LifecycleTransferBody,
     LifecycleSuspendBody, LifecycleReinstateBody,
     LifecycleGiveNoticeBody, LifecycleExitBody, LifecycleArchiveBody,
+    LifecyclePutOnProbationBody,
 )
 from app.utils.auth import get_password_hash
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.onboarding_bootstrap import bootstrap_onboarding
 
 router = APIRouter(prefix="/hr/employees", tags=["HR — Employees"])
 
@@ -352,6 +354,11 @@ def create_employee(
         reason=history_reason,
         effective_date=emp.joining_date or datetime.utcnow().date(),
     )
+
+    # Auto-bootstrap onboarding spine (checklist, documents, identity, welcome kit,
+    # default accounts, mandatory training). Same transaction so partial failure rolls back.
+    bootstrap_onboarding(db, employee=emp, offer=offer_obj, actor_id=admin.id)
+
     db.commit()
     emp = _load_with_relations(db, emp.id)
     return _to_detail(emp, reveal_bank=False)
@@ -494,6 +501,54 @@ def lifecycle_confirm(
         db, emp, EmployeeChangeType.CONFIRMED,
         before=before, after=_serialise_employee_snapshot(emp),
         actor_id=admin.id, reason=body.reason, effective_date=eff,
+    )
+    db.commit()
+    db.refresh(emp)
+    return _to_detail(emp, reveal_bank=False)
+
+
+@router.post("/{employee_pk}/lifecycle/put-on-probation", response_model=EmployeeDetailResponse)
+def lifecycle_put_on_probation(
+    employee_pk: UUID,
+    body: LifecyclePutOnProbationBody,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Move an ACTIVE employee onto probation.
+
+    Sets `lifecycle_state = ON_PROBATION`, `employee_category = PROBATIONARY`,
+    and records the probation window. Confirmation date defaults to today + N months.
+    """
+    import calendar
+    from datetime import date as _date
+    _track_actor(db, admin.id)
+    emp = _load_with_relations(db, employee_pk)
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    _require_state(emp, [LifecycleState.ACTIVE])
+    before = _serialise_employee_snapshot(emp)
+    eff = body.effective_date or datetime.utcnow().date()
+    months = body.probation_months or 6
+    emp.lifecycle_state = LifecycleState.ON_PROBATION
+    emp.employee_category = EmployeeCategory.PROBATIONARY
+    emp.probation_months = months
+    # Confirmation date is when probation ends — caller can override
+    if body.confirmation_date:
+        emp.confirmation_date = body.confirmation_date
+    else:
+        # Pure-stdlib month math (avoid dateutil dependency)
+        y = eff.year + (eff.month - 1 + months) // 12
+        m = (eff.month - 1 + months) % 12 + 1
+        day = min(eff.day, calendar.monthrange(y, m)[1])
+        emp.confirmation_date = _date(y, m, day)
+    emp.last_updated_by_id = admin.id
+    db.flush()
+    _write_history(
+        db, emp, EmployeeChangeType.PROFILE_UPDATED,
+        before=before, after=_serialise_employee_snapshot(emp),
+        actor_id=admin.id,
+        reason=body.reason or f"Placed on probation for {months} month(s)",
+        effective_date=eff,
     )
     db.commit()
     db.refresh(emp)

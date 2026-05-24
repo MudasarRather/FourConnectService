@@ -43,6 +43,53 @@ from app.models.hr.recruitment import (
     FeedbackRecommendation,
     OfferStatus,
 )
+from app.models.hr.onboarding import (
+    OnboardingProcess,
+    OnboardingChecklistTemplate,
+    OnboardingChecklistItem,
+    OnboardingDocument,
+    JoiningApproval,
+    OnboardingTask,
+    EmployeeIdentity,
+    WelcomeKit,
+    WelcomeKitTemplate,
+    OnboardingStatus,
+    OnboardingStage,
+    ChecklistCategory,
+    ChecklistItemStatus,
+    DocumentSlotStatus,
+    ApprovalRole,
+    ApprovalDecision,
+    TaskStatus as OnbTaskStatus,
+    TaskPriority as OnbTaskPriority,
+    IdentityStatus,
+    WelcomeKitStatus,
+)
+from app.models.hr.asset import (
+    Asset,
+    AssetAllocation,
+    AssetType,
+    AssetCondition,
+    AssetStatus,
+    AllocationStatus,
+)
+from app.models.hr.training import (
+    TrainingProgram,
+    TrainingAssignment,
+    TrainingType,
+    TrainingAssignmentStatus,
+)
+from app.models.hr.induction import (
+    InductionSession,
+    InductionAttendance,
+    InductionType,
+    AttendanceStatus,
+)
+from app.models.hr.account_provisioning import (
+    AccountProvisioning,
+    AccountType,
+    AccountProvisioningStatus,
+)
 
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
@@ -86,4 +133,46 @@ __all__ = [
     "InterviewStatus",
     "FeedbackRecommendation",
     "OfferStatus",
+    # Onboarding
+    "OnboardingProcess",
+    "OnboardingChecklistTemplate",
+    "OnboardingChecklistItem",
+    "OnboardingDocument",
+    "JoiningApproval",
+    "OnboardingTask",
+    "EmployeeIdentity",
+    "WelcomeKit",
+    "WelcomeKitTemplate",
+    "OnboardingStatus",
+    "OnboardingStage",
+    "ChecklistCategory",
+    "ChecklistItemStatus",
+    "DocumentSlotStatus",
+    "ApprovalRole",
+    "ApprovalDecision",
+    "OnbTaskStatus",
+    "OnbTaskPriority",
+    "IdentityStatus",
+    "WelcomeKitStatus",
+    # Assets
+    "Asset",
+    "AssetAllocation",
+    "AssetType",
+    "AssetCondition",
+    "AssetStatus",
+    "AllocationStatus",
+    # Training
+    "TrainingProgram",
+    "TrainingAssignment",
+    "TrainingType",
+    "TrainingAssignmentStatus",
+    # Induction
+    "InductionSession",
+    "InductionAttendance",
+    "InductionType",
+    "AttendanceStatus",
+    # Account Provisioning
+    "AccountProvisioning",
+    "AccountType",
+    "AccountProvisioningStatus",
 ]

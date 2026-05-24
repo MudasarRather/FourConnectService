@@ -23,21 +23,31 @@ app = FastAPI(
 def startup_db():
     Base.metadata.create_all(bind=engine)
 
-# Configure CORS - allow all local origins for development
+# Configure CORS — local dev origins + production frontend domains.
+# Keep this list in sync with the global exception handler below.
+ALLOWED_ORIGINS = [
+    # Local dev
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    # Production frontend
+    "https://crm.fourreck.com",
+    "https://www.crm.fourreck.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174"
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Global exception handler — ensures 500 errors are logged and include CORS headers
+# that match the requesting origin. Hardcoding a single origin here means any
+# allowed origin OTHER than that one (e.g. production) would have its 500
+# response blocked by the browser as a CORS error, masking the real failure.
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     import traceback as tb
@@ -45,14 +55,20 @@ async def global_exception_handler(request: Request, exc: Exception):
         f.write(f"Exception happened: {type(exc).__name__}: {str(exc)}\n")
         f.write(tb.format_exc())
     tb.print_exc()
+
+    # Echo back the request origin only when it's on the allowlist.
+    request_origin = request.headers.get("origin", "")
+    cors_origin = request_origin if request_origin in ALLOWED_ORIGINS else ALLOWED_ORIGINS[0]
+
     return JSONResponse(
         status_code=500,
         content={"detail": str(exc)},
         headers={
-            "Access-Control-Allow-Origin": "http://localhost:5173",
+            "Access-Control-Allow-Origin": cors_origin,
             "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Methods": "*",
             "Access-Control-Allow-Headers": "*",
+            "Vary": "Origin",
         }
     )
 

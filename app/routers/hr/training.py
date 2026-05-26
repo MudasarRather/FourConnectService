@@ -125,6 +125,17 @@ def delete_program(
     p = db.query(TrainingProgram).filter(TrainingProgram.id == program_id).first()
     if not p:
         raise HTTPException(404, "Not found")
+    active = (
+        db.query(func.count(TrainingAssignment.id))
+        .filter(TrainingAssignment.program_id == program_id)
+        .scalar()
+    )
+    if active:
+        raise HTTPException(
+            409,
+            f"Cannot delete a program with {active} assignment(s); "
+            "remove the assignees from this training first.",
+        )
     p.is_deleted = True
     db.commit()
 

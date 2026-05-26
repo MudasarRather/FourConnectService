@@ -4,6 +4,7 @@ All request and response shapes for the recruitment module. Each entity has
 the standard triplet: <Entity>Create, <Entity>Update, <Entity>Response. List
 responses paginate as { items, total, page, limit, total_pages }.
 """
+import enum
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Optional, List, Any, Dict
@@ -164,6 +165,20 @@ class PositionUpdate(BaseModel):
     status: Optional[PositionStatus] = None
 
 
+class PositionCloseReason(str, enum.Enum):
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    BUDGET = "BUDGET"
+    RESCOPED = "RESCOPED"
+    OTHER = "OTHER"
+
+
+class PositionCloseRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    reason: PositionCloseReason
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
 class PositionResponse(PositionBase):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
@@ -177,6 +192,10 @@ class PositionResponse(PositionBase):
     recruiter_name: Optional[str] = None
     hiring_manager_name: Optional[str] = None
     applications_count: int = 0
+    close_reason: Optional[str] = None
+    close_note: Optional[str] = None
+    closed_at: Optional[datetime] = None
+    closed_by_id: Optional[UUID] = None
     created_at: datetime
     updated_at: datetime
 

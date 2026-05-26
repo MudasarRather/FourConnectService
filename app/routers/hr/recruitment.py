@@ -31,6 +31,7 @@ from app.schemas.hr.recruitment import (
     RequisitionCreate, RequisitionUpdate, RequisitionResponse,
     RequisitionListResponse, RequisitionApproval,
     PositionCreate, PositionUpdate, PositionResponse, PositionListResponse,
+    PositionCloseRequest,
     CandidateCreate, CandidateUpdate, CandidateResponse, CandidateListResponse,
     ApplicationCreate, ApplicationUpdate, ApplicationResponse,
     ApplicationListResponse, ApplicationStageChange,
@@ -310,6 +311,28 @@ def _position_to_response(pos: JobPosition) -> dict:
     return data
 
 
+def _apply_position_fill(pos: JobPosition, joined: int) -> bool:
+    """Sync a position's filled_count to its JOINED-application count and
+    auto-close it once every opening is filled. Returns True if anything
+    changed so the caller knows whether to commit.
+
+    Only OPEN/ON_HOLD positions are auto-closed — a DRAFT or already-CLOSED
+    (incl. manually closed) position is left untouched, so a manual close can
+    never be silently reopened. Idempotent: safe to call on every load.
+    """
+    changed = False
+    if pos.filled_count != joined:
+        pos.filled_count = joined
+        changed = True
+    openings = pos.openings_count or 0
+    if openings > 0 and joined >= openings and pos.status in (
+        PositionStatus.OPEN, PositionStatus.ON_HOLD,
+    ):
+        pos.status = PositionStatus.CLOSED
+        changed = True
+    return changed
+
+
 @router.get("/positions", response_model=PositionListResponse)
 def list_positions(
     page: int = Query(1, ge=1),
@@ -347,6 +370,22 @@ def list_positions(
     q = q.order_by(desc(JobPosition.created_at))
 
     items, total, pages = _paginate(q, page, limit)
+
+    # Self-heal: reconcile filled_count and auto-close any fully-filled position
+    # whose status wasn't transitioned at join time (e.g. positions filled
+    # before auto-close existed). Uses the already-joinedloaded applications
+    # relationship, so no extra queries; commits only when something changed.
+    dirty = False
+    for pos in items:
+        joined = sum(
+            1 for a in (pos.applications or [])
+            if not a.is_deleted and a.current_stage == ApplicationStage.JOINED
+        )
+        if _apply_position_fill(pos, joined):
+            dirty = True
+    if dirty:
+        db.commit()
+
     return {
         "items": [_position_to_response(i) for i in items],
         "total": total,
@@ -445,13 +484,25 @@ def hold_position(
 @router.post("/positions/{pid}/close", response_model=PositionResponse)
 def close_position(
     pid: UUID,
+    payload: PositionCloseRequest,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_superuser),
 ):
     pos = db.query(JobPosition).filter(JobPosition.id == pid).first()
     if not pos:
         raise HTTPException(404, "Position not found")
+    # State-machine guard: only a live (OPEN / ON_HOLD) position can be closed.
+    # DRAFT positions are archived/published instead; an already-CLOSED or
+    # ARCHIVED position is a no-op error so a stale UI can't double-close.
+    if pos.status not in (PositionStatus.OPEN, PositionStatus.ON_HOLD):
+        raise HTTPException(
+            409, f"Only OPEN or ON_HOLD positions can be closed (current status: {pos.status.value})"
+        )
     pos.status = PositionStatus.CLOSED
+    pos.close_reason = payload.reason.value
+    pos.close_note = (payload.note or "").strip() or None
+    pos.closed_at = datetime.utcnow()
+    pos.closed_by_id = admin.id
     db.commit()
     db.refresh(pos)
     return _position_to_response(pos)
@@ -1317,6 +1368,20 @@ def respond_offer(
         o.application.candidate.status = CandidateStatus.JOINED
         o.application.current_stage = ApplicationStage.JOINED
         o.application.stage_changed_at = datetime.utcnow()
+        # The candidate has joined this position — auto-close it if every
+        # opening is now filled. Flush first so the count below sees the
+        # JOINED stage we just set (session is autoflush=False).
+        pid = o.application.position_id or o.position_id
+        if pid:
+            db.flush()
+            joined = db.query(func.count(Application.id)).filter(
+                Application.position_id == pid,
+                Application.current_stage == ApplicationStage.JOINED,
+                Application.is_deleted == False,  # noqa: E712
+            ).scalar() or 0
+            pos = db.query(JobPosition).filter(JobPosition.id == pid).first()
+            if pos:
+                _apply_position_fill(pos, joined)
     db.commit()
     db.refresh(o)
     return _offer_to_response(o)

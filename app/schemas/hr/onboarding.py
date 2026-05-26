@@ -342,6 +342,7 @@ class DashboardStatsResponse(BaseModel):
     probation_employees: int
     training_pending: int
     incomplete_onboarding: int
+    completed_onboarding: int = 0   # processes with status == COMPLETED
     department_wise_joining: List[dict]  # [{department, count}]
 
 

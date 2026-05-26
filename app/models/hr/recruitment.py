@@ -276,6 +276,12 @@ class JobPosition(Base):
     status = Column(Enum(PositionStatus, name="hr_rec_position_status"), nullable=False, default=PositionStatus.DRAFT, index=True)
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
 
+    # Manual-close audit trail (set by POST /positions/{id}/close).
+    close_reason = Column(String(40), nullable=True)   # FILLED | CANCELLED | BUDGET | RESCOPED | OTHER
+    close_note = Column(Text, nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)

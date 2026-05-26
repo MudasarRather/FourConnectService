@@ -304,6 +304,7 @@ def dashboard_stats(
         .count()
     )
     incomplete = base_proc.filter(OnboardingProcess.status == OnboardingStatus.IN_PROGRESS).count()
+    completed = base_proc.filter(OnboardingProcess.status == OnboardingStatus.COMPLETED).count()
 
     dept_rows = (
         db.query(Department.name, func.count(OnboardingProcess.id))
@@ -325,6 +326,7 @@ def dashboard_stats(
         probation_employees=int(probation_employees),
         training_pending=int(training_pending),
         incomplete_onboarding=int(incomplete),
+        completed_onboarding=int(completed),
         department_wise_joining=department_wise,
     )
 
@@ -377,8 +379,23 @@ def pending_joining_tray(
         .order_by(Offer.joining_date.asc().nullslast(), Offer.updated_at.desc())
         .all()
     )
+    # Employees whose onboarding is fully complete are no longer "pending joining" —
+    # drop their accepted offer from the tray so finished joiners don't linger here.
+    completed_emp_ids = {
+        row[0]
+        for row in (
+            db.query(OnboardingProcess.employee_id)
+            .filter(
+                OnboardingProcess.status == OnboardingStatus.COMPLETED,
+                OnboardingProcess.is_deleted == False,  # noqa: E712
+            )
+            .all()
+        )
+    }
     result: List[PendingJoiningResponse] = []
     for o in offers:
+        if o.employee_id is not None and o.employee_id in completed_emp_ids:
+            continue
         cand = o.candidate
         result.append(PendingJoiningResponse(
             offer_id=o.id,

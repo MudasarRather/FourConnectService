@@ -101,41 +101,70 @@ def signup(user_data: UserCreate, db: Session = Depends(get_db)):
 @router.post("/login")
 def login(credentials: UserLogin):
     try:
-        # Find user by email using direct psycopg2 to bypass SQLAlchemy deadlocks on Python 3.14
+        # Find user by email using direct psycopg2 to bypass SQLAlchemy deadlocks on Python 3.14.
         import psycopg2
         import psycopg2.extras
         from app.config import get_settings
         settings = get_settings()
-        
-        # Use config credentials directly
-        db_url = settings.DATABASE_URL
-        # Parse URL manually for psycopg2 since we can't trust SQLAlchemy's parsing in this env
-        # Example: postgresql://postgres:acer2gb@127.0.0.1:5432/fourreck_db
-        import re
-        match = re.search(r'postgresql://(.*?):(.*?)@(.*?):(\d+)/(.*)', db_url)
-        if match:
-            user, password, host, port, dbname = match.groups()
-        else:
-            # Fallback to defaults (based on user info)
-            user, password, host, port, dbname = "postgres", "acer2gb", "127.0.0.1", "5432", "fourreck_db"
+
+        # Normalize the URL — psycopg2 accepts `postgresql://` and `postgres://`
+        # but not the SQLAlchemy-style `postgresql+psycopg2://` driver suffix.
+        # Strip it if present so psycopg2's native DSN parser can read the URL.
+        db_url = settings.DATABASE_URL or ""
+        if db_url.startswith("postgresql+psycopg2://"):
+            db_url = "postgresql://" + db_url[len("postgresql+psycopg2://"):]
+        elif db_url.startswith("postgres+psycopg2://"):
+            db_url = "postgresql://" + db_url[len("postgres+psycopg2://"):]
+
+        if not db_url:
+            raise HTTPException(
+                status_code=500,
+                detail="Server misconfiguration: DATABASE_URL is empty"
+            )
+
+        # Use psycopg2's native URL connect — handles query strings (sslmode,
+        # options), URL-encoded special chars in password, and the `postgres://`
+        # / `postgresql://` schemes. Avoids the previous brittle regex which
+        # silently fell back to localhost credentials on any URL it couldn't
+        # match.
+        try:
+            conn = psycopg2.connect(db_url)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database connection failed: {type(e).__name__}: {str(e)}"
+            )
 
         try:
-            conn = psycopg2.connect(
-                host=host,
-                user=user,
-                password=password,
-                port=port,
-                dbname=dbname
-            )
-            # Use DictCursor from extras
             cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            # Fetch user details including is_superuser
-            cur.execute("SELECT id, email, full_name, hashed_password, is_active, is_superuser, is_activated FROM users WHERE email = %s", (credentials.email,))
-            user_row = cur.fetchone()
-            cur.close()
+            # Fetch user details. Wrap in a single try so a missing column on
+            # the live DB (schema drift) yields a precise error message rather
+            # than a generic 500.
+            try:
+                cur.execute(
+                    "SELECT id, email, full_name, hashed_password, is_active, is_superuser, is_activated "
+                    "FROM users WHERE email = %s",
+                    (credentials.email,)
+                )
+                user_row = cur.fetchone()
+            except psycopg2.errors.UndefinedColumn as e:
+                # Column drift between model and live DB — most commonly
+                # is_activated hasn't been added. Fall back to a minimal SELECT
+                # so login still works for environments missing the new column.
+                conn.rollback()
+                cur.execute(
+                    "SELECT id, email, full_name, hashed_password, is_active, is_superuser "
+                    "FROM users WHERE email = %s",
+                    (credentials.email,)
+                )
+                row = cur.fetchone()
+                user_row = dict(row) if row else None
+                if user_row is not None:
+                    user_row['is_activated'] = True  # safe default
+            finally:
+                cur.close()
+        finally:
             conn.close()
-        except Exception as e:
-             raise Exception(f"Database connection error: {str(e)}")
 
         if not user_row:
             raise HTTPException(
@@ -143,7 +172,7 @@ def login(credentials: UserLogin):
                 detail="Incorrect email or password",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
+
         # Mimic User object
         class SimpleUser:
             pass
@@ -154,30 +183,37 @@ def login(credentials: UserLogin):
         user.is_active = user_row['is_active']
         user.is_superuser = user_row['is_superuser']
         user.is_activated = user_row['is_activated']
-        
-        # Verify password (using the updated pbkdf2 context from utils.auth)
-        if not verify_password(credentials.password, user.hashed_password):
+
+        # Verify password (argon2 via passlib — see app/utils/auth.py).
+        try:
+            password_ok = verify_password(credentials.password, user.hashed_password)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Password verifier failed: {type(e).__name__}: {str(e)}"
+            )
+        if not password_ok:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
+
         if not user.is_active:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Inactive user account"
             )
-        
+
         # Create access token
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={"sub": str(user.id)},
             expires_delta=access_token_expires
         )
-        
+
         return {
-            "access_token": access_token, 
+            "access_token": access_token,
             "token_type": "bearer",
             "is_activated": user.is_activated,
             "is_superuser": user.is_superuser,
@@ -192,10 +228,18 @@ def login(credentials: UserLogin):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        with open("backend_debug_err.log", "a") as f:
-             f.write(f"Login Outer Error: {str(e)}\n")
-             traceback.print_exc(file=f)
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            with open("backend_debug_err.log", "a") as f:
+                f.write(f"Login Outer Error: {type(e).__name__}: {str(e)}\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        # Surface a categorised detail so the frontend / browser devtools
+        # response body shows the real cause instead of just str(e).
+        raise HTTPException(
+            status_code=500,
+            detail=f"Login failed: {type(e).__name__}: {str(e)}"
+        )
 
 
 @router.get("/me", response_model=UserResponse)

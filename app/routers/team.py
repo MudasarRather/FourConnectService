@@ -242,8 +242,13 @@ def get_approved_projects(
     items = []
     try:
         for p in projects:
-            # Team members already loaded via selectinload - no additional queries
-            members = p.team_members
+            # Team members already loaded via selectinload - no additional queries.
+            # Exclude soft-deleted ('removed') members so the row avatars and
+            # team_count match what the admin's "Assigned Team" panel shows
+            # after a successful remove. Without this filter, the removed
+            # member's avatar lingers on the project row even though the
+            # backend has marked them removed — making the remove look broken.
+            members = [m for m in p.team_members if m.status != 'removed']
             team_members_data = []
             for m in members:
                 team_members_data.append({
@@ -261,7 +266,7 @@ def get_approved_projects(
                     "override_reason": m.override_reason,
                     "is_superuser": m.user.is_superuser if m.user else False
                 })
-            
+
             items.append({
                 "id": p.id,
                 "code": p.code,

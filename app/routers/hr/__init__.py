@@ -21,6 +21,21 @@ from app.routers.hr.training import router as _training_router
 from app.routers.hr.induction import router as _induction_router
 from app.routers.hr.account_provisioning import router as _account_provisioning_router
 from app.routers.hr.welcome_kit import router as _welcome_kit_router
+from app.routers.hr.employee_documents import router as _employee_documents_router
+
+# Attendance module — Phase 2.0
+from app.routers.hr.shifts import router as _shifts_router
+from app.routers.hr.attendance import router as _attendance_router
+from app.routers.hr.attendance_corrections import router as _att_corrections_router
+from app.routers.hr.wfh import router as _wfh_router
+from app.routers.hr.overtime import router as _overtime_router
+from app.routers.hr.holidays import router as _holidays_router
+from app.routers.hr.attendance_policies import router as _att_policies_router
+from app.routers.hr.geo_fences import router as _geo_fences_router
+from app.routers.hr.biometric import router as _biometric_router
+from app.routers.hr.attendance_logs import router as _attendance_logs_router
+from app.routers.hr.attendance_reports import router as _attendance_reports_router
+from app.routers.hr.half_day import router as _half_day_router
 
 router = APIRouter()
 router.include_router(_dashboard_router)
@@ -38,3 +53,24 @@ router.include_router(_training_router)
 router.include_router(_induction_router)
 router.include_router(_account_provisioning_router)
 router.include_router(_welcome_kit_router)
+router.include_router(_employee_documents_router)
+
+# Attendance — order matters when prefixes share roots: more-specific
+# (corrections, policies, logs) before the broad /hr/attendance router. The
+# distinct prefixes don't actually collide, but keeping this order makes the
+# OpenAPI route table easier to scan.
+router.include_router(_shifts_router)
+router.include_router(_att_corrections_router)
+router.include_router(_att_policies_router)
+router.include_router(_attendance_logs_router)
+# IMPORTANT: reports sub-router (prefix /hr/attendance/reports) must register
+# before the broad attendance router (prefix /hr/attendance) so /reports/...
+# isn't shadowed by the `/{attendance_id}` route on the broad router.
+router.include_router(_attendance_reports_router)
+router.include_router(_attendance_router)
+router.include_router(_wfh_router)
+router.include_router(_half_day_router)
+router.include_router(_overtime_router)
+router.include_router(_holidays_router)
+router.include_router(_geo_fences_router)
+router.include_router(_biometric_router)

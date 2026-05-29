@@ -12,3 +12,14 @@ pydantic[email]>=2.7.0
 pydantic-settings>=2.2.1
 huggingface_hub>=0.20.0
 
+# ── Reporting stack ────────────────────────────────────────────────────────
+# WeasyPrint renders the unique branded PDFs for HR Attendance Reports.
+# On Windows it needs GTK3 DLLs in PATH — vendor/gtk-runtime/ ships them and
+# app/utils/gtk_bootstrap.py prepends that dir to PATH at import time.
+# On Linux/macOS the system Pango/Cairo are used and the bootstrap is a no-op.
+weasyprint>=68.0
+# openpyxl: cell-level styling, theming, conditional formats, formulas.
+# xlsxwriter: native chart objects, sparklines, complex number formats.
+# Both are used side-by-side — see app/utils/hr/attendance_reports/excel/.
+openpyxl>=3.1.5
+xlsxwriter>=3.2.0

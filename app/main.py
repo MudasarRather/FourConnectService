@@ -1,3 +1,26 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Windows WMI bypass — must run BEFORE SQLAlchemy is imported.
+# SQLAlchemy 2's cyextension chain calls platform.uname() / _Processor.get(),
+# which on Windows talks to the WMI service. When Winmgmt is wedged (a known
+# Win11 quirk that recurs without warning), that call blocks forever and the
+# uvicorn worker hangs at import with no log output. Priming the cache here
+# short-circuits both calls. No-op on Linux/macOS where _Processor.get reads
+# /proc or sysctl and never blocks. Set `ur.__dict__["processor"]` directly —
+# uname_result._replace iterates the tuple, which would re-trigger WMI via the
+# cached_property.
+import sys as _sys
+if _sys.platform == "win32":
+    import platform as _platform
+    _ur = _platform.uname_result("Windows", "localhost", "11", "10.0", "AMD64")
+    _ur.__dict__["processor"] = "Intel"
+    _platform._uname_cache = _ur
+    _platform._Processor.get = staticmethod(lambda: "Intel")
+
+# Prepare GTK runtime DLL path on Windows so WeasyPrint can render PDF
+# reports without each handler having to bootstrap. No-op on Linux/macOS.
+from app.utils.gtk_bootstrap import ensure_gtk_runtime as _ensure_gtk_runtime
+_ensure_gtk_runtime()
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html

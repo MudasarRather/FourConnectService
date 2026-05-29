@@ -83,13 +83,40 @@ from app.models.hr.induction import (
     InductionSession,
     InductionAttendance,
     InductionType,
-    AttendanceStatus,
+    AttendanceStatus as InductionAttendanceStatus,
 )
 from app.models.hr.account_provisioning import (
     AccountProvisioning,
     AccountType,
     AccountProvisioningStatus,
 )
+from app.models.hr.employee_document import (
+    EmployeeDocument,
+    EmployeeDocumentEvent,
+    EmployeeDocumentTemplate,
+    DocumentCategory,
+    DocVerificationStatus,
+    DocSource,
+    DocTemplateType,
+    CONFIDENTIAL_CATEGORIES,
+)
+from app.models.hr.document_request import (
+    DocumentRequest,
+    DocumentRequestType,
+    DocumentRequestStatus,
+)
+# Attendance module — Phase 2.0
+from app.models.hr.shift import Shift, EmployeeShiftAssignment, ShiftType
+from app.models.hr.attendance import Attendance, AttendanceStatus, AttendanceSource
+from app.models.hr.attendance_punch import AttendancePunch, PunchType
+from app.models.hr.attendance_correction import AttendanceCorrection, CorrectionStatus
+from app.models.hr.wfh_request import WfhRequest, WfhStatus, WfhRequestType
+from app.models.hr.overtime import OvertimeRequest, OtType, OtStatus, OtPayrollStatus
+from app.models.hr.holiday import Holiday, HolidayType
+from app.models.hr.attendance_policy import AttendancePolicy, PolicyType
+from app.models.hr.geo_fence import GeoFence
+from app.models.hr.biometric_device import BiometricDevice, BiometricDeviceType, BiometricDeviceStatus
+from app.models.hr.attendance_log import AttendanceLog, AttendanceLogAction
 
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
@@ -170,9 +197,50 @@ __all__ = [
     "InductionSession",
     "InductionAttendance",
     "InductionType",
-    "AttendanceStatus",
+    "InductionAttendanceStatus",
     # Account Provisioning
     "AccountProvisioning",
     "AccountType",
     "AccountProvisioningStatus",
+    # Employee Documents
+    "EmployeeDocument",
+    "EmployeeDocumentEvent",
+    "EmployeeDocumentTemplate",
+    "DocumentCategory",
+    "DocVerificationStatus",
+    "DocSource",
+    "DocTemplateType",
+    "CONFIDENTIAL_CATEGORIES",
+    # Document Requests
+    "DocumentRequest",
+    "DocumentRequestType",
+    "DocumentRequestStatus",
+    # Attendance / Shifts
+    "Shift",
+    "EmployeeShiftAssignment",
+    "ShiftType",
+    "Attendance",
+    "AttendanceStatus",
+    "AttendanceSource",
+    "AttendancePunch",
+    "PunchType",
+    "AttendanceCorrection",
+    "CorrectionStatus",
+    "WfhRequest",
+    "WfhStatus",
+    "WfhRequestType",
+    "OvertimeRequest",
+    "OtType",
+    "OtStatus",
+    "OtPayrollStatus",
+    "Holiday",
+    "HolidayType",
+    "AttendancePolicy",
+    "PolicyType",
+    "GeoFence",
+    "BiometricDevice",
+    "BiometricDeviceType",
+    "BiometricDeviceStatus",
+    "AttendanceLog",
+    "AttendanceLogAction",
 ]

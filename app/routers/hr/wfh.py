@@ -107,6 +107,11 @@ def create_my_wfh(
     user: User = Depends(get_current_user),
 ):
     emp = _resolve_self(db, user)
+    # WFH/Remote is forward-looking: a past date can never be approved (see the
+    # approve handler), so reject it at creation rather than letting a dead
+    # request pile up in the admin queue.
+    if payload.wfh_date < date.today():
+        raise HTTPException(422, "WFH/remote requests must be for today or a future date")
     if payload.wfh_date_until and payload.wfh_date_until < payload.wfh_date:
         raise HTTPException(422, "wfh_date_until must be >= wfh_date")
     w = WfhRequest(

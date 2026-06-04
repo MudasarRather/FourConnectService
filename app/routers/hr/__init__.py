@@ -22,6 +22,7 @@ from app.routers.hr.induction import router as _induction_router
 from app.routers.hr.account_provisioning import router as _account_provisioning_router
 from app.routers.hr.welcome_kit import router as _welcome_kit_router
 from app.routers.hr.employee_documents import router as _employee_documents_router
+from app.routers.hr.employee_document_reports import router as _employee_document_reports_router
 
 # Attendance module — Phase 2.0
 from app.routers.hr.shifts import router as _shifts_router
@@ -36,6 +37,7 @@ from app.routers.hr.biometric import router as _biometric_router
 from app.routers.hr.attendance_logs import router as _attendance_logs_router
 from app.routers.hr.attendance_reports import router as _attendance_reports_router
 from app.routers.hr.half_day import router as _half_day_router
+from app.routers.hr.leaves import router as _leaves_router
 
 router = APIRouter()
 router.include_router(_dashboard_router)
@@ -53,6 +55,10 @@ router.include_router(_training_router)
 router.include_router(_induction_router)
 router.include_router(_account_provisioning_router)
 router.include_router(_welcome_kit_router)
+# Reports sub-router (prefix /hr/employee-documents/reports) registers before
+# the broad employee-documents router so /reports/... isn't shadowed by the
+# `/{doc_id}` route on the broad router.
+router.include_router(_employee_document_reports_router)
 router.include_router(_employee_documents_router)
 
 # Attendance — order matters when prefixes share roots: more-specific
@@ -70,6 +76,7 @@ router.include_router(_attendance_reports_router)
 router.include_router(_attendance_router)
 router.include_router(_wfh_router)
 router.include_router(_half_day_router)
+router.include_router(_leaves_router)
 router.include_router(_overtime_router)
 router.include_router(_holidays_router)
 router.include_router(_geo_fences_router)

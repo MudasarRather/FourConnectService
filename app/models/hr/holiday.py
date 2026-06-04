@@ -34,3 +34,13 @@ class Holiday(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+    # Provenance — distinguish admin-entered rows from rows materialized by the
+    # bulk public-holiday importer. Without this, an activated import is
+    # indistinguishable from a hand-typed holiday and admins lose track of why
+    # a date is exempted from leave. Values:
+    #   'manual'      — admin typed/edited it via the Holidays UI
+    #   'import:in'   — POST /api/hr/holidays/import?country=IN (curated)
+    #   'import:nager'— POST /api/hr/holidays/import?country=XX (Nager.Date API)
+    source = Column(String(32), nullable=False, server_default="manual", index=True)
+    source_ref = Column(String(120), nullable=True)   # e.g. "IN:2026"

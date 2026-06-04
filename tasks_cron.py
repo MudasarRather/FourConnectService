@@ -25,6 +25,12 @@ def run_cron():
         result = check_document_expiry_alerts(db)
         print(f"- Document expiry checks completed: {result}")
 
+        # 4. Attendance finalizer: stamp ABSENT / HALF_DAY / WEEK_OFF etc. for
+        #    shifts that have ended (also runs in-process on a 15-min thread).
+        from app.utils.hr.attendance_finalizer import finalize_due_attendance
+        n = finalize_due_attendance(db)
+        print(f"- Attendance finalizer processed {n} record(s) for today.")
+
         print("Success: All transitions processed.")
     except Exception as e:
         print(f"Error during task transitions: {e}")

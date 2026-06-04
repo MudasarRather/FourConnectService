@@ -130,6 +130,11 @@ class EmployeeUpdate(BaseModel):
     # full_name / email may be null to skip; backend validates uniqueness on email.
     full_name: Optional[str] = None
     email: Optional[EmailStr] = None
+    # employee_code is canonical on User (unique) and mirrored on Employee;
+    # backend updates both inside update_employee. employee_id stays
+    # immutable (auto-generated sequence — use a separate admin tool to
+    # renumber).
+    employee_code: Optional[str] = None
 
     # Identity
     gender: Optional[str] = None

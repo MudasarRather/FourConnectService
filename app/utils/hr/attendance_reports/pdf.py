@@ -118,15 +118,22 @@ def _columns(key: str) -> list[dict]:
         return [
             {"label": "Code", "key": "employee_code", "align": "left"},
             {"label": "Employee", "key": "employee_name", "align": "left"},
-            {"label": "Department", "key": "department", "align": "left"},
-            {"label": "Present", "key": "present_days", "align": "right"},
+            {"label": "Dept", "key": "department", "align": "left"},
+            {"label": "Pre", "key": "present_days", "align": "right"},
             {"label": "Late", "key": "late_days", "align": "right", "warn_if": lambda v: v > 0},
-            {"label": "Absent", "key": "absent_days", "align": "right", "danger_if": lambda v: v > 0},
+            {"label": "Half", "key": "half_days", "align": "right"},
+            {"label": "Abs", "key": "absent_days", "align": "right", "danger_if": lambda v: v > 0},
+            {"label": "LWP", "key": "lwp_days", "align": "right", "warn_if": lambda v: v > 0},
+            {"label": "Leave", "key": "leave_days", "align": "right", "good_if": lambda v: v > 0},
             {"label": "WFH", "key": "wfh_days", "align": "right"},
-            {"label": "Leave", "key": "leave_days", "align": "right"},
-            {"label": "Working hrs", "key": "total_working_hours", "align": "right", "fmt": "hours"},
+            {"label": "LOP", "key": "lop_days", "align": "right", "danger_if": lambda v: v > 0},
+            {"label": "Payable", "key": "payable_days", "align": "right"},
+            {"label": "Work hrs", "key": "total_working_hours", "align": "right", "fmt": "hours"},
             {"label": "Break hrs", "key": "total_break_hours", "align": "right", "fmt": "hours"},
+            {"label": "Excess brk", "key": "excess_break_minutes", "align": "right", "fmt": "mins", "warn_if": lambda v: v > 0},
             {"label": "OT hrs", "key": "total_overtime_hours", "align": "right", "fmt": "hours", "good_if": lambda v: v > 0},
+            {"label": "Late", "key": "total_late_minutes", "align": "right", "fmt": "mins", "warn_if": lambda v: v > 0},
+            {"label": "Att %", "key": "attendance_pct", "align": "right", "fmt": "pct"},
         ]
     if key == "late":
         return [
@@ -287,6 +294,24 @@ _BASE_CSS = """
     @bottom-left { content: ""; }
     @bottom-right { content: ""; }
 }
+/* Wide landscape pages — used by the detailed Monthly Summary table so its
+   full payroll column set fits without clipping. */
+@page wide {
+    size: A4 landscape;
+    margin: 14mm 12mm 18mm 12mm;
+    @bottom-left {
+        content: "{COMPANY_LEGAL} · {COMPANY_WEB}";
+        font-family: 'Helvetica', sans-serif; font-size: 7.5pt; color: #786c5c;
+    }
+    @bottom-right {
+        content: "Page " counter(page) " of " counter(pages);
+        font-family: 'Helvetica', sans-serif; font-size: 7.5pt; color: #786c5c;
+    }
+}
+.body-wide { page: wide; }
+.body-wide .data-table { font-size: 7pt; }
+.body-wide .data-table th { padding: 4pt 4pt; font-size: 6.6pt; }
+.body-wide .data-table td { padding: 3.2pt 4pt; }
 * { box-sizing: border-box; }
 html, body {
     margin: 0; padding: 0;
@@ -352,56 +377,65 @@ html, body {
     margin-bottom: 12mm;
 }
 .cover-period {
-    margin: 0 auto;
-    padding: 6mm 8mm;
-    border-radius: 3mm;
-    width: 150mm;
+    margin: 0 auto 14mm;           /* big gap before KPI strip — visually separated */
+    padding: 7mm 9mm;
+    border-radius: 3.5mm;
+    width: 154mm;
     display: flex; justify-content: space-between; align-items: center;
+    position: relative;
+    overflow: hidden;              /* clip any decorative children to rounded corners */
 }
 .cover-period .label {
-    font-size: 7pt; letter-spacing: 1.6pt; font-weight: 800;
+    font-size: 7pt; letter-spacing: 2pt; font-weight: 800;
     text-transform: uppercase;
+    opacity: 0.85;
 }
 .cover-period .value {
-    font-size: 11pt; font-weight: 800;
+    font-size: 11.5pt; font-weight: 800;
     color: #1a1410;
-    margin-top: 1.5mm;
+    margin-top: 2mm;
+    letter-spacing: -0.1pt;
 }
 .cover-generated {
     text-align: center;
-    margin: 4mm 0 12mm;
+    margin: 5mm 0 10mm;
     font-size: 8.5pt;
     color: #6b7280;
+    letter-spacing: 0.3pt;
 }
 .kpi-grid {
-    display: flex; gap: 4mm; margin: 0 auto;
+    display: flex; gap: 4.5mm;
+    margin: 8mm auto 0;            /* universal top buffer so KPI tiles can't visually touch whatever precedes them */
     width: 170mm;
 }
 .kpi-tile {
     flex: 1;
     padding: 6mm 4mm 7mm;
-    background: #fffdf5;
-    border: 1pt solid #e6e1d7;
-    border-radius: 3mm;
+    background: #ffffff;
+    /* Sharp rectangular tiles — corporate report aesthetic. Dropping
+       border-radius eliminates the WeasyPrint corner-rendering quirk
+       where a thick border-top + thin side borders produce mismatched
+       rounded vs square corners. The colored top rail is set per-tile
+       via inline `border-top-color`. */
+    border: 0.8pt solid #8a8170;
+    border-top: 2.5mm solid #ea580c;   /* color overridden per tile */
     text-align: center;
     position: relative;
-}
-.kpi-tile::before {
-    content: ''; position: absolute; left: 0; right: 0; top: 0;
-    height: 1.6mm;
+    box-shadow: 0 1pt 3pt rgba(26, 20, 16, 0.08);
 }
 .kpi-label {
-    font-size: 7pt; letter-spacing: 1.4pt; font-weight: 800;
-    color: #786c5c;
+    font-size: 7pt; letter-spacing: 1.6pt; font-weight: 800;
+    color: #6b5840;
     text-transform: uppercase;
-    margin-bottom: 2mm;
+    margin: 2mm 0 2.5mm;
 }
 .kpi-value {
     font-size: 22pt; font-weight: 900;
     line-height: 1;
-    letter-spacing: -0.3pt;
+    letter-spacing: -0.4pt;
+    font-variant-numeric: tabular-nums;
 }
-.kpi-value small { font-size: 11pt; opacity: 0.7; }
+.kpi-value small { font-size: 11pt; opacity: 0.7; font-weight: 700; }
 .cover-footer {
     position: absolute;
     left: 0; right: 0;
@@ -434,75 +468,103 @@ html, body {
     justify-content: space-between;
     align-items: baseline;
     border-bottom: 0.6pt solid #d1cabb;
-    padding-bottom: 2mm; margin-bottom: 5mm;
+    padding-bottom: 2.5mm; margin-bottom: 6mm;
 }
 .page-head .title {
     font-size: 12pt; font-weight: 800; letter-spacing: -0.2pt;
 }
 .page-head .meta {
-    font-size: 7pt; color: #786c5c; letter-spacing: 0.4pt;
+    font-size: 7pt; color: #786c5c; letter-spacing: 0.5pt;
 }
 .section-h {
-    margin: 4mm 0 2mm;
-    font-size: 16pt; font-weight: 900; letter-spacing: -0.3pt;
+    margin: 5mm 0 2mm;
+    font-size: 18pt; font-weight: 900; letter-spacing: -0.4pt;
+    line-height: 1.1;
 }
 .section-rule {
-    width: 22mm; height: 0.9mm;
+    width: 26mm; height: 1.1mm;
     margin-bottom: 4mm;
+    border-radius: 0.6mm;
 }
 .section-sub {
-    margin: 0 0 4mm;
+    margin: 0 0 6mm;
     font-size: 9.5pt;
     color: #4b5563;
+    letter-spacing: 0.1pt;
 }
 
-/* ─────────── Data table (shared) ─────────── */
+/* ─────────── Data table (shared) ───────────
+   Uses border-collapse: collapse for clean page-flow. Every cell gets a
+   visible grid border on all four sides — corporate spreadsheet feel.
+   thead repeats on every continuation page (display: table-header-group),
+   and every row carries page-break-inside: avoid so a single row never
+   gets split across pages.
+   ──────────────────────────────────────────────────────────────────── */
 .data-table {
     width: 100%;
     border-collapse: collapse;
-    margin-top: 1mm;
-    font-size: 8.5pt;
+    margin-top: 2mm;
+    font-size: 8pt;
+    table-layout: auto;
 }
 .data-table thead {
-    display: table-header-group;
+    display: table-header-group;       /* auto-repeat header on each page */
+}
+.data-table tbody tr {
+    page-break-inside: avoid;          /* don't split a row across pages */
+    break-inside: avoid;
+    -weasy-page-break-inside: avoid;
+}
+.data-table tbody td {
+    page-break-inside: avoid;          /* belt-and-suspenders for WeasyPrint */
+    break-inside: avoid;
 }
 .data-table th {
     color: #fff;
     text-align: left;
-    padding: 2.6mm 2mm;
+    padding: 2.4mm 1.8mm;
     font-weight: 800;
-    font-size: 7.5pt;
-    letter-spacing: 0.6pt;
+    font-size: 7pt;
+    letter-spacing: 0.5pt;
     text-transform: uppercase;
+    border: 1pt solid #1a1410;         /* dark border on all sides of header */
+    border-bottom-width: 2pt;
 }
 .data-table th.r { text-align: right; }
 .data-table th.c { text-align: center; }
 .data-table td {
-    padding: 2mm 2mm;
-    border-bottom: 0.3pt solid #ece6d7;
+    padding: 1.6mm 1.8mm;
+    /* 1.4pt solid charcoal — heavy enough to render at any PDF viewer
+       zoom (30%–200%), but slim enough that 12-column wide tables
+       (Daily Roster, Monthly Summary) still fit within A4 portrait. */
+    border: 1.4pt solid #1a1410;
     vertical-align: middle;
     color: #1a1410;
 }
-.data-table tr.zebra td { background: #fffdf5; }
+.data-table tr.zebra td { background: #fbf8f0; }
 .data-table td.r { text-align: right; font-variant-numeric: tabular-nums; }
 .data-table td.c { text-align: center; }
 .data-table td.cell-danger {
-    background: #fee2e2; color: #7f1d1d; font-weight: 700;
+    background: #fee2e2; color: #7f1d1d; font-weight: 800;
+    border-left: 1.2pt solid #b91c1c;
 }
 .data-table td.cell-warn {
-    background: #fef9c3; color: #713f12; font-weight: 700;
+    background: #fef9c3; color: #713f12; font-weight: 800;
+    border-left: 1.2pt solid #a16207;
 }
 .data-table td.cell-good {
-    background: #ccfbf1; color: #115e59; font-weight: 700;
+    background: #ccfbf1; color: #115e59; font-weight: 800;
+    border-left: 1.2pt solid #0d9488;
 }
 .status-pill {
     display: inline-block;
-    padding: 0.6mm 2mm;
-    border-radius: 5mm;
+    padding: 1mm 2.5mm;
+    border-radius: 6mm;
     font-size: 6.8pt;
     font-weight: 800;
-    letter-spacing: 0.5pt;
+    letter-spacing: 0.6pt;
     text-transform: uppercase;
+    line-height: 1.1;
 }
 
 /* Empty-state message */
@@ -564,7 +626,6 @@ def _kpi_tiles_html(summary: dict, accent: str, shaped_count: int | None = None)
         '<div class="kpi-grid">'
         + "".join(
             f'<div class="kpi-tile" style="border-top-color:{c}">'
-            f'<div class="kpi-stripe" style="position:absolute;left:0;right:0;top:0;height:1.6mm;background:{c}"></div>'
             f'<div class="kpi-label">{html.escape(label)}</div>'
             f'<div class="kpi-value" style="color:{c}">{val}</div>'
             f'</div>'
@@ -1210,7 +1271,7 @@ def _cover_cafe(meta: dict, summary: dict, period: dict, shaped_count: int | Non
         </div>
 
         <!-- receipt body -->
-        <div style="margin:0 auto;width:140mm;background:#fff;border:1pt dashed {deep};padding:6mm 8mm;font-family:'Courier New',monospace;font-size:10pt;color:#1a1410;position:relative;z-index:2">
+        <div style="margin:0 auto;width:140mm;background:#fff;border:1pt dashed {deep};padding:6mm 8mm;font-family:'Courier New',monospace;font-size:10pt;color:#1a1410">
             <div style="text-align:center;font-weight:900;letter-spacing:2pt;border-bottom:0.4pt dashed {deep};padding-bottom:2mm;margin-bottom:3mm">
                 ⊳ DAILY BREAK RECEIPT ⊲
             </div>
@@ -1223,6 +1284,12 @@ def _cover_cafe(meta: dict, summary: dict, period: dict, shaped_count: int | Non
             <div style="border-top:1pt double {deep};margin:3mm 0 1mm"></div>
             <div style="text-align:center;font-style:italic;color:#6b5840">— thank you for fuelling up —</div>
         </div>
+
+        <!-- Literal spacer — block sibling with explicit height. Margins
+             collapse in WeasyPrint; padding-on-parent or a sized spacer
+             div doesn't. This is the only reliable way to guarantee gap
+             between two flow elements. 30mm = clearly visible separation. -->
+        <div style="height:30mm;clear:both;display:block;font-size:0;line-height:0">&nbsp;</div>
 
         {_kpi_tiles_html(summary, accent, shaped_count)}
 
@@ -1287,7 +1354,8 @@ def _body_pages(report_key: str, shaped_rows: list[dict], summary: dict, meta: d
     .data-table th {{ background: {accent}; }}
     """
 
-    return f"<section>{page_head}{section_h}{table}<style>{accent_css}</style></section>"
+    body_cls = "body-wide" if report_key == "monthly" else ""
+    return f'<section class="{body_cls}">{page_head}{section_h}{table}<style>{accent_css}</style></section>'
 
 
 # ════════════════════════════════════════════════════════════════════════════

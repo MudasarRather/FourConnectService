@@ -19,6 +19,9 @@ Design philosophy:
     * Autofilter on the main table.
     * One title band per report, themed to match the PDF cover accent.
     * Conditional formats highlight outliers without burying them.
+    * Corporate typography — Calibri / Aptos at restrained sizes (18-22pt
+      titles, 9-10pt body). No editorial-style display fonts that look
+      out of place in a spreadsheet.
 """
 from __future__ import annotations
 
@@ -35,6 +38,179 @@ COMPANY = {
     "legal": "Fourreck Technologies Pvt. Ltd.",
     "web": "fourreck.com",
 }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Shared corporate palette — unified neutrals across every report so titles,
+# subtitles, period bands and zebra rows feel like one product line. Each
+# report still gets its own accent color (drives the KPI top-rail, tab tint,
+# header row + chart fills) so visual identity per report is preserved.
+# ════════════════════════════════════════════════════════════════════════════
+BRAND = {
+    "ink":          "#111418",   # primary text
+    "ink_muted":    "#475569",   # secondary text
+    "ink_dim":      "#94a3b8",   # tertiary
+    "rule":         "#94a3b8",   # body cell borders — strong enough to read on white
+    "rule_soft":    "#cbd5e1",   # zebra row dividers / column rules
+    "rule_strong":  "#475569",   # header rules + period band underline
+    "cream":        "#fbf8f0",   # zebra fill (warm cream)
+    "panel":        "#ffffff",   # KPI tile background
+    "panel_soft":   "#f1f5f9",   # period band background
+    "header_ink":   "#ffffff",   # header text on accent
+    "danger_bg":    "#fee2e2", "danger_fg": "#7f1d1d",
+    "warn_bg":      "#fef3c7", "warn_fg":   "#854d0e",
+    "good_bg":      "#ccfbf1", "good_fg":   "#115e59",
+    "title_pt":     18,          # title font size
+    "subtitle_pt":  10,          # subtitle / tagline
+    "meta_pt":      9,           # period · generated line
+    "kpi_label_pt": 8,
+    "kpi_value_pt": 18,
+    "header_pt":    10,
+    "body_pt":      10,
+}
+
+
+def _corporate_title_block(wb, ws, theme: dict, period: dict, summary: dict, *, last_col: int) -> int:
+    """Write a uniform 4-row corporate header: top accent rail · title · subtitle · period.
+
+    Returns the row index immediately after the block (caller should start KPI
+    or data table from there).
+
+        last_col: zero-based last column index the block should span across.
+    """
+    accent = theme["accent"]
+    deep = theme["accent_deep"]
+    name = theme["name"]
+    subtitle = theme.get("subtitle", "")
+
+    f_rail = wb.add_format({"bg_color": accent})
+    f_title = wb.add_format({
+        "bold": True, "font_size": BRAND["title_pt"], "font_name": "Calibri",
+        "font_color": BRAND["ink"], "bg_color": BRAND["panel"],
+        "align": "left", "valign": "vcenter", "indent": 1,
+    })
+    f_sub = wb.add_format({
+        "font_size": BRAND["subtitle_pt"], "italic": True, "font_name": "Calibri",
+        "font_color": BRAND["ink_muted"], "bg_color": BRAND["panel"],
+        "align": "left", "valign": "vcenter", "indent": 1,
+        "bottom": 1, "bottom_color": BRAND["rule_soft"],
+    })
+    f_period = wb.add_format({
+        "bold": True, "font_size": BRAND["meta_pt"], "font_name": "Calibri",
+        "font_color": BRAND["ink"], "bg_color": BRAND["panel_soft"],
+        "align": "left", "valign": "vcenter", "indent": 1,
+        "top": 1, "top_color": BRAND["rule"],
+        "bottom": 2, "bottom_color": deep,
+    })
+
+    ws.set_row(0, 4)                           # accent rail
+    ws.merge_range(0, 0, 0, last_col, "", f_rail)
+
+    ws.set_row(1, 32)                          # title
+    ws.merge_range(
+        1, 0, 1, last_col,
+        f"  {COMPANY['name']}  ·  {name}",
+        f_title,
+    )
+
+    ws.set_row(2, 20)                          # subtitle
+    ws.merge_range(2, 0, 2, last_col, f"  {subtitle}", f_sub)
+
+    ws.set_row(3, 22)                          # period · generated
+    ws.merge_range(
+        3, 0, 3, last_col,
+        f"  Period   {period['from'].strftime('%d %b %Y')}    →    {period['to'].strftime('%d %b %Y')}"
+        f"        ·        Generated   {datetime.now().strftime('%d %b %Y · %I:%M %p').lstrip('0')}",
+        f_period,
+    )
+
+    return 4
+
+
+def _corporate_kpi_strip(wb, ws, theme: dict, kpis: list[tuple[str, object, str]], *,
+                          start_row: int, last_col: int) -> int:
+    """Write a clean KPI row: label row (8pt) + value row (16pt) with a
+    1-cell-wide colored top accent on each tile.
+
+        kpis: list of (LABEL, value, hex_color_for_top_rail).
+            value can be int / float / str — str values render as-is.
+        Returns the row index immediately after the strip.
+    """
+    if not kpis or last_col < 0:
+        return start_row
+
+    n = len(kpis)
+    # We span the full available columns evenly across n tiles.
+    cols_per = max(1, (last_col + 1) // n)
+    leftover = (last_col + 1) - cols_per * n
+
+    # Spacer row above
+    ws.set_row(start_row, 8)
+
+    label_row = start_row + 1
+    value_row = start_row + 2
+    ws.set_row(label_row, 20)
+    ws.set_row(value_row, 30)
+
+    c0 = 0
+    for i, (label, value, rail_color) in enumerate(kpis):
+        extra = 1 if i < leftover else 0
+        c1 = min(c0 + cols_per - 1 + extra, last_col)
+
+        f_label = wb.add_format({
+            "bold": True, "font_size": BRAND["kpi_label_pt"], "font_name": "Calibri",
+            "font_color": BRAND["ink_muted"], "bg_color": BRAND["panel"],
+            "align": "center", "valign": "vcenter",
+            "left": 2, "left_color": BRAND["rule"],
+            "right": 2, "right_color": BRAND["rule"],
+            "top": 5, "top_color": rail_color,            # 5 = "thick" → visible top rail
+        })
+        f_value = wb.add_format({
+            "bold": True, "font_size": BRAND["kpi_value_pt"], "font_name": "Calibri",
+            "font_color": BRAND["ink"], "bg_color": BRAND["panel"],
+            "align": "center", "valign": "vcenter",
+            "left": 2, "left_color": BRAND["rule"],
+            "right": 2, "right_color": BRAND["rule"],
+            "bottom": 2, "bottom_color": BRAND["rule"],
+        })
+
+        if c0 == c1:
+            ws.write(label_row, c0, label, f_label)
+            if isinstance(value, (int, float)):
+                ws.write_number(value_row, c0, value, f_value)
+            else:
+                ws.write(value_row, c0, str(value), f_value)
+        else:
+            ws.merge_range(label_row, c0, label_row, c1, label, f_label)
+            if isinstance(value, (int, float)):
+                # merge first, then overwrite center cell with the number
+                ws.merge_range(value_row, c0, value_row, c1, "", f_value)
+                ws.write_number(value_row, c0, value, f_value)
+            else:
+                ws.merge_range(value_row, c0, value_row, c1, str(value), f_value)
+        c0 = c1 + 1
+
+    # Trailing spacer
+    spacer = value_row + 1
+    ws.set_row(spacer, 10)
+    return spacer + 1
+
+
+def _corporate_header_format(wb, theme: dict, *, align: str = "left") -> object:
+    """Reusable table-header format. Accent fill, white text, dark bottom rule
+    + thin side rules so the header reads as a discrete band over the body grid.
+    """
+    return wb.add_format({
+        "bold": True, "font_color": BRAND["header_ink"],
+        "bg_color": theme["accent"], "font_name": "Calibri",
+        "align": align, "valign": "vcenter", "indent": 1,
+        "font_size": BRAND["header_pt"],
+        "top": 2, "top_color": theme["accent_deep"],
+        "bottom": 2, "bottom_color": theme["accent_deep"],
+        "left": 1, "left_color": theme["accent_deep"],
+        "right": 1, "right_color": theme["accent_deep"],
+        "text_wrap": False,
+    })
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -110,172 +286,194 @@ def _excel_monthly(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_tab_color(accent)
     ws.hide_gridlines(2)
 
-    # ── Formats ────────────────────────────────────────────────────────
-    f_title = wb.add_format({
-        "bold": True, "font_size": 22, "font_color": "#FFFFFF",
-        "bg_color": accent, "align": "left", "valign": "vcenter",
-        "indent": 1, "font_name": "Calibri",
-    })
-    f_sub = wb.add_format({
-        "italic": True, "font_size": 11, "font_color": "#1a1410",
-        "bg_color": accent_soft, "align": "left", "valign": "vcenter", "indent": 1,
-    })
-    f_period = wb.add_format({
-        "font_size": 9, "font_color": "#786c5c", "bg_color": "#fffdf5",
-        "align": "left", "valign": "vcenter", "indent": 1,
-    })
-    f_kpi_label = wb.add_format({
-        "font_size": 8, "font_color": "#786c5c", "bold": True,
-        "bg_color": "#fffdf5", "align": "center", "border": 1, "border_color": "#e6e1d7",
-        "top": 2, "top_color": accent,
-    })
-    f_kpi_value = wb.add_format({
-        "font_size": 18, "font_color": deep, "bold": True,
-        "bg_color": "#fffdf5", "align": "center", "border": 1, "border_color": "#e6e1d7",
-        "num_format": "0",
-    })
-    f_header = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "left", "valign": "vcenter", "font_size": 10, "border": 0,
-        "indent": 1, "bottom": 2, "bottom_color": deep,
-    })
-    f_header_r = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "right", "valign": "vcenter", "font_size": 10,
-        "indent": 1, "bottom": 2, "bottom_color": deep,
-    })
-    f_cell = wb.add_format({"font_size": 10, "align": "left", "indent": 1, "border": 0, "bottom": 1, "bottom_color": "#ece6d7"})
-    f_cell_zebra = wb.add_format({"font_size": 10, "align": "left", "indent": 1, "bg_color": "#fffdf5", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_num = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_num_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bg_color": "#fffdf5", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_hrs = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_hrs_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": "#fffdf5", "bottom": 1, "bottom_color": "#ece6d7"})
-
     # ── Layout ─────────────────────────────────────────────────────────
     ws.set_column("A:A", 12)   # code
-    ws.set_column("B:B", 26)   # name
-    ws.set_column("C:C", 22)   # department
-    ws.set_column("D:L", 12)   # numeric
+    ws.set_column("B:B", 24)   # name
+    ws.set_column("C:C", 18)   # department
+    ws.set_column("D:D", 16)   # designation
+    ws.set_column("E:E", 16)   # shift
+    ws.set_column("F:Y", 11)   # numeric payroll columns
 
-    ws.set_row(0, 38)
-    ws.merge_range("A1:L1", f" {COMPANY['name'].upper()}   ·   {theme['name'].upper()}", f_title)
-    ws.set_row(1, 24)
-    ws.merge_range("A2:L2", f"  {theme['subtitle']}", f_sub)
-    ws.set_row(2, 18)
-    ws.merge_range(
-        "A3:L3",
-        f"  Period  {period['from'].strftime('%d %b %Y')}  →  {period['to'].strftime('%d %b %Y')}    ·    "
-        f"Generated  {datetime.now().strftime('%d %b %Y %I:%M %p')}",
-        f_period,
-    )
+    # ── Corporate title block (rows 0..3) ──────────────────────────────
+    next_row = _corporate_title_block(wb, ws, theme, period, summary, last_col=11)
 
-    # KPI strip
-    ws.set_row(4, 8)  # spacer
+    # ── KPI strip — payroll-focused tiles ──────────────────────────────
+    present_total = sum(r["present_days"] for r in rows)
+    absent_total = sum(r["absent_days"] for r in rows)
+    leave_total = round(sum(r["leave_days"] for r in rows), 1)
+    lop_total = round(sum(r["lop_days"] for r in rows), 1)
+    ot_total = round(sum(r["total_overtime_hours"] for r in rows), 1)
     kpis = [
-        ("EMPLOYEES", summary["employees"]),
-        ("PRESENT", summary["present"]),
-        ("LATE EVENTS", summary["late"]),
-        ("ABSENT", summary["absent"]),
-        ("ON-TIME %", summary["on_time_pct"]),
-        ("OVERTIME HRS", round(summary["overtime_hours"], 1)),
+        ("EMPLOYEES",    summary["employees"], "#475569"),
+        ("PRESENT DAYS", present_total,        "#0d9488"),
+        ("ABSENT DAYS",  absent_total,         "#b91c1c"),
+        ("LEAVE DAYS",   leave_total,          "#7c3aed"),
+        ("LOP DAYS",     lop_total,            "#dc2626"),
+        ("OVERTIME HRS", ot_total,             "#ea580c"),
     ]
-    ws.set_row(5, 18)
-    ws.set_row(6, 28)
-    for i, (lbl, val) in enumerate(kpis):
-        # Each KPI tile spans ~2 columns; total 6 tiles = 12 cols, we use 11+spacer
-        c0 = i * 2 if i < 4 else i * 2  # contiguous
-        if c0 >= 12:
-            break
-        c1 = min(c0 + 1, 11)
-        ws.merge_range(5, c0, 5, c1, lbl, f_kpi_label)
-        ws.merge_range(6, c0, 6, c1, val, f_kpi_value)
+    next_row = _corporate_kpi_strip(wb, ws, theme, kpis, start_row=next_row, last_col=11)
 
-    # Table header
-    start_row = 9
-    headers = [
-        ("Code", "left"), ("Employee", "left"), ("Department", "left"),
-        ("Present", "right"), ("Late", "right"), ("Absent", "right"),
-        ("WFH", "right"), ("Leave", "right"),
-        ("Working hrs", "right"), ("Break hrs", "right"),
-        ("OT hrs", "right"), ("Late mins", "right"),
+    # ── Body formats ───────────────────────────────────────────────────
+    f_header = _corporate_header_format(wb, theme, align="left")
+    f_header_r = _corporate_header_format(wb, theme, align="right")
+    f_cell = wb.add_format({"font_size": BRAND["body_pt"], "align": "left", "indent": 1, "border": 1, "border_color": BRAND["rule_soft"]})
+    f_cell_zebra = wb.add_format({"font_size": BRAND["body_pt"], "align": "left", "indent": 1, "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_num = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_num_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_hrs = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_hrs_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+
+    from xlsxwriter.utility import xl_col_to_name as _xlc
+
+    # ── Full payroll column spec: (label, key, kind) ───────────────────
+    COLS = [
+        ("Code", "employee_code", "text"),
+        ("Employee", "employee_name", "text"),
+        ("Department", "department", "text"),
+        ("Designation", "designation", "text"),
+        ("Shift", "shift_name", "text"),
+        ("Present", "present_days", "int"),
+        ("Late", "late_days", "int"),
+        ("Half", "half_days", "int"),
+        ("Absent", "absent_days", "int"),
+        ("LWP", "lwp_days", "int"),
+        ("Leave", "leave_days", "days"),
+        ("WFH", "wfh_days", "int"),
+        ("Holiday", "holidays", "int"),
+        ("Week-off", "week_offs", "int"),
+        ("LOP Days", "lop_days", "days"),
+        ("Payable Days", "payable_days", "days"),
+        ("Attendance %", "attendance_pct", "pct"),
+        ("Working hrs", "total_working_hours", "hours"),
+        ("Avg hrs/day", "avg_working_hours", "hours"),
+        ("Break hrs", "total_break_hours", "hours"),
+        ("Excess Break (min)", "excess_break_minutes", "int"),
+        ("OT hrs", "total_overtime_hours", "hours"),
+        ("Late (min)", "total_late_minutes", "int"),
+        ("Early-exit (min)", "total_early_exit_minutes", "int"),
+        ("Flagged", "flagged_days", "int"),
+        ("Missing Punch", "missing_punch_days", "int"),
     ]
-    for i, (h, a) in enumerate(headers):
-        ws.write(start_row, i, h, f_header_r if a == "right" else f_header)
-    ws.set_row(start_row, 26)
-    ws.freeze_panes(start_row + 1, 0)
+    ncol = len(COLS)
+    col_idx = {k: i for i, (_l, k, _kind) in enumerate(COLS)}
+
+    def _mk(numfmt, zebra=False):
+        f = {"font_size": BRAND["body_pt"], "align": "right", "indent": 1,
+             "num_format": numfmt, "border": 1, "border_color": BRAND["rule_soft"]}
+        if zebra:
+            f["bg_color"] = BRAND["cream"]
+        return wb.add_format(f)
+    f_days, f_days_z = _mk("0.0"), _mk("0.0", True)
+    f_pct, f_pct_z = _mk('0.0"%"'), _mk('0.0"%"', True)
+    fmt_for = {
+        "text":  (f_cell, f_cell_zebra),
+        "int":   (f_num, f_num_z),
+        "days":  (f_days, f_days_z),
+        "pct":   (f_pct, f_pct_z),
+        "hours": (f_hrs, f_hrs_z),
+    }
+
+    # Header
+    start_row = next_row
+    for i, (label, _k, kind) in enumerate(COLS):
+        ws.write(start_row, i, label, f_header if kind == "text" else f_header_r)
+    ws.set_row(start_row, 30)
+    ws.freeze_panes(start_row + 1, 3)   # keep header + Code/Employee/Dept on screen
 
     # Body
     for ri, r in enumerate(rows):
         row_idx = start_row + 1 + ri
         zebra = ri % 2 == 1
-        ws.set_row(row_idx, 22)
-        ws.write(row_idx, 0, r["employee_code"], f_cell_zebra if zebra else f_cell)
-        ws.write(row_idx, 1, r["employee_name"], f_cell_zebra if zebra else f_cell)
-        ws.write(row_idx, 2, r["department"], f_cell_zebra if zebra else f_cell)
-        ws.write_number(row_idx, 3, r["present_days"], f_num_z if zebra else f_num)
-        ws.write_number(row_idx, 4, r["late_days"], f_num_z if zebra else f_num)
-        ws.write_number(row_idx, 5, r["absent_days"], f_num_z if zebra else f_num)
-        ws.write_number(row_idx, 6, r["wfh_days"], f_num_z if zebra else f_num)
-        ws.write_number(row_idx, 7, r["leave_days"], f_num_z if zebra else f_num)
-        ws.write_number(row_idx, 8, r["total_working_hours"], f_hrs_z if zebra else f_hrs)
-        ws.write_number(row_idx, 9, r["total_break_hours"], f_hrs_z if zebra else f_hrs)
-        ws.write_number(row_idx, 10, r["total_overtime_hours"], f_hrs_z if zebra else f_hrs)
-        ws.write_number(row_idx, 11, r["total_late_minutes"], f_num_z if zebra else f_num)
+        ws.set_row(row_idx, 21)
+        for i, (_label, key, kind) in enumerate(COLS):
+            base, zeb = fmt_for[kind]
+            f = zeb if zebra else base
+            v = r.get(key)
+            if kind == "text":
+                ws.write(row_idx, i, v if v not in (None, "") else "—", f)
+            else:
+                ws.write_number(row_idx, i, float(v or 0), f)
 
-    # Conditional formats — heat the Late & Absent columns
     last_row = start_row + len(rows)
-    if rows:
-        ws.conditional_format(start_row + 1, 4, last_row, 4, {
-            "type": "3_color_scale",
-            "min_color": "#ffffff", "mid_color": "#fef9c3", "max_color": "#f59e0b",
-        })
-        ws.conditional_format(start_row + 1, 5, last_row, 5, {
-            "type": "3_color_scale",
-            "min_color": "#ffffff", "mid_color": "#fecaca", "max_color": "#b91c1c",
-        })
-        # Break hours data bar
-        ws.conditional_format(start_row + 1, 9, last_row, 9, {
-            "type": "data_bar", "bar_color": "#0284c7", "bar_solid": False,
-        })
-        ws.conditional_format(start_row + 1, 10, last_row, 10, {
-            "type": "data_bar", "bar_color": "#fb923c", "bar_solid": True,
-        })
-        ws.autofilter(start_row, 0, last_row, len(headers) - 1)
 
-    # ─── Embedded chart sheet ───
+    # ── TOTAL row (sum count/hours columns; ratio columns left blank) ──
     if rows:
+        tr = last_row + 1
+        ws.set_row(tr, 24)
+        f_tot_l = wb.add_format({"font_size": BRAND["body_pt"], "bold": True, "font_color": "#ffffff",
+                                 "bg_color": deep, "align": "left", "indent": 1, "border": 1, "border_color": deep})
+        def _tot(numfmt):
+            return wb.add_format({"font_size": BRAND["body_pt"], "bold": True, "font_color": "#ffffff",
+                                  "bg_color": deep, "align": "right", "indent": 1, "num_format": numfmt,
+                                  "border": 1, "border_color": deep})
+        f_tot_int, f_tot_days, f_tot_hrs = _tot("0"), _tot("0.0"), _tot('0.00" h"')
+        f_tot_blank = wb.add_format({"bg_color": deep, "border": 1, "border_color": deep})
+        for i, (_label, key, kind) in enumerate(COLS):
+            if i == 0:
+                ws.write(tr, i, "TOTAL", f_tot_l)
+            elif kind in ("int", "days", "hours") and key != "avg_working_hours":
+                colL = _xlc(i)
+                tf = f_tot_hrs if kind == "hours" else (f_tot_days if kind == "days" else f_tot_int)
+                ws.write_formula(tr, i, f"=SUM({colL}{start_row + 2}:{colL}{last_row + 1})", tf)
+            else:
+                ws.write_blank(tr, i, None, f_tot_blank)
+
+    # ── Conditional heat-maps + data bars on the payroll-critical columns ──
+    if rows:
+        def cf(key, kw):
+            ws.conditional_format(start_row + 1, col_idx[key], last_row, col_idx[key], kw)
+        cf("late_days",   {"type": "3_color_scale", "min_color": "#ffffff", "mid_color": "#fef9c3", "max_color": "#f59e0b"})
+        cf("absent_days", {"type": "3_color_scale", "min_color": "#ffffff", "mid_color": "#fecaca", "max_color": "#b91c1c"})
+        cf("lop_days",    {"type": "3_color_scale", "min_color": "#ffffff", "mid_color": "#fecaca", "max_color": "#dc2626"})
+        cf("excess_break_minutes", {"type": "3_color_scale", "min_color": "#ffffff", "mid_color": "#ffedd5", "max_color": "#ea580c"})
+        cf("attendance_pct", {"type": "3_color_scale", "min_color": "#fecaca", "mid_color": "#fef9c3", "max_color": "#86efac"})
+        cf("total_working_hours", {"type": "data_bar", "bar_color": accent, "bar_solid": False})
+        cf("total_overtime_hours", {"type": "data_bar", "bar_color": "#ea580c", "bar_solid": True})
+        ws.autofilter(start_row, 0, last_row, ncol - 1)
+
+    # ─── Embedded charts ───
+    if rows:
+        name_c = col_idx["employee_name"]
+        work_c = col_idx["total_working_hours"]
+        ot_c = col_idx["total_overtime_hours"]
+        lop_c = col_idx["lop_days"]
+
         chart = wb.add_chart({"type": "bar"})
         chart.add_series({
             "name": "Working hours",
-            "categories": ["Monthly Summary", start_row + 1, 1, last_row, 1],
-            "values":     ["Monthly Summary", start_row + 1, 8, last_row, 8],
-            "fill": {"color": accent},
-            "border": {"color": deep},
-        })
-        chart.add_series({
-            "name": "Break hours",
-            "categories": ["Monthly Summary", start_row + 1, 1, last_row, 1],
-            "values":     ["Monthly Summary", start_row + 1, 9, last_row, 9],
-            "fill": {"color": "#0284c7"},
-            "border": {"color": "#0c4a6e"},
+            "categories": ["Monthly Summary", start_row + 1, name_c, last_row, name_c],
+            "values":     ["Monthly Summary", start_row + 1, work_c, last_row, work_c],
+            "fill": {"color": accent}, "border": {"color": deep},
         })
         chart.add_series({
             "name": "Overtime hours",
-            "categories": ["Monthly Summary", start_row + 1, 1, last_row, 1],
-            "values":     ["Monthly Summary", start_row + 1, 10, last_row, 10],
-            "fill": {"color": "#ea580c"},
-            "border": {"color": "#7c2d12"},
+            "categories": ["Monthly Summary", start_row + 1, name_c, last_row, name_c],
+            "values":     ["Monthly Summary", start_row + 1, ot_c, last_row, ot_c],
+            "fill": {"color": "#ea580c"}, "border": {"color": "#7c2d12"},
         })
-        chart.set_title({"name": "Working hours vs Overtime", "name_font": {"size": 13, "bold": True, "color": deep}})
+        chart.set_title({"name": "Working vs Overtime hours", "name_font": {"size": 13, "bold": True, "color": deep}})
         chart.set_x_axis({"name": "Hours", "num_format": "0"})
         chart.set_y_axis({"name": "Employee"})
         chart.set_legend({"position": "bottom"})
         chart.set_size({"width": 760, "height": max(360, 40 + 30 * len(rows))})
 
-        chart_ws = wb.add_worksheet("Chart · Hours")
+        lop_chart = wb.add_chart({"type": "column"})
+        lop_chart.add_series({
+            "name": "LOP days",
+            "categories": ["Monthly Summary", start_row + 1, name_c, last_row, name_c],
+            "values":     ["Monthly Summary", start_row + 1, lop_c, last_row, lop_c],
+            "fill": {"color": "#dc2626"}, "border": {"color": "#7f1d1d"},
+            "data_labels": {"value": True, "num_format": "0.0", "font": {"size": 8, "bold": True}},
+        })
+        lop_chart.set_title({"name": "Loss-of-Pay days by employee", "name_font": {"size": 13, "bold": True, "color": "#7f1d1d"}})
+        lop_chart.set_legend({"none": True})
+        lop_chart.set_size({"width": 760, "height": 320})
+
+        chart_ws = wb.add_worksheet("Charts")
         chart_ws.set_tab_color("#fb923c")
         chart_ws.hide_gridlines(2)
         chart_ws.insert_chart("B2", chart)
+        chart_ws.insert_chart("B22", lop_chart)
 
     return _xw_finalize(wb, buf)
 
@@ -296,45 +494,6 @@ def _excel_late(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_tab_color(accent)
     ws.hide_gridlines(2)
 
-    # Bulletin-style title
-    f_band_top = wb.add_format({
-        "bold": True, "font_size": 8,
-        "font_color": "#fde68a", "bg_color": "#1a1410",
-        "align": "center", "valign": "vcenter",
-    })
-    f_title = wb.add_format({
-        "bold": True, "font_size": 32, "font_name": "Georgia",
-        "font_color": "#1a1410", "bg_color": theme["accent_soft"],
-        "align": "center", "valign": "vcenter",
-    })
-    f_sub = wb.add_format({
-        "italic": True, "font_size": 11, "font_color": "#4b5563",
-        "bg_color": theme["accent_soft"], "align": "center", "valign": "vcenter",
-    })
-    f_ticker = wb.add_format({
-        "bold": True, "font_size": 10, "font_color": "#fde68a",
-        "bg_color": "#1a1410", "font_name": "Consolas", "align": "center", "valign": "vcenter",
-    })
-
-    f_header = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "left", "valign": "vcenter", "indent": 1,
-        "border_color": deep, "bottom": 2, "bottom_color": deep, "font_size": 10,
-    })
-    f_header_r = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "right", "valign": "vcenter", "indent": 1,
-        "bottom": 2, "bottom_color": deep, "font_size": 10,
-    })
-    f_cell = wb.add_format({"font_size": 10, "indent": 1, "bottom": 1, "bottom_color": "#ece6d7"})
-    f_cell_z = wb.add_format({"font_size": 10, "indent": 1, "bg_color": "#fefdf8", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_num = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_num_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bg_color": "#fefdf8", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_date = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_date_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bg_color": "#fefdf8", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_time = wb.add_format({"font_size": 10, "indent": 1, "num_format": "hh:mm AM/PM", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_time_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "hh:mm AM/PM", "bg_color": "#fefdf8", "bottom": 1, "bottom_color": "#ece6d7"})
-
     ws.set_column("A:A", 13)
     ws.set_column("B:B", 12)
     ws.set_column("C:C", 26)
@@ -344,24 +503,33 @@ def _excel_late(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_column("G:G", 12)
     ws.set_column("H:H", 14)
 
-    ws.set_row(0, 16)
-    ws.merge_range("A1:H1", "·  P U N C T U A L I T Y   B U L L E T I N  ·", f_band_top)
-    ws.set_row(1, 46)
-    ws.merge_range("A2:H2", "LATE ARRIVALS", f_title)
-    ws.set_row(2, 22)
-    ws.merge_range("A3:H3", theme["subtitle"], f_sub)
-    ws.set_row(3, 22)
-    ws.merge_range(
-        "A4:H4",
-        f"▶ {summary['late']} BREACHES · {summary['late_minutes']} TOTAL LATE MINUTES · "
-        f"{summary['employees']} EMPLOYEES · "
-        f"{period['from'].strftime('%d %b').upper()} – {period['to'].strftime('%d %b %Y').upper()}  ◀",
-        f_ticker,
-    )
+    # ── Corporate title block (rows 0..3) ──────────────────────────────
+    next_row = _corporate_title_block(wb, ws, theme, period, summary, last_col=7)
+
+    # ── KPI strip — punctuality vitals ─────────────────────────────────
+    next_row = _corporate_kpi_strip(wb, ws, theme, [
+        ("BREACHES",       summary["late"],         "#b91c1c"),
+        ("LATE MINUTES",   summary["late_minutes"], "#d97706"),
+        ("EMPLOYEES",      summary["employees"],    "#475569"),
+        ("AVG LATE / EMP", round(summary["late_minutes"] / max(summary["employees"], 1)),
+                                                    "#ea580c"),
+    ], start_row=next_row, last_col=7)
+
+    # ── Body formats ───────────────────────────────────────────────────
+    f_header = _corporate_header_format(wb, theme, align="left")
+    f_header_r = _corporate_header_format(wb, theme, align="right")
+    f_cell = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "border": 1, "border_color": BRAND["rule_soft"]})
+    f_cell_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_num = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_num_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_date = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_date_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_time = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "hh:mm AM/PM", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_time_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "hh:mm AM/PM", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
 
     # Headers
     headers = ["Date", "Code", "Employee", "Department", "Shift", "Check-in", "Late mins", "Status"]
-    start_row = 5
+    start_row = next_row
     ws.set_row(start_row, 24)
     for i, h in enumerate(headers):
         ws.write(start_row, i, h, f_header_r if h == "Late mins" else f_header)
@@ -418,40 +586,6 @@ def _excel_overtime(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_tab_color(accent)
     ws.hide_gridlines(2)
 
-    # Industrial dashboard band
-    f_title = wb.add_format({
-        "bold": True, "font_size": 30, "font_color": "#fde68a", "bg_color": "#0c0a09",
-        "align": "left", "indent": 1, "valign": "vcenter",
-    })
-    f_kpi_card_label = wb.add_format({
-        "bold": True, "font_size": 8, "font_color": "#9ca3af",
-        "bg_color": "#0c0a09", "align": "center", "border": 0,
-        "font_name": "Consolas", "valign": "vcenter",
-    })
-    f_kpi_card_val = wb.add_format({
-        "bold": True, "font_size": 22, "font_color": accent,
-        "bg_color": "#0c0a09", "align": "center", "border": 0,
-        "font_name": "Consolas", "valign": "vcenter", "num_format": "0.0",
-    })
-    f_header = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "left", "indent": 1, "font_size": 10,
-        "bottom": 2, "bottom_color": deep, "valign": "vcenter",
-    })
-    f_header_r = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "right", "indent": 1, "font_size": 10,
-        "bottom": 2, "bottom_color": deep, "valign": "vcenter",
-    })
-    f_cell = wb.add_format({"font_size": 10, "indent": 1, "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_cell_z = wb.add_format({"font_size": 10, "indent": 1, "bg_color": "#fff7ed", "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_hrs = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_hrs_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": "#fff7ed", "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_date = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_date_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bg_color": "#fff7ed", "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_time = wb.add_format({"font_size": 10, "indent": 1, "num_format": "hh:mm AM/PM", "bottom": 1, "bottom_color": "#ffe7d4"})
-    f_time_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "hh:mm AM/PM", "bg_color": "#fff7ed", "bottom": 1, "bottom_color": "#ffe7d4"})
-
     ws.set_column("A:A", 13)
     ws.set_column("B:B", 12)
     ws.set_column("C:C", 26)
@@ -461,31 +595,33 @@ def _excel_overtime(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_column("G:H", 13)
     ws.set_column("I:I", 14)
 
-    ws.set_row(0, 44)
-    ws.merge_range("A1:I1", "  OPERATIONS · OVERTIME DASHBOARD", f_title)
+    # ── Corporate title block ──────────────────────────────────────────
+    next_row = _corporate_title_block(wb, ws, theme, period, summary, last_col=8)
 
-    # KPI cards
-    ws.set_row(1, 18)
-    ws.set_row(2, 28)
-    cards = [
-        ("RECORDS", float(summary["rows"])),
-        ("EMPLOYEES", float(summary["employees"])),
-        ("ON-TIME %", float(summary["on_time_pct"])),
-        ("TOTAL OT", float(summary["overtime_hours"])),
-    ]
-    cols_per = 9 // len(cards)  # ~2 each but cards span ~2.25 cols
-    for i, (lbl, val) in enumerate(cards):
-        c0 = i * cols_per
-        c1 = min(c0 + cols_per - 1, 8)
-        if i == len(cards) - 1:
-            c1 = 8
-        ws.merge_range(1, c0, 1, c1, lbl, f_kpi_card_label)
-        ws.merge_range(2, c0, 2, c1, val, f_kpi_card_val)
+    # ── KPI strip — operations vitals ──────────────────────────────────
+    next_row = _corporate_kpi_strip(wb, ws, theme, [
+        ("RECORDS",     summary["rows"],                       "#475569"),
+        ("EMPLOYEES",   summary["employees"],                  "#0284c7"),
+        ("ON-TIME %",   summary["on_time_pct"],                "#0d9488"),
+        ("TOTAL OT",    round(summary["overtime_hours"], 1),   accent),
+    ], start_row=next_row, last_col=8)
+
+    # ── Body formats ───────────────────────────────────────────────────
+    f_header = _corporate_header_format(wb, theme, align="left")
+    f_header_r = _corporate_header_format(wb, theme, align="right")
+    f_cell = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "border": 1, "border_color": BRAND["rule_soft"]})
+    f_cell_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_hrs = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_hrs_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_date = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_date_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_time = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "hh:mm AM/PM", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_time_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "hh:mm AM/PM", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
 
     # Headers
     headers = ["Date", "Code", "Employee", "Department", "Shift",
                "Check-in", "Check-out", "OT hours", "Working hrs"]
-    start_row = 5
+    start_row = next_row
     ws.set_row(start_row, 24)
     for i, h in enumerate(headers):
         ws.write(start_row, i, h, f_header_r if h in ("OT hours", "Working hrs") else f_header)
@@ -567,68 +703,100 @@ def _excel_wfh(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.tabColor = accent
 
-    thin = Side(style="thin", color="EAE6D5")
+    thin = Side(style="thin", color="94A3B8")
+    rule_soft = Side(style="thin", color="CBD5E1")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    cell_border = Border(left=rule_soft, right=rule_soft, top=rule_soft, bottom=rule_soft)
 
-    # Title band — postcard style
+    # ── Corporate title block (rows 1..4) ──────────────────────────────
+    # Row 1 — 4pt accent rail
     ws.merge_cells("A1:H1")
-    ws["A1"] = "  ✉  GREETINGS FROM THE HOME OFFICE"
-    ws["A1"].font = Font(name="Georgia", size=22, bold=True, color="FFFFFF")
     ws["A1"].fill = PatternFill("solid", fgColor=accent)
-    ws["A1"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
-    ws.row_dimensions[1].height = 42
+    ws.row_dimensions[1].height = 4
 
+    # Row 2 — title (left) + report key (right)
     ws.merge_cells("A2:H2")
-    ws["A2"] = theme["subtitle"]
-    ws["A2"].font = Font(size=11, italic=True, color="4B5563")
-    ws["A2"].fill = PatternFill("solid", fgColor=accent_soft)
-    ws["A2"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[2].height = 22
+    ws["A2"] = f"  {COMPANY['name']}  ·  {theme['name']}"
+    ws["A2"].font = Font(name="Calibri", size=18, bold=True, color="111418")
+    ws["A2"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws["A2"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    ws["A2"].border = Border(bottom=Side(style="thin", color="D1D5DB"))
+    for col in "BCDEFGH":
+        ws[f"{col}2"].border = Border(bottom=Side(style="thin", color="D1D5DB"))
+        ws[f"{col}2"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws.row_dimensions[2].height = 32
 
+    # Row 3 — subtitle (italic)
     ws.merge_cells("A3:H3")
-    ws["A3"] = (
-        f"   ·   Period  {period['from'].strftime('%d %b %Y')}  →  {period['to'].strftime('%d %b %Y')}   ·   "
-        f"{summary['wfh']} WFH days   ·   {summary['employees']} employees   ·   "
-        f"{summary['working_hours']:.1f}h logged   ·"
+    ws["A3"] = f"  {theme['subtitle']}"
+    ws["A3"].font = Font(name="Calibri", size=10, italic=True, color="475569")
+    ws["A3"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws["A3"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGH":
+        ws[f"{col}3"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws.row_dimensions[3].height = 20
+
+    # Row 4 — period band
+    ws.merge_cells("A4:H4")
+    ws["A4"] = (
+        f"  Period   {period['from'].strftime('%d %b %Y')}    →    {period['to'].strftime('%d %b %Y')}"
+        f"        ·        Generated   {datetime.now().strftime('%d %b %Y · %I:%M %p').lstrip('0')}"
     )
-    ws["A3"].font = Font(size=10, bold=True, color=deep)
-    ws["A3"].fill = PatternFill("solid", fgColor="FFFAF0")
-    ws["A3"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[3].height = 22
+    ws["A4"].font = Font(name="Calibri", size=9, color="475569")
+    ws["A4"].fill = PatternFill("solid", fgColor="F8FAFC")
+    ws["A4"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGH":
+        ws[f"{col}4"].fill = PatternFill("solid", fgColor="F8FAFC")
+    ws.row_dimensions[4].height = 22
 
-    # KPI tiles row
+    # ── KPI strip (rows 5 spacer · 6 labels · 7 values · 8 spacer) ─────
+    ws.row_dimensions[5].height = 8
+    rail_colors = ["0284C7", "0EA5E9", "475569", "0D9488", accent, "EA580C"]
     kpis = [
-        ("WFH days",     summary["wfh"]),
-        ("Remote days",  summary["remote"]),
-        ("Employees",    summary["employees"]),
-        ("Departments",  summary["departments"]),
-        ("Working hrs",  summary["working_hours"]),
-        ("OT hrs",       summary["overtime_hours"]),
+        ("WFH DAYS",     summary["wfh"]),
+        ("REMOTE DAYS",  summary["remote"]),
+        ("EMPLOYEES",    summary["employees"]),
+        ("DEPARTMENTS",  summary["departments"]),
+        ("WORKING HRS",  round(summary["working_hours"], 1)),
+        ("OT HRS",       round(summary["overtime_hours"], 1)),
     ]
-    ws.row_dimensions[4].height = 12
-    for i, (lbl, val) in enumerate(kpis):
-        col_lbl = get_column_letter(i + 1)
-        # Header label
-        c_label = ws.cell(row=5, column=i + 1, value=lbl.upper())
-        c_label.font = Font(size=8, bold=True, color=deep)
-        c_label.fill = PatternFill("solid", fgColor="FFFDF5")
-        c_label.alignment = Alignment(vertical="center", horizontal="center")
-        c_label.border = border
-        # Value
-        c_val = ws.cell(row=6, column=i + 1, value=val)
-        c_val.font = Font(size=16, bold=True, color=accent, name="Georgia")
-        c_val.fill = PatternFill("solid", fgColor="FFFDF5")
-        c_val.alignment = Alignment(vertical="center", horizontal="center")
-        c_val.border = border
-    ws.row_dimensions[5].height = 16
-    ws.row_dimensions[6].height = 28
-
-    # Spacer
-    ws.row_dimensions[7].height = 14
+    tile_spans = [("A", "B"), ("C", "C"), ("D", "D"), ("E", "E"), ("F", "F"), ("G", "H")]
+    for i, ((c0, c1), (lbl, val)) in enumerate(zip(tile_spans, kpis)):
+        rail = rail_colors[i]
+        # Label cell(s) — colored thick top rail + medium side rules
+        if c0 != c1:
+            ws.merge_cells(f"{c0}6:{c1}6")
+        cell_l = ws[f"{c0}6"]
+        cell_l.value = lbl
+        cell_l.font = Font(name="Calibri", size=8, bold=True, color="475569")
+        cell_l.fill = PatternFill("solid", fgColor="FFFFFF")
+        cell_l.alignment = Alignment(vertical="center", horizontal="center")
+        cell_l.border = Border(
+            top=Side(style="thick", color=rail),
+            left=Side(style="medium", color="94A3B8"),
+            right=Side(style="medium", color="94A3B8"),
+        )
+        # Value cell(s) — medium side + bottom rule
+        if c0 != c1:
+            ws.merge_cells(f"{c0}7:{c1}7")
+        cell_v = ws[f"{c0}7"]
+        cell_v.value = val
+        cell_v.font = Font(name="Calibri", size=18, bold=True, color="111418")
+        cell_v.fill = PatternFill("solid", fgColor="FFFFFF")
+        cell_v.alignment = Alignment(vertical="center", horizontal="center")
+        cell_v.border = Border(
+            left=Side(style="medium", color="94A3B8"),
+            right=Side(style="medium", color="94A3B8"),
+            bottom=Side(style="medium", color="94A3B8"),
+        )
+    ws.row_dimensions[6].height = 20
+    ws.row_dimensions[7].height = 30
+    ws.row_dimensions[8].height = 10
 
     # Headers
     headers = ["Date", "Code", "Employee", "Department", "Check-in", "Check-out", "Working hrs", "Status"]
-    head_row = 8
+    head_row = 9
+    deep_side = Side(style="medium", color=deep)
     for i, h in enumerate(headers):
         c = ws.cell(row=head_row, column=i + 1, value=h.upper())
         c.font = Font(size=10, bold=True, color="FFFFFF")
@@ -636,6 +804,9 @@ def _excel_wfh(rows: list[dict], summary: dict, meta: dict) -> bytes:
         c.alignment = Alignment(vertical="center",
                                 horizontal="right" if h == "Working hrs" else "left",
                                 indent=1)
+        c.border = Border(top=deep_side, bottom=deep_side,
+                          left=Side(style="thin", color=deep),
+                          right=Side(style="thin", color=deep))
     ws.row_dimensions[head_row].height = 26
     ws.freeze_panes = f"A{head_row + 1}"
 
@@ -643,13 +814,13 @@ def _excel_wfh(rows: list[dict], summary: dict, meta: dict) -> bytes:
     for ri, r in enumerate(rows):
         row_idx = head_row + 1 + ri
         is_zebra = ri % 2 == 1
-        fill = PatternFill("solid", fgColor="F0F9FF") if is_zebra else PatternFill("solid", fgColor="FFFFFF")
+        fill = PatternFill("solid", fgColor="FBF8F0") if is_zebra else PatternFill("solid", fgColor="FFFFFF")
         for col in range(1, 9):
             cell = ws.cell(row=row_idx, column=col)
-            cell.font = Font(size=10, color="1A1410")
+            cell.font = Font(size=10, color="111418")
             cell.fill = fill
             cell.alignment = Alignment(vertical="center", indent=1)
-            cell.border = Border(bottom=Side(style="thin", color="DDEEF6"))
+            cell.border = cell_border
         ws.cell(row=row_idx, column=1, value=r["date"]).number_format = "dd mmm yyyy"
         ws.cell(row=row_idx, column=2, value=r["employee_code"])
         ws.cell(row=row_idx, column=3, value=r["employee_name"])
@@ -707,63 +878,89 @@ def _excel_compliance(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.tabColor = accent
 
-    # Certificate-style title
+    # ── Corporate title block ──────────────────────────────────────────
     ws.merge_cells("A1:I1")
-    ws["A1"] = "  ◇  CERTIFICATE OF COMPLIANCE  ◇  ATTENDANCE AUDIT"
-    ws["A1"].font = Font(name="Georgia", size=22, bold=True, color="FFFFFF")
     ws["A1"].fill = PatternFill("solid", fgColor=accent)
-    ws["A1"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[1].height = 42
+    ws.row_dimensions[1].height = 4
 
     ws.merge_cells("A2:I2")
-    ws["A2"] = f"  Attested for {COMPANY['legal']} · {theme['subtitle']}"
-    ws["A2"].font = Font(name="Georgia", size=11, italic=True, color="4B5563")
-    ws["A2"].fill = PatternFill("solid", fgColor=accent_soft)
-    ws["A2"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[2].height = 22
+    ws["A2"] = f"  {COMPANY['name']}  ·  {theme['name']}"
+    ws["A2"].font = Font(name="Calibri", size=18, bold=True, color="111418")
+    ws["A2"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws["A2"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGHI":
+        ws[f"{col}2"].fill = PatternFill("solid", fgColor="FFFFFF")
+        ws[f"{col}2"].border = Border(bottom=Side(style="thin", color="D1D5DB"))
+    ws["A2"].border = Border(bottom=Side(style="thin", color="D1D5DB"))
+    ws.row_dimensions[2].height = 32
 
     ws.merge_cells("A3:I3")
-    ws["A3"] = (
-        f"PERIOD  ◇  {period['from'].strftime('%d %B %Y')}  —  {period['to'].strftime('%d %B %Y')}   ·   "
-        f"COMPILED  {datetime.now().strftime('%d %B %Y')}   ·   "
-        f"REF  FRC/HR/COMP/{period['from'].year}/{datetime.now().strftime('%m%d%H%M')}"
-    )
-    ws["A3"].font = Font(size=9, color=deep, bold=True)
-    ws["A3"].fill = PatternFill("solid", fgColor="FFFDF5")
-    ws["A3"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[3].height = 22
+    ws["A3"] = f"  {theme['subtitle']}"
+    ws["A3"].font = Font(name="Calibri", size=10, italic=True, color="475569")
+    ws["A3"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws["A3"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGHI":
+        ws[f"{col}3"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws.row_dimensions[3].height = 20
 
-    # KPI ribbon
+    # Note: we keep the existing meta line below — it lands on row 4 already.
+    ws.merge_cells("A4:I4")
+    ws["A4"] = (
+        f"  Period   {period['from'].strftime('%d %b %Y')}    →    {period['to'].strftime('%d %b %Y')}"
+        f"        ·        Compiled   {datetime.now().strftime('%d %b %Y · %I:%M %p').lstrip('0')}"
+        f"        ·        Ref FRC/HR/COMP/{period['from'].year}/{datetime.now().strftime('%m%d%H%M')}"
+    )
+    ws["A4"].font = Font(name="Calibri", size=9, color="475569")
+    ws["A4"].fill = PatternFill("solid", fgColor="F8FAFC")
+    ws["A4"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGHI":
+        ws[f"{col}4"].fill = PatternFill("solid", fgColor="F8FAFC")
+    ws.row_dimensions[4].height = 22
+
+    # KPI ribbon — corporate tiles with colored top rails
     kpis = [
-        ("EMPLOYEES",      summary["employees"]),
-        ("DEPARTMENTS",    summary["departments"]),
-        ("ON-TIME %",      f"{summary['on_time_pct']}%"),
-        ("PRESENT",        summary["present"]),
-        ("LATE",           summary["late"]),
-        ("ABSENT",         summary["absent"]),
+        ("EMPLOYEES",      summary["employees"],          "475569"),
+        ("DEPARTMENTS",    summary["departments"],        "0284C7"),
+        ("ON-TIME %",      f"{summary['on_time_pct']}%", "0D9488"),
+        ("PRESENT",        summary["present"],           "0D9488"),
+        ("LATE",           summary["late"],              "D97706"),
+        ("ABSENT",         summary["absent"],            "B91C1C"),
     ]
-    ws.row_dimensions[4].height = 14
-    for i, (lbl, val) in enumerate(kpis):
+    ws.row_dimensions[5].height = 20
+    ws.row_dimensions[6].height = 30
+    ws.row_dimensions[7].height = 12
+    for i, (lbl, val, rail) in enumerate(kpis):
         col = i + 1 + ((9 - len(kpis)) // 2)  # center 6 tiles in 9 cols
         if col > 9:
             break
-        ws.cell(row=5, column=col, value=lbl).font = Font(size=8, bold=True, color=deep)
-        ws.cell(row=5, column=col).fill = PatternFill("solid", fgColor=accent_soft)
-        ws.cell(row=5, column=col).alignment = Alignment(vertical="center", horizontal="center")
+        # Label cell with colored thick top rail + medium side rules
+        l_cell = ws.cell(row=5, column=col, value=lbl)
+        l_cell.font = Font(name="Calibri", size=8, bold=True, color="475569")
+        l_cell.fill = PatternFill("solid", fgColor="FFFFFF")
+        l_cell.alignment = Alignment(vertical="center", horizontal="center")
+        l_cell.border = Border(
+            top=Side(style="thick", color=rail),
+            left=Side(style="medium", color="94A3B8"),
+            right=Side(style="medium", color="94A3B8"),
+        )
+        # Value cell — medium side + bottom rule for box look
         v_cell = ws.cell(row=6, column=col, value=val)
-        v_cell.font = Font(name="Georgia", size=15, bold=True, color=deep)
-        v_cell.fill = PatternFill("solid", fgColor="FFFDF5")
+        v_cell.font = Font(name="Calibri", size=18, bold=True, color="111418")
+        v_cell.fill = PatternFill("solid", fgColor="FFFFFF")
         v_cell.alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[5].height = 16
-    ws.row_dimensions[6].height = 26
-    ws.row_dimensions[7].height = 14
+        v_cell.border = Border(
+            left=Side(style="medium", color="94A3B8"),
+            right=Side(style="medium", color="94A3B8"),
+            bottom=Side(style="medium", color="94A3B8"),
+        )
 
-    # Headers
+    # Headers — corporate accent fill with dark side + bottom rules
     headers = [
         "Code", "Employee", "Department", "Shift",
         "Scheduled", "Actual hrs", "Expected hrs", "Coverage %", "Missing",
     ]
     head_row = 8
+    deep_side = Side(style="medium", color=deep)
     for i, h in enumerate(headers):
         c = ws.cell(row=head_row, column=i + 1, value=h.upper())
         c.font = Font(size=10, bold=True, color="FFFFFF")
@@ -773,21 +970,29 @@ def _excel_compliance(rows: list[dict], summary: dict, meta: dict) -> bytes:
             horizontal="right" if h in ("Scheduled", "Actual hrs", "Expected hrs", "Coverage %", "Missing") else "left",
             indent=1,
         )
+        c.border = Border(top=deep_side, bottom=deep_side,
+                          left=Side(style="thin", color=deep),
+                          right=Side(style="thin", color=deep))
     ws.row_dimensions[head_row].height = 26
     ws.freeze_panes = f"A{head_row + 1}"
 
-    # Body
+    # Body — strong grid borders so every cell reads as a discrete grid cell
+    cell_grid = Border(
+        left=Side(style="thin", color="CBD5E1"),
+        right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"),
+        bottom=Side(style="thin", color="CBD5E1"),
+    )
     for ri, r in enumerate(rows):
         row_idx = head_row + 1 + ri
         zebra = ri % 2 == 1
-        bg = "F0FDFA" if zebra else "FFFFFF"
-        bottom = Border(bottom=Side(style="thin", color="D6E9E5"))
+        bg = "FBF8F0" if zebra else "FFFFFF"
         for col in range(1, 10):
             cell = ws.cell(row=row_idx, column=col)
-            cell.font = Font(size=10, color="1A1410")
+            cell.font = Font(size=10, color="111418")
             cell.fill = PatternFill("solid", fgColor=bg)
             cell.alignment = Alignment(vertical="center", indent=1)
-            cell.border = bottom
+            cell.border = cell_grid
         ws.cell(row=row_idx, column=1, value=r["employee_code"])
         ws.cell(row=row_idx, column=2, value=r["employee_name"])
         ws.cell(row=row_idx, column=3, value=r["department"])
@@ -866,57 +1071,63 @@ def _excel_anomalies(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.tabColor = accent
 
-    # Dossier-style header
+    # ── Corporate title block ──────────────────────────────────────────
     ws.merge_cells("A1:I1")
-    ws["A1"] = "  ⚑  CONFIDENTIAL  ·  ATTENDANCE ANOMALIES DOSSIER"
-    ws["A1"].font = Font(name="Georgia", size=22, bold=True, color="FFFFFF")
-    ws["A1"].fill = PatternFill("solid", fgColor="1A1410")
-    ws["A1"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[1].height = 44
+    ws["A1"].fill = PatternFill("solid", fgColor=accent)
+    ws.row_dimensions[1].height = 4
 
     ws.merge_cells("A2:I2")
-    ws["A2"] = (
-        f"  CASE FRC/HR/ANM/{period['from'].year}/{datetime.now().strftime('%m%d%H%M')}   "
-        f"·   COMPILED {datetime.now().strftime('%d %B %Y')}"
-    )
-    ws["A2"].font = Font(size=10, bold=True, color="FDE68A")
-    ws["A2"].fill = PatternFill("solid", fgColor="1A1410")
-    ws["A2"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[2].height = 20
+    ws["A2"] = f"  {COMPANY['name']}  ·  {theme['name']}"
+    ws["A2"].font = Font(name="Calibri", size=18, bold=True, color="111418")
+    ws["A2"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws["A2"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGHI":
+        ws[f"{col}2"].fill = PatternFill("solid", fgColor="FFFFFF")
+        ws[f"{col}2"].border = Border(bottom=Side(style="thin", color="D1D5DB"))
+    ws["A2"].border = Border(bottom=Side(style="thin", color="D1D5DB"))
+    ws.row_dimensions[2].height = 32
 
     ws.merge_cells("A3:I3")
-    ws["A3"] = (
-        f"   Evidence window: {period['from'].strftime('%d %B %Y')} to {period['to'].strftime('%d %B %Y')}   "
-        f"·   {summary['late']} flagged events   ·   {summary['late_minutes']} accumulated late minutes"
-    )
-    ws["A3"].font = Font(size=10, italic=True, color=deep)
-    ws["A3"].fill = PatternFill("solid", fgColor="F5EFD8")  # manila
-    ws["A3"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[3].height = 22
+    ws["A3"] = f"  {theme['subtitle']}"
+    ws["A3"].font = Font(name="Calibri", size=10, italic=True, color="475569")
+    ws["A3"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws["A3"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGHI":
+        ws[f"{col}3"].fill = PatternFill("solid", fgColor="FFFFFF")
+    ws.row_dimensions[3].height = 20
 
-    # Severity tile row
-    severity = "HIGH" if summary["late"] > 5 else "MODERATE" if summary["late"] > 0 else "LOW"
-    sev_color = {"HIGH": accent, "MODERATE": "B45309", "LOW": "0D9488"}[severity]
     ws.merge_cells("A4:I4")
-    ws["A4"] = f"     SEVERITY  ·  {severity}     "
-    ws["A4"].font = Font(name="Georgia", size=14, bold=True, color="FFFFFF")
-    ws["A4"].fill = PatternFill("solid", fgColor=sev_color)
-    ws["A4"].alignment = Alignment(vertical="center", horizontal="center")
-    ws.row_dimensions[4].height = 28
-    ws.row_dimensions[5].height = 14
+    severity = "HIGH" if summary["late"] > 5 else "MODERATE" if summary["late"] > 0 else "LOW"
+    sev_color = {"HIGH": "B91C1C", "MODERATE": "D97706", "LOW": "0D9488"}[severity]
+    ws["A4"] = (
+        f"  Case  FRC/HR/ANM/{period['from'].year}/{datetime.now().strftime('%m%d%H%M')}"
+        f"        ·        Window  {period['from'].strftime('%d %b %Y')} → {period['to'].strftime('%d %b %Y')}"
+        f"        ·        Severity  {severity}"
+    )
+    ws["A4"].font = Font(name="Calibri", size=9, color="475569", bold=False)
+    ws["A4"].fill = PatternFill("solid", fgColor="F8FAFC")
+    ws["A4"].alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    for col in "BCDEFGHI":
+        ws[f"{col}4"].fill = PatternFill("solid", fgColor="F8FAFC")
+    ws.row_dimensions[4].height = 22
+    ws.row_dimensions[5].height = 14  # spacer before headers
 
-    # Headers
+    # Headers — corporate accent fill, dark borders on every side
     headers = ["Date", "Code", "Employee", "Department", "Status",
                "Check-in", "Check-out", "Late mins", "Reasons"]
     head_row = 6
+    deep_side = Side(style="medium", color=deep)
     for i, h in enumerate(headers):
         c = ws.cell(row=head_row, column=i + 1, value=h.upper())
-        c.font = Font(size=10, bold=True, color="FDE68A")
-        c.fill = PatternFill("solid", fgColor="1A1410")
+        c.font = Font(size=10, bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor=accent)
         c.alignment = Alignment(vertical="center",
                                 horizontal="right" if h == "Late mins" else "left",
                                 indent=1)
-    ws.row_dimensions[head_row].height = 28
+        c.border = Border(top=deep_side, bottom=deep_side,
+                          left=Side(style="thin", color=deep),
+                          right=Side(style="thin", color=deep))
+    ws.row_dimensions[head_row].height = 26
     ws.freeze_panes = f"A{head_row + 1}"
 
     # Body — manila row with severity stripe on left
@@ -928,19 +1139,27 @@ def _excel_anomalies(rows: list[dict], summary: dict, meta: dict) -> bytes:
         sev = r.get("severity", 0)
         stripe = accent if sev >= 5 else "B45309" if sev >= 3 else "92400E"
 
+        cell_grid = Border(
+            left=Side(style="thin", color="CBD5E1"),
+            right=Side(style="thin", color="CBD5E1"),
+            top=Side(style="thin", color="CBD5E1"),
+            bottom=Side(style="thin", color="CBD5E1"),
+        )
         for col in range(1, 10):
             cell = ws.cell(row=row_idx, column=col)
-            cell.font = Font(size=10, color="1A1410")
+            cell.font = Font(size=10, color="111418")
             cell.fill = PatternFill("solid", fgColor=bg)
             cell.alignment = Alignment(vertical="center", indent=1)
-            cell.border = Border(bottom=Side(style="dashed", color="D1CABB"))
+            cell.border = cell_grid
 
-        # Severity stripe on date column
+        # Severity stripe on date column — keep the thick left rail signal
         date_cell = ws.cell(row=row_idx, column=1, value=r["date"])
         date_cell.number_format = "dd mmm yyyy"
         date_cell.border = Border(
             left=Side(style="thick", color=stripe),
-            bottom=Side(style="dashed", color="D1CABB"),
+            right=Side(style="thin", color="CBD5E1"),
+            top=Side(style="thin", color="CBD5E1"),
+            bottom=Side(style="thin", color="CBD5E1"),
         )
         date_cell.font = Font(size=10, bold=True, color="1A1410")
         ws.cell(row=row_idx, column=2, value=r["employee_code"])
@@ -1006,48 +1225,6 @@ def _excel_daily(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_tab_color(accent)
     ws.hide_gridlines(2)
 
-    # Blueprint-style header
-    f_title = wb.add_format({
-        "bold": True, "font_size": 22, "font_color": "#FFFFFF",
-        "bg_color": "#1e1b4b", "align": "left", "indent": 1, "valign": "vcenter",
-        "font_name": "Consolas",
-    })
-    f_sub = wb.add_format({
-        "italic": True, "font_size": 10, "font_color": "#a5b4fc",
-        "bg_color": "#1e1b4b", "align": "left", "indent": 1, "valign": "vcenter",
-        "font_name": "Consolas",
-    })
-    f_titleblock_lbl = wb.add_format({
-        "bold": True, "font_size": 8, "font_color": "#a5b4fc",
-        "bg_color": "#312e81", "align": "left", "indent": 1, "valign": "vcenter",
-        "font_name": "Consolas",
-    })
-    f_titleblock_val = wb.add_format({
-        "bold": True, "font_size": 11, "font_color": "#FFFFFF",
-        "bg_color": "#312e81", "align": "left", "indent": 1, "valign": "vcenter",
-        "font_name": "Consolas",
-    })
-    f_header = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "left", "indent": 1, "font_size": 10,
-        "bottom": 2, "bottom_color": deep, "valign": "vcenter",
-    })
-    f_header_r = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "right", "indent": 1, "font_size": 10,
-        "bottom": 2, "bottom_color": deep, "valign": "vcenter",
-    })
-    f_cell = wb.add_format({"font_size": 10, "indent": 1, "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_cell_z = wb.add_format({"font_size": 10, "indent": 1, "bg_color": "#f5f3ff", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_hrs = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_hrs_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": "#f5f3ff", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_num = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_num_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bg_color": "#f5f3ff", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_date = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_date_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bg_color": "#f5f3ff", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_time = wb.add_format({"font_size": 10, "indent": 1, "num_format": "hh:mm AM/PM", "bottom": 1, "bottom_color": "#e9e5f7"})
-    f_time_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "hh:mm AM/PM", "bg_color": "#f5f3ff", "bottom": 1, "bottom_color": "#e9e5f7"})
-
     ws.set_column("A:A", 14)
     ws.set_column("B:B", 12)
     ws.set_column("C:C", 26)
@@ -1057,33 +1234,37 @@ def _excel_daily(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_column("H:K", 11)
     ws.set_column("L:L", 14)
 
-    ws.set_row(0, 32)
-    ws.merge_range("A1:L1", "   ◇  ATTENDANCE  ·  DAILY ROSTER  ·  TECHNICAL DRAWING", f_title)
-    ws.set_row(1, 22)
-    ws.merge_range("A2:L2", f"   {theme['subtitle']}", f_sub)
+    # ── Corporate title block ──────────────────────────────────────────
+    next_row = _corporate_title_block(wb, ws, theme, period, summary, last_col=11)
 
-    # Title-block strip
-    ws.set_row(2, 24)
-    ws.merge_range("A3:B3", "  PROJECT", f_titleblock_lbl)
-    ws.merge_range("C3:F3", "FOURRECK HR ATTENDANCE", f_titleblock_val)
-    ws.merge_range("G3:H3", "  DWG NO.", f_titleblock_lbl)
-    ws.merge_range("I3:J3", f"ATT-{period['from'].strftime('%y%m%d')}", f_titleblock_val)
-    ws.merge_range("K3:L3", f"  REV. A · {datetime.now().strftime('%d.%m.%y')}", f_titleblock_lbl)
+    # ── KPI strip — daily roster vitals ────────────────────────────────
+    next_row = _corporate_kpi_strip(wb, ws, theme, [
+        ("EMPLOYEES",     summary["employees"],                   "#475569"),
+        ("ROWS",          summary["rows"],                        "#0284c7"),
+        ("ON-TIME %",     summary["on_time_pct"],                 "#0d9488"),
+        ("LATE EVENTS",   summary["late"],                        "#d97706"),
+        ("ABSENT",        summary["absent"],                      "#b91c1c"),
+        ("OT HRS",        round(summary["overtime_hours"], 1),    "#ea580c"),
+    ], start_row=next_row, last_col=11)
 
-    # Period strip
-    ws.set_row(3, 22)
-    ws.merge_range("A4:B4", "  FROM", f_titleblock_lbl)
-    ws.merge_range("C4:D4", period["from"].strftime("%Y-%m-%d"), f_titleblock_val)
-    ws.merge_range("E4:F4", "  TO", f_titleblock_lbl)
-    ws.merge_range("G4:H4", period["to"].strftime("%Y-%m-%d"), f_titleblock_val)
-    ws.merge_range("I4:J4", "  EMPLOYEES", f_titleblock_lbl)
-    ws.merge_range("K4:L4", f"  {summary['employees']} · {summary['rows']} ROWS", f_titleblock_val)
-    ws.set_row(4, 12)
+    # ── Body formats ───────────────────────────────────────────────────
+    f_header = _corporate_header_format(wb, theme, align="left")
+    f_header_r = _corporate_header_format(wb, theme, align="right")
+    f_cell = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "border": 1, "border_color": BRAND["rule_soft"]})
+    f_cell_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_hrs = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_hrs_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_num = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_num_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_date = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_date_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_time = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "hh:mm AM/PM", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_time_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "hh:mm AM/PM", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
 
     # Headers
     headers = ["Date", "Code", "Employee", "Department", "Shift",
                "Check-in", "Check-out", "Hours", "Break", "Late", "OT", "Status"]
-    start_row = 5
+    start_row = next_row
     ws.set_row(start_row, 26)
     for i, h in enumerate(headers):
         ws.write(start_row, i, h, f_header_r if h in ("Hours", "Break", "Late", "OT") else f_header)
@@ -1175,49 +1356,6 @@ def _excel_breaks(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_tab_color(accent)
     ws.hide_gridlines(2)
 
-    # Receipt-style header (monospace, dark on cream)
-    f_title = wb.add_format({
-        "bold": True, "font_size": 24, "font_color": deep,
-        "bg_color": theme["accent_soft"], "align": "center", "valign": "vcenter",
-        "font_name": "Georgia",
-    })
-    f_sub = wb.add_format({
-        "italic": True, "font_size": 11, "font_color": "#6b5840",
-        "bg_color": theme["accent_soft"], "align": "center", "valign": "vcenter",
-    })
-    f_receipt = wb.add_format({
-        "font_size": 10, "font_color": deep, "bg_color": "#fefaf3",
-        "align": "center", "valign": "vcenter", "font_name": "Consolas", "bold": True,
-    })
-
-    f_header = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "left", "valign": "vcenter", "indent": 1, "font_size": 10,
-        "bottom": 2, "bottom_color": deep,
-    })
-    f_header_r = wb.add_format({
-        "bold": True, "font_color": "#FFFFFF", "bg_color": accent,
-        "align": "right", "valign": "vcenter", "indent": 1, "font_size": 10,
-        "bottom": 2, "bottom_color": deep,
-    })
-    f_cell = wb.add_format({"font_size": 10, "indent": 1, "bottom": 1, "bottom_color": "#ece6d7"})
-    f_cell_z = wb.add_format({"font_size": 10, "indent": 1, "bg_color": "#fefaf3", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_hrs = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_hrs_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": "#fefaf3", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_num = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_num_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0", "bg_color": "#fefaf3", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_pct = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0\"%\"", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_pct_z = wb.add_format({"font_size": 10, "align": "right", "indent": 1, "num_format": "0\"%\"", "bg_color": "#fefaf3", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_date = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bottom": 1, "bottom_color": "#ece6d7"})
-    f_date_z = wb.add_format({"font_size": 10, "indent": 1, "num_format": "dd mmm yyyy", "bg_color": "#fefaf3", "bottom": 1, "bottom_color": "#ece6d7"})
-
-    # Intensity pill formats
-    INTENSITY_STYLES = {
-        "SHORT":    {"bg": "#dcfce7", "fg": "#14532d"},
-        "STANDARD": {"bg": "#fef9c3", "fg": "#713f12"},
-        "LONG":     {"bg": "#fee2e2", "fg": "#7f1d1d"},
-    }
-
     ws.set_column("A:A", 14)
     ws.set_column("B:B", 12)
     ws.set_column("C:C", 26)
@@ -1227,24 +1365,44 @@ def _excel_breaks(rows: list[dict], summary: dict, meta: dict) -> bytes:
     ws.set_column("H:I", 12)
     ws.set_column("J:J", 14)
 
-    ws.set_row(0, 44)
-    ws.merge_range("A1:J1", "☕  BREAK RECEIPT  ·  FOURRECK CAFÉ  ☕", f_title)
-    ws.set_row(1, 22)
-    ws.merge_range("A2:J2", theme["subtitle"], f_sub)
-    ws.set_row(2, 22)
-    ws.merge_range(
-        "A3:J3",
-        f"FROM  {period['from'].strftime('%d-%b-%Y').upper()}    →    "
-        f"TO  {period['to'].strftime('%d-%b-%Y').upper()}    ·    "
-        f"BREAK-DAYS  {len(rows)}    ·    EMPLOYEES  {summary['employees']}",
-        f_receipt,
-    )
-    ws.set_row(3, 12)
+    # ── Corporate title block ──────────────────────────────────────────
+    next_row = _corporate_title_block(wb, ws, theme, period, summary, last_col=9)
+
+    # ── KPI strip — break intelligence ─────────────────────────────────
+    total_break_min = sum(int(r.get("break_minutes") or 0) for r in rows)
+    avg_ratio = round(sum(float(r.get("break_ratio_pct") or 0) for r in rows) / max(len(rows), 1))
+    next_row = _corporate_kpi_strip(wb, ws, theme, [
+        ("BREAK-DAYS",     len(rows),                "#475569"),
+        ("EMPLOYEES",      summary["employees"],     "#0284c7"),
+        ("TOTAL BREAK MIN", total_break_min,         accent),
+        ("AVG RATIO %",    avg_ratio,                "#d97706"),
+    ], start_row=next_row, last_col=9)
+
+    # ── Body formats ───────────────────────────────────────────────────
+    f_header = _corporate_header_format(wb, theme, align="left")
+    f_header_r = _corporate_header_format(wb, theme, align="right")
+    f_cell = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "border": 1, "border_color": BRAND["rule_soft"]})
+    f_cell_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_hrs = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_hrs_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0.00\" h\"", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_num = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_num_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_pct = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0\"%\"", "border": 1, "border_color": BRAND["rule_soft"]})
+    f_pct_z = wb.add_format({"font_size": BRAND["body_pt"], "align": "right", "indent": 1, "num_format": "0\"%\"", "bg_color": BRAND["cream"], "border": 1, "border_color": BRAND["rule_soft"]})
+    f_date = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+    f_date_z = wb.add_format({"font_size": BRAND["body_pt"], "indent": 1, "num_format": "dd mmm yyyy", "bg_color": BRAND["cream"], "bottom": 1, "bottom_color": BRAND["rule_soft"]})
+
+    # Intensity pill formats
+    INTENSITY_STYLES = {
+        "SHORT":    {"bg": BRAND["good_bg"], "fg": BRAND["good_fg"]},
+        "STANDARD": {"bg": BRAND["warn_bg"], "fg": BRAND["warn_fg"]},
+        "LONG":     {"bg": BRAND["danger_bg"], "fg": BRAND["danger_fg"]},
+    }
 
     # Headers
     headers = ["Date", "Code", "Employee", "Department", "Shift",
                "Working hrs", "Break hrs", "Break mins", "Ratio %", "Length"]
-    start_row = 4
+    start_row = next_row
     ws.set_row(start_row, 26)
     for i, h in enumerate(headers):
         ws.write(start_row, i, h, f_header_r if h in ("Working hrs", "Break hrs", "Break mins", "Ratio %") else f_header)

@@ -383,12 +383,20 @@ def update_employee(
     if not update:
         return _to_detail(emp, reveal_bank=False)
 
-    # Linked-user fields (full_name / email) are pulled out before we assign
-    # the remainder to the Employee record — they live on the User model.
+    # Linked-user fields (full_name / email / employee_code) are pulled out
+    # before we assign the remainder to the Employee record — they live on
+    # the User model. employee_code is also mirrored on Employee for fast
+    # queries (see Employee.employee_code comment).
     user_full_name = update.pop("full_name", None)
     user_email = update.pop("email", None)
+    user_employee_code = update.pop("employee_code", None) if "employee_code" in update else None
+    employee_code_in_payload = "employee_code" in payload.model_fields_set
 
-    if (user_full_name is not None or user_email is not None) and emp.user_id:
+    if (
+        user_full_name is not None
+        or user_email is not None
+        or employee_code_in_payload
+    ) and emp.user_id:
         user = db.query(User).filter(User.id == emp.user_id).first()
         if not user:
             raise HTTPException(409, "Linked user account is missing")
@@ -404,6 +412,21 @@ def update_employee(
             user.email = user_email
         if user_full_name is not None:
             user.full_name = user_full_name
+        if employee_code_in_payload:
+            # Normalise empty / whitespace to NULL so the unique index allows
+            # multiple un-coded employees.
+            new_code = (user_employee_code or "").strip() or None
+            if new_code != user.employee_code:
+                if new_code is not None:
+                    clash = (
+                        db.query(User.id)
+                        .filter(User.employee_code == new_code, User.id != user.id)
+                        .first()
+                    )
+                    if clash:
+                        raise HTTPException(409, "Employee code is already in use by another employee")
+                user.employee_code = new_code
+                emp.employee_code = new_code  # keep the mirror in sync
 
     for k, v in update.items():
         setattr(emp, k, v)

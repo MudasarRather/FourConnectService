@@ -45,6 +45,16 @@ app = FastAPI(
 @app.on_event("startup")
 def startup_db():
     Base.metadata.create_all(bind=engine)
+    # Start the shift-end attendance finalizer (classifies un-actioned days as
+    # ABSENT / HALF_DAY / WEEK_OFF / … shortly after each shift ends). Fully
+    # guarded + runs on its own NullPool engine so it can never block boot or
+    # contend with the StaticPool request connection.
+    try:
+        from app.utils.hr.attendance_finalizer import start_finalizer
+        start_finalizer(900)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
 
 # Configure CORS — local dev origins + production frontend domains.
 # Keep this list in sync with the global exception handler below.

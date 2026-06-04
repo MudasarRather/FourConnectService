@@ -168,6 +168,8 @@ def fetch_rows(
             Attendance.late_minutes,
             Attendance.early_exit_minutes,
             Attendance.overtime_hours,
+            Attendance.lop_days,
+            Attendance.leave_request_id,
             Attendance.status,
             Attendance.source,
             Attendance.geo_verified,
@@ -182,6 +184,8 @@ def fetch_rows(
             Shift.name.label("shift_name"),
             Shift.start_time.label("shift_start"),
             Shift.end_time.label("shift_end"),
+            Shift.break_minutes.label("break_cap"),
+            Shift.full_day_hours.label("full_day_hours"),
         )
         .join(Employee, Employee.id == Attendance.employee_id)
         .join(User, User.id == Employee.user_id)
@@ -214,6 +218,10 @@ def fetch_rows(
             "late_minutes": int(r.late_minutes or 0),
             "early_exit_minutes": int(r.early_exit_minutes or 0),
             "overtime_hours": float(r.overtime_hours or 0),
+            "lop_days": float(r.lop_days or 0),
+            "leave_request_id": str(r.leave_request_id) if r.leave_request_id else None,
+            "break_cap": int(r.break_cap) if r.break_cap is not None else 60,
+            "full_day_hours": float(r.full_day_hours) if r.full_day_hours is not None else 8.0,
             "status": r.status.value if hasattr(r.status, "value") else str(r.status),
             "source": r.source.value if hasattr(r.source, "value") else str(r.source),
             "geo_verified": bool(r.geo_verified),
@@ -238,7 +246,7 @@ def fetch_rows(
 
 
 def shape_summary(rows: list[dict]) -> dict:
-    present = late = absent = half = leave = wfh = remote = on_duty = week_off = holiday = 0
+    present = late = absent = half = leave = wfh = remote = on_duty = week_off = holiday = lwp = 0
     ot_hours = 0.0
     late_minutes = 0
     work_hours = 0.0
@@ -256,8 +264,12 @@ def shape_summary(rows: list[dict]) -> dict:
             late += 1
         elif s == "HALF_DAY":
             half += 1
+            if r.get("leave_request_id"):   # leave-driven half-day → 0.5 leave
+                leave += 0.5
         elif s == "ABSENT":
             absent += 1
+        elif s == "LWP":
+            lwp += 1
         elif s == "LEAVE":
             leave += 1
         elif s == "WFH":
@@ -288,6 +300,7 @@ def shape_summary(rows: list[dict]) -> dict:
         "late": late,
         "absent": absent,
         "half_day": half,
+        "lwp": lwp,
         "leave": leave,
         "wfh": wfh,
         "remote": remote,
@@ -307,6 +320,17 @@ def shape_summary(rows: list[dict]) -> dict:
 
 
 def _shape_monthly(rows: list[dict]) -> list[dict]:
+    """Corporate-grade per-employee monthly summary — payroll-ready.
+
+    Captures the full day-type breakdown (present / late / half / absent /
+    leave / WFH / holiday / week-off), the hours ledger (worked / break /
+    excess-break / overtime), punctuality (late & early-exit minutes), and the
+    payroll spine (loss-of-pay days, payable days, attendance %).
+
+    Leave counting is fixed: a full LEAVE day counts 1.0, and a half-day driven
+    by an approved leave (status HALF_DAY with a `leave_request_id`) counts 0.5
+    — so applied leave that materialised as a half-day is no longer invisible.
+    """
     by_emp: dict[str, dict] = {}
     for r in rows:
         key = r["employee_id"]
@@ -317,21 +341,39 @@ def _shape_monthly(rows: list[dict]) -> list[dict]:
                 "department": r["department"],
                 "designation": r["designation"],
                 "shift_name": r["shift_name"],
+                # day-type counts
                 "present_days": 0,
                 "late_days": 0,
                 "absent_days": 0,
                 "half_days": 0,
-                "leave_days": 0,
+                "lwp_days": 0,          # authorised unpaid no-show days (LWP-debited)
+                "leave_days": 0.0,      # paid leave taken (full=1, half-leave=0.5)
                 "wfh_days": 0,
                 "week_offs": 0,
                 "holidays": 0,
+                "on_duty_days": 0,
+                # payroll spine
+                "total_days": 0,        # calendar days with an attendance row
+                "lop_days": 0.0,        # loss-of-pay days (payroll deduction)
+                "payable_days": 0.0,
+                "attendance_pct": 0.0,
+                # hours ledger
                 "total_working_hours": 0.0,
+                "avg_working_hours": 0.0,
                 "total_break_hours": 0.0,
-                "total_late_minutes": 0,
+                "excess_break_minutes": 0,
                 "total_overtime_hours": 0.0,
+                # punctuality
+                "total_late_minutes": 0,
+                "total_early_exit_minutes": 0,
+                # exceptions
+                "flagged_days": 0,
+                "missing_punch_days": 0,
+                "_worked_days": 0,       # internal — days with a real check-in
             }
         e = by_emp[key]
         s = r["status"]
+        e["total_days"] += 1
         if s == "PRESENT":
             e["present_days"] += 1
         elif s == "LATE":
@@ -339,26 +381,80 @@ def _shape_monthly(rows: list[dict]) -> list[dict]:
             e["late_days"] += 1
         elif s == "HALF_DAY":
             e["half_days"] += 1
+            # Only the leave-driven half counts as leave; a late/short half
+            # (no leave_request_id) is just a half day, not leave.
+            if r.get("leave_request_id"):
+                e["leave_days"] += 0.5
         elif s == "ABSENT":
             e["absent_days"] += 1
+        elif s == "LWP":
+            # Authorised unpaid no-show (no clock-in, covered by LWP balance).
+            e["lwp_days"] += 1
         elif s == "LEAVE":
-            e["leave_days"] += 1
+            e["leave_days"] += 1.0
         elif s in ("WFH", "REMOTE"):
             e["wfh_days"] += 1
+            e["present_days"] += 1
+        elif s == "ON_DUTY":
+            e["on_duty_days"] += 1
             e["present_days"] += 1
         elif s == "WEEK_OFF":
             e["week_offs"] += 1
         elif s == "HOLIDAY":
             e["holidays"] += 1
-        e["total_working_hours"] += r["working_hours"] or 0
-        e["total_break_hours"] += r["break_hours"] or 0
-        e["total_late_minutes"] += r["late_minutes"] or 0
-        e["total_overtime_hours"] += r["overtime_hours"] or 0
+
+        e["total_working_hours"] += r.get("working_hours") or 0
+        e["total_break_hours"] += r.get("break_hours") or 0
+        e["total_late_minutes"] += r.get("late_minutes") or 0
+        e["total_early_exit_minutes"] += r.get("early_exit_minutes") or 0
+        e["total_overtime_hours"] += r.get("overtime_hours") or 0
+
+        # Loss-of-pay derived from the day type — the stored `lop_days` column
+        # can be stale on older/restored rows (e.g. ABSENT rows left at 0), so
+        # deriving it here keeps the payroll figure reliable:
+        #   ABSENT                              → 1.0 unpaid
+        #   unapproved short/late HALF_DAY      → 0.5 unpaid
+        #   approved half-day-leave not worked  → 0.5 unpaid (leave pays the other half)
+        if s == "ABSENT":
+            e["lop_days"] += 1.0
+        elif s == "LWP":
+            e["lop_days"] += 1.0          # full unpaid day, debited to LWP balance
+        elif s == "HALF_DAY":
+            if not r.get("leave_request_id"):
+                e["lop_days"] += 0.5
+            elif (r.get("working_hours") or 0) <= 0:
+                e["lop_days"] += 0.5
+
+        # Excess break = break taken beyond the shift's allowance, per day.
+        cap = r.get("break_cap") or 60
+        actual_break_min = (r.get("break_hours") or 0) * 60.0
+        if actual_break_min > cap:
+            e["excess_break_minutes"] += int(round(actual_break_min - cap))
+
+        if r.get("check_in_time"):
+            e["_worked_days"] += 1
+        if r.get("is_flagged"):
+            e["flagged_days"] += 1
+        # A day that should have been worked but has no punch.
+        if (not r.get("check_in_time")
+                and s not in ("ABSENT", "WEEK_OFF", "HOLIDAY", "LEAVE", "LWP")):
+            e["missing_punch_days"] += 1
+
     out = list(by_emp.values())
     for e in out:
         e["total_working_hours"] = round(e["total_working_hours"], 2)
         e["total_break_hours"] = round(e["total_break_hours"], 2)
         e["total_overtime_hours"] = round(e["total_overtime_hours"], 2)
+        e["leave_days"] = round(e["leave_days"], 1)
+        e["lop_days"] = round(e["lop_days"], 1)
+        worked = e.pop("_worked_days", 0)
+        e["avg_working_hours"] = round(e["total_working_hours"] / worked, 2) if worked else 0.0
+        # Payable days = every day on file minus the loss-of-pay portion.
+        e["payable_days"] = round(e["total_days"] - e["lop_days"], 1)
+        # Attendance % over scheduled (working) days = days expected at work.
+        scheduled = e["total_days"] - e["holidays"] - e["week_offs"]
+        present_equiv = e["present_days"] + e["half_days"] * 0.5
+        e["attendance_pct"] = round((present_equiv / scheduled) * 100, 1) if scheduled else 0.0
     out.sort(key=lambda x: x["employee_name"].lower())
     return out
 

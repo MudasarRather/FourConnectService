@@ -19,7 +19,8 @@ from app.models.hr.shift import Shift
 from app.models.hr.attendance import Attendance, AttendanceStatus, AttendanceSource
 from app.models.hr.attendance_punch import AttendancePunch, PunchType
 from app.models.hr.attendance_correction import AttendanceCorrection, CorrectionStatus
-from app.models.hr.wfh_request import WfhRequest, WfhStatus
+from app.models.hr.wfh_request import WfhRequest, WfhStatus, WfhRequestType
+from app.models.hr.half_day_request import HalfDayRequest, HalfDayStatus, HalfDayWhich
 from app.models.hr.holiday import Holiday
 from app.models.hr.biometric_device import BiometricDevice, BiometricDeviceStatus
 from app.models.hr.attendance_log import AttendanceLogAction
@@ -102,6 +103,8 @@ def _to_att_response(db: Session, a: Attendance) -> AttendanceResponse:
         remarks=a.remarks,
         is_flagged=bool(a.is_flagged),
         is_locked=bool(a.is_locked),
+        late_condoned=bool(getattr(a, "late_condoned", False)),
+        lop_days=float(a.lop_days or 0),
         created_at=a.created_at,
         updated_at=a.updated_at,
         **snap,
@@ -584,6 +587,45 @@ def recompute_attendance(
     return _to_att_response(db, a)
 
 
+@router.post("/condone-late", response_model=AttendanceResponse)
+def condone_late(
+    employee_id: UUID,
+    on_date: date,
+    condoned: bool = True,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Waive (or un-waive) a LATE mark so it no longer counts toward the monthly
+    late-accumulation penalty — corporate "regularisation". The punch and the
+    LATE status stay on record; only the penalty is reconciled. Recompute then
+    releases (or re-applies) the LWP late penalty for that month.
+    """
+    a = (
+        db.query(Attendance)
+        .filter(Attendance.employee_id == employee_id, Attendance.date == on_date,
+                Attendance.is_deleted == False)  # noqa: E712
+        .first()
+    )
+    if not a:
+        raise HTTPException(404, "Attendance row not found for that employee/date")
+    if a.status != AttendanceStatus.LATE:
+        raise HTTPException(409, f"Only LATE days can be condoned (this is {a.status.value})")
+    a.late_condoned = bool(condoned)
+    db.flush()
+    log(
+        db, actor_id=admin.id,
+        action=AttendanceLogAction.MANUAL_EDIT,
+        target_table="hr_attendance", target_id=a.id, employee_id=employee_id,
+        payload={"on_date": on_date.isoformat(), "late_condoned": bool(condoned),
+                 "reason": "late_mark_regularisation"},
+    )
+    # Reconcile the month's penalty with the new condone state.
+    daily_rollup(db, employee_id, on_date, actor_id=admin.id, source=AttendanceSource.MANUAL)
+    db.commit()
+    db.refresh(a)
+    return _to_att_response(db, a)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Admin — Break-anomaly monitoring
 # ──────────────────────────────────────────────────────────────────────────
@@ -905,6 +947,15 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
     # Week off?
     is_week_off = bool(shift and today.weekday() in (shift.weekly_off_days or []))
 
+    # Full-day approved leave? (half-day leave does NOT block — works the other half)
+    leave_today = _approved_full_day_leave(db, emp.id, today)
+    is_on_leave = leave_today is not None
+    leave_type_val = (
+        leave_today.leave_type.value if (is_on_leave and hasattr(leave_today.leave_type, "value"))
+        else (str(leave_today.leave_type) if is_on_leave else None)
+    )
+    leave_reference_no = leave_today.reference_no if is_on_leave else None
+
     # WFH approved?
     wfh = (
         db.query(WfhRequest)
@@ -916,11 +967,27 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
         )
         .all()
     )
-    wfh_approved = any(
-        (w.wfh_date_until or w.wfh_date) >= today for w in wfh
-    )
+    wfh_matches = [w for w in wfh if (w.wfh_date_until or w.wfh_date) >= today]
+    wfh_approved = bool(wfh_matches)
+    # Surface the discriminator so the live chip reads "Remote approved" vs
+    # "WFH approved" instead of always saying WFH. REMOTE wins if any covering
+    # request is REMOTE (rare to have both for one day).
+    wfh_request_type = None
+    if wfh_matches:
+        wfh_request_type = (
+            WfhRequestType.REMOTE.value
+            if any(w.request_type == WfhRequestType.REMOTE for w in wfh_matches)
+            else WfhRequestType.WFH.value
+        )
 
     can_clock_in = open_punch is None and not has_close_out
+    # A weekly-off or company holiday is a non-working day — no self clock-in
+    # (matches the /me/clock-in enforcement). An approved WFH/remote waives it.
+    if (is_week_off or is_holiday) and not wfh_approved:
+        can_clock_in = False
+    # Full-day approved leave blocks self clock-in outright (not WFH-waivable).
+    if is_on_leave:
+        can_clock_in = False
     can_clock_out = open_punch == PunchType.IN
     can_break_start = open_punch == PunchType.IN
     can_break_end = open_punch == PunchType.BREAK_START
@@ -930,6 +997,8 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
     is_late = False
     minutes_late = 0
     requires_late_approval = False
+    late_window_closed = False
+    late_punch_cutoff_min = 0
     is_too_early_to_punch = False
     minutes_until_clock_in_opens = 0
     minutes_until_shift_start = 0
@@ -937,37 +1006,67 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
     requires_early_exit_approval = False
     minutes_until_shift_end = 0
     has_approved_early_exit = False
-    if shift:
-        shift_start_dt = _shift_start_local(shift, today)
-        shift_end_dt = _shift_end_local(shift, today)
-        minutes_until_shift_start = max(0, int((shift_start_dt - now_local).total_seconds() // 60))
-        minutes_until_shift_end = max(0, int((shift_end_dt - now_local).total_seconds() // 60))
 
-        minutes_late = _minutes_late_now(shift, now_local)
-        is_late = minutes_late > int(shift.grace_minutes or 0)
+    # Half-day state — read once, reused for every windowed check below so
+    # FIRST-off employees aren't 4+ hours "late" at midday and SECOND-off
+    # employees can leave at mid-shift without triggering the early-exit
+    # approval flow.
+    half_day = _approved_half_day(db, emp.id, today) if shift else None
+    effective_start_str: Optional[str] = None
+    effective_end_str: Optional[str] = None
+    effective_grace = 0
+
+    if shift:
+        effective_start_dt, effective_end_dt = _effective_shift_window(shift, today, half_day)
+        effective_start_str = effective_start_dt.strftime("%H:%M")
+        effective_end_str = effective_end_dt.strftime("%H:%M")
+        minutes_until_shift_start = max(0, int((effective_start_dt - now_local).total_seconds() // 60))
+        minutes_until_shift_end = max(0, int((effective_end_dt - now_local).total_seconds() // 60))
+
+        effective_grace = _effective_grace_minutes(shift, half_day)
+        minutes_late = _minutes_late_now(shift, now_local, effective_start=effective_start_dt)
+        is_late = minutes_late > effective_grace
         threshold = int(shift.late_self_punch_threshold_minutes or 0)
-        grace = int(shift.grace_minutes or 0)
 
         # Early clock-in lock: anything more than EARLY_PUNCH_BUFFER_MINUTES
-        # before shift start is rejected on submit. Surface a friendly state
-        # to the frontend so the clock-in button can render disabled with a
+        # before the *effective* shift start is rejected on submit. Surface a
+        # friendly state so the clock-in button renders disabled with a
         # "shift hasn't started yet" caption.
         if minutes_until_shift_start > EARLY_PUNCH_BUFFER_MINUTES and can_clock_in:
             is_too_early_to_punch = True
             can_clock_in = False
             minutes_until_clock_in_opens = minutes_until_shift_start - EARLY_PUNCH_BUFFER_MINUTES
-            clock_in_opens_at_dt = shift_start_dt - timedelta(minutes=EARLY_PUNCH_BUFFER_MINUTES)
+            clock_in_opens_at_dt = effective_start_dt - timedelta(minutes=EARLY_PUNCH_BUFFER_MINUTES)
             clock_in_opens_at_str = clock_in_opens_at_dt.strftime("%H:%M")
 
-        if can_clock_in and shift.late_punch_requires_approval and minutes_late > grace + threshold:
-            requires_late_approval = True
-            can_clock_in = False  # frontend should surface "Request late approval" instead
+        # Cap the self-late-punch window. Beyond the half-day-late cutoff — the
+        # EARLIER of mid-shift or 2h after the effective start — OR once the
+        # effective shift end has passed, a self late-punch no longer makes
+        # sense: the day is a half-day/no-show that must go through admin
+        # regularization, not the quick late-punch button. This mirrors the
+        # `min(shift_span/2, 120)` half-day cutoff used by the daily rollup.
+        _eff_span_min = (effective_end_dt - effective_start_dt).total_seconds() / 60.0
+        if _eff_span_min <= 0:                       # overnight effective window
+            _eff_span_min += 24 * 60
+        late_punch_cutoff_min = int(min(_eff_span_min / 2.0, 120.0))
+        shift_has_ended = now_local >= effective_end_dt
 
-        # Early clock-out: if the shift hasn't ended and there's no approved
-        # early-exit correction, mark `requires_early_exit_approval` so the
-        # frontend can route the Clock-out button into the request modal
-        # instead of letting the API call fail.
-        if open_punch == PunchType.IN and now_local < shift_end_dt:
+        if can_clock_in and shift.late_punch_requires_approval and minutes_late > effective_grace + threshold:
+            if minutes_late <= late_punch_cutoff_min and not shift_has_ended:
+                requires_late_approval = True
+                can_clock_in = False  # frontend surfaces "Request late approval" instead
+            else:
+                # Past the cap — lock self clock-in but do NOT offer the
+                # late-punch request; the frontend shows a terminal
+                # "window closed — contact HR" state instead.
+                can_clock_in = False
+                late_window_closed = True
+
+        # Early clock-out: if the *effective* shift end hasn't passed and
+        # there's no approved early-exit correction, route the Clock-out
+        # button into the request modal. A SECOND-off employee at 13:31
+        # (mid-shift effective end) is allowed to leave cleanly.
+        if open_punch == PunchType.IN and now_local < effective_end_dt:
             has_approved_early_exit = _has_approved_correction(db, emp.id, today, "[EARLY_EXIT]")
             if not has_approved_early_exit:
                 requires_early_exit_approval = True
@@ -1008,6 +1107,8 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
         next_action = "done"
     elif requires_late_approval:
         next_action = "request_late_approval"
+    elif late_window_closed:
+        next_action = "late_window_closed"
     elif is_too_early_to_punch:
         next_action = "wait_for_shift"
     else:
@@ -1028,10 +1129,16 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
         holiday_name=holiday_name,
         is_week_off=is_week_off,
         wfh_approved=wfh_approved,
+        wfh_request_type=wfh_request_type,
+        is_on_leave=is_on_leave,
+        leave_type=leave_type_val,
+        leave_reference_no=leave_reference_no,
         next_action=next_action,
         is_late=is_late,
         late_minutes_now=max(0, minutes_late),
         requires_late_approval=requires_late_approval,
+        late_window_closed=late_window_closed,
+        late_punch_cutoff_minutes=late_punch_cutoff_min,
         pending_late_request_id=pending_late_request_id,
         pending_late_request_status=pending_late_request_status,
         is_too_early_to_punch=is_too_early_to_punch,
@@ -1048,6 +1155,12 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
         current_break_window=current_window,
         next_break_window=next_window,
         in_break_window_now=in_window_now,
+        is_half_day=half_day is not None,
+        half_day_which=half_day.which_half.value if half_day else None,
+        half_day_reason=(half_day.reason if half_day else None),
+        effective_shift_start=effective_start_str,
+        effective_shift_end=effective_end_str,
+        effective_grace_minutes=effective_grace,
     )
 
 
@@ -1069,9 +1182,71 @@ def _shift_start_local(shift: Shift, on_date: date) -> datetime:
     return datetime.combine(on_date, shift.start_time, tzinfo=IST)
 
 
-def _minutes_late_now(shift: Shift, now_local: datetime) -> int:
-    """Minutes past shift start_time (negative if before)."""
-    start = _shift_start_local(shift, now_local.date())
+def _approved_half_day(
+    db: Session, employee_id: UUID, on_date: date,
+) -> Optional[HalfDayRequest]:
+    """Return the APPROVED half-day request for (employee, date) or None.
+
+    Used by every late/early/grace check so a first-half-off employee isn't
+    treated as 4+ hours late at midday, and a second-half-off employee can
+    clock out at mid-shift without tripping early-exit approval.
+    """
+    return (
+        db.query(HalfDayRequest)
+        .filter(
+            HalfDayRequest.employee_id == employee_id,
+            HalfDayRequest.half_day_date == on_date,
+            HalfDayRequest.status == HalfDayStatus.APPROVED,
+            HalfDayRequest.is_deleted == False,  # noqa: E712
+        )
+        .first()
+    )
+
+
+def _effective_shift_window(
+    shift: Shift, on_date: date, half_day: Optional[HalfDayRequest],
+) -> tuple[datetime, datetime]:
+    """Return (effective_start, effective_end) wall-clock IST datetimes.
+
+    For a half-day:
+      * FIRST off  → effective_start = midpoint(start, end), end unchanged
+      * SECOND off → start unchanged, effective_end = midpoint(start, end)
+
+    Midpoint uses the raw shift span so it doesn't depend on break_minutes.
+    Wraps past midnight when start > end (night shift) — same convention as
+    `_shift_end_local`.
+    """
+    start_dt = datetime.combine(on_date, shift.start_time, tzinfo=IST)
+    end_dt = datetime.combine(on_date, shift.end_time, tzinfo=IST)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+
+    if not half_day:
+        return start_dt, end_dt
+
+    mid_dt = start_dt + (end_dt - start_dt) / 2
+    if half_day.which_half == HalfDayWhich.FIRST:
+        return mid_dt, end_dt
+    return start_dt, mid_dt
+
+
+def _effective_grace_minutes(shift: Shift, half_day: Optional[HalfDayRequest]) -> int:
+    """`half_day_grace_minutes` if a half-day is active today, else `grace_minutes`."""
+    if half_day:
+        return int(getattr(shift, "half_day_grace_minutes", None) or shift.grace_minutes or 0)
+    return int(shift.grace_minutes or 0)
+
+
+def _minutes_late_now(
+    shift: Shift, now_local: datetime,
+    *, effective_start: Optional[datetime] = None,
+) -> int:
+    """Minutes past the effective shift start (negative if before).
+
+    Callers that have already resolved the effective start should pass it in;
+    otherwise this falls back to `shift.start_time` (legacy behaviour).
+    """
+    start = effective_start or _shift_start_local(shift, now_local.date())
     return int((now_local - start).total_seconds() // 60)
 
 
@@ -1194,46 +1369,61 @@ def _validate_punch_policy(
     now_local = _now_local()
     today = now_local.date()
 
+    # Resolve half-day awareness so a FIRST-off employee at 14:00 isn't treated
+    # as ~5h late, and a SECOND-off employee can clock in normally for the
+    # morning half. Requires db + employee_id — callers always pass them on
+    # IN/OUT today; legacy callers without them fall back to nominal shift.
+    half_day = (
+        _approved_half_day(db, employee_id, today)
+        if db is not None and employee_id is not None
+        else None
+    )
+    effective_start, effective_end = _effective_shift_window(shift, today, half_day)
+    grace = _effective_grace_minutes(shift, half_day)
+    effective_start_str = effective_start.strftime("%H:%M")
+
     if expected_type == PunchType.IN:
-        # Block punches that arrive far before the shift starts (e.g. 1:11 AM
-        # for a 9:00 AM shift) — they're almost always accidental and skew the
-        # working_hours calculation.
-        shift_start = _shift_start_local(shift, today)
-        minutes_before_start = int((shift_start - now_local).total_seconds() // 60)
+        # Block punches that arrive far before the *effective* shift starts.
+        minutes_before_start = int((effective_start - now_local).total_seconds() // 60)
         if minutes_before_start > EARLY_PUNCH_BUFFER_MINUTES:
             raise HTTPException(
                 status_code=423,
                 detail={
                     "code": "EARLY_PUNCH_NOT_ALLOWED",
                     "message": (
-                        f"Your shift starts at {shift.start_time.strftime('%H:%M')}. "
+                        f"Your {'half-day ' if half_day else ''}shift starts at {effective_start_str}. "
                         f"You're {minutes_before_start} minutes early — clock-in opens "
                         f"{EARLY_PUNCH_BUFFER_MINUTES} minutes before shift start."
                     ),
-                    "shift_start": shift.start_time.strftime("%H:%M"),
+                    "shift_start": effective_start_str,
                     "minutes_before_start": minutes_before_start,
                     "early_buffer_minutes": EARLY_PUNCH_BUFFER_MINUTES,
-                    "clock_in_opens_at": (shift_start - timedelta(minutes=EARLY_PUNCH_BUFFER_MINUTES)).strftime("%H:%M"),
+                    "clock_in_opens_at": (effective_start - timedelta(minutes=EARLY_PUNCH_BUFFER_MINUTES)).strftime("%H:%M"),
+                    "is_half_day": half_day is not None,
+                    "half_day_which": half_day.which_half.value if half_day else None,
                 },
             )
 
         if shift.late_punch_requires_approval:
-            grace = int(shift.grace_minutes or 0)
             threshold = int(shift.late_self_punch_threshold_minutes or 0)
-            minutes_late = _minutes_late_now(shift, now_local)
+            minutes_late = _minutes_late_now(shift, now_local, effective_start=effective_start)
             if minutes_late > grace + threshold:
                 raise HTTPException(
                     status_code=423,
                     detail={
                         "code": "LATE_PUNCH_REQUIRES_APPROVAL",
                         "message": (
-                            f"You are {minutes_late} minutes late. Self-punch is locked beyond "
-                            f"{grace + threshold} min ({grace} grace + {threshold} threshold). "
+                            f"You are {minutes_late} minutes late "
+                            f"({'half-day · ' if half_day else ''}start {effective_start_str}). "
+                            f"Self-punch is locked beyond {grace + threshold} min "
+                            f"({grace} grace + {threshold} threshold). "
                             "Submit a late-punch request for admin approval."
                         ),
-                        "shift_start": shift.start_time.strftime("%H:%M"),
+                        "shift_start": effective_start_str,
                         "minutes_late": minutes_late,
                         "threshold_minutes": grace + threshold,
+                        "is_half_day": half_day is not None,
+                        "half_day_which": half_day.which_half.value if half_day else None,
                     },
                 )
         return
@@ -1241,25 +1431,29 @@ def _validate_punch_policy(
     if expected_type == PunchType.OUT:
         # Block early clock-out unless admin has approved an early-exit request
         # for today. Reuses the AttendanceCorrection table tagged with
-        # `[EARLY_EXIT]` (see /me/request-early-exit).
-        shift_end = _shift_end_local(shift, today)
-        if now_local < shift_end:
+        # `[EARLY_EXIT]` (see /me/request-early-exit). When SECOND-half-off is
+        # approved, the effective end is mid-shift — leaving any time after
+        # that is fine and shouldn't trigger the early-exit flow.
+        effective_end_str = effective_end.strftime("%H:%M")
+        if now_local < effective_end:
             approved = False
             if db is not None and employee_id is not None:
                 approved = _has_approved_correction(db, employee_id, today, "[EARLY_EXIT]")
             if not approved:
-                minutes_remaining = int((shift_end - now_local).total_seconds() // 60)
+                minutes_remaining = int((effective_end - now_local).total_seconds() // 60)
                 raise HTTPException(
                     status_code=423,
                     detail={
                         "code": "EARLY_EXIT_REQUIRES_APPROVAL",
                         "message": (
-                            f"Your shift ends at {shift.end_time.strftime('%H:%M')}. "
+                            f"Your {'half-day ' if half_day else ''}shift ends at {effective_end_str}. "
                             f"You still have {minutes_remaining} minute(s) left. "
                             "Submit an early-exit request — admin approval is required to clock out before shift end."
                         ),
-                        "shift_end": shift.end_time.strftime("%H:%M"),
+                        "shift_end": effective_end_str,
                         "minutes_remaining": minutes_remaining,
+                        "is_half_day": half_day is not None,
+                        "half_day_which": half_day.which_half.value if half_day else None,
                     },
                 )
         return
@@ -1299,6 +1493,124 @@ def _validate_punch_policy(
                         "now_time": current_t.strftime("%H:%M"),
                     },
                 )
+
+
+def _holiday_for(db: Session, emp: Employee, on_date: date) -> Optional[Holiday]:
+    """Return the active (non-restricted) holiday that applies to this employee
+    on `on_date`, honouring location scoping — or None. Mirrors the detection
+    used by /me/today and daily_rollup so all three agree."""
+    from app.models.hr.holiday import HolidayType
+    rows = (
+        db.query(Holiday)
+        .filter(
+            Holiday.date == on_date,
+            Holiday.is_active == True,            # noqa: E712
+            Holiday.is_deleted == False,          # noqa: E712
+            Holiday.holiday_type != HolidayType.RESTRICTED,
+        )
+        .all()
+    )
+    for h in rows:
+        if h.location_id is None or (emp and emp.work_location_id == h.location_id):
+            return h
+    return None
+
+
+def _approved_wfh_today(db: Session, employee_id: UUID, on_date: date) -> bool:
+    """True when an APPROVED WFH/remote request covers `on_date`. Lets a
+    legitimately-approved remote worker punch even on a rest day."""
+    from app.models.hr.wfh_request import WfhRequest, WfhStatus
+    for w in (
+        db.query(WfhRequest)
+        .filter(
+            WfhRequest.employee_id == employee_id,
+            WfhRequest.status == WfhStatus.APPROVED,
+            WfhRequest.is_deleted == False,       # noqa: E712
+            WfhRequest.wfh_date <= on_date,
+        )
+        .all()
+    ):
+        if w.wfh_date <= on_date <= (w.wfh_date_until or w.wfh_date):
+            return True
+    return False
+
+
+def _approved_full_day_leave(db: Session, employee_id: UUID, on_date: date):
+    """Return the APPROVED *full-day* leave covering `on_date`, or None.
+
+    Half-day leave is intentionally excluded — the employee still works the
+    other half, so clock-in stays allowed (daily_rollup tags it HALF_DAY).
+    Mirrors the leave detection in app.utils.hr.attendance_logic.daily_rollup."""
+    from app.models.hr.leave_request import LeaveRequest
+    from app.models.hr.leave_type import LeaveStatus as _LeaveStatus
+    return (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == employee_id,
+            LeaveRequest.from_date <= on_date,
+            LeaveRequest.to_date >= on_date,
+            LeaveRequest.status == _LeaveStatus.APPROVED,
+            LeaveRequest.is_half_day == False,  # noqa: E712
+            LeaveRequest.is_deleted == False,   # noqa: E712
+        )
+        .order_by(LeaveRequest.created_at.desc())
+        .first()
+    )
+
+
+def _assert_self_punch_allowed_today(db: Session, emp: Employee, shift: Optional[Shift], today: date) -> None:
+    """Block a *self* opening clock-in on a non-working day — full-day approved
+    leave, weekly-off, or company holiday. Working such a day is an
+    admin-recorded exception (cancel the leave, or admin punch-on-behalf +
+    comp-off grant), not a self-punch.
+
+    An approved WFH/remote waives the week-off / holiday block, but NOT the
+    leave block — being officially on leave outranks a remote-work approval.
+    Only gates the opening IN punch; an already-open day can still be
+    broken/closed so nobody gets stuck mid-day."""
+    # Full-day approved leave — most specific reason, checked first and not
+    # waivable by a WFH approval.
+    leave = _approved_full_day_leave(db, emp.id, today)
+    if leave is not None:
+        lt = leave.leave_type.value if hasattr(leave.leave_type, "value") else str(leave.leave_type)
+        raise HTTPException(
+            status_code=423,
+            detail={
+                "code": "ON_LEAVE_NO_PUNCH",
+                "message": (
+                    f"You're on approved {lt.replace('_', ' ').title()} leave today "
+                    f"({leave.reference_no}) — self clock-in is disabled. If you actually "
+                    "worked, ask HR to cancel the leave or record attendance on your behalf."
+                ),
+                "leave_type": lt,
+                "reference_no": leave.reference_no,
+            },
+        )
+    if _approved_wfh_today(db, emp.id, today):
+        return
+    if shift and today.weekday() in (shift.weekly_off_days or []):
+        raise HTTPException(
+            status_code=423,
+            detail={
+                "code": "WEEK_OFF_NO_PUNCH",
+                "message": (
+                    "Today is your weekly off — self clock-in is disabled. "
+                    "If you worked, ask HR to record it and grant comp-off."
+                ),
+            },
+        )
+    hol = _holiday_for(db, emp, today)
+    if hol is not None:
+        raise HTTPException(
+            status_code=423,
+            detail={
+                "code": "HOLIDAY_NO_PUNCH",
+                "message": (
+                    f"Today is a company holiday ({hol.name}) — self clock-in is disabled. "
+                    "If you worked, ask HR to record it and grant comp-off."
+                ),
+            },
+        )
 
 
 def _create_punch(
@@ -1353,6 +1665,9 @@ def _create_punch(
 
     # Shift-policy validation (early/late punch, early exit, break windows, break cap).
     shift = resolve_shift(db, emp.id, today)
+    # Self clock-in is not allowed on a weekly-off / company-holiday day.
+    if expected_type == PunchType.IN:
+        _assert_self_punch_allowed_today(db, emp, shift, today)
     _validate_punch_policy(shift, expected_type, punches, db=db, employee_id=emp.id)
 
     geo = verify_geofence(db, emp.id, payload.geo_lat, payload.geo_lng)
@@ -1659,7 +1974,38 @@ def me_request_late_punch(
     if existing:
         raise HTTPException(409, "You already have a pending request for today")
 
-    minutes_late = _minutes_late_now(shift, now_local) if shift else 0
+    # Use effective shift start so a half-day-off employee's audit reason
+    # records the *real* late minutes (vs midshift), not 200+ minutes past 9 AM.
+    if shift:
+        _hd = _approved_half_day(db, emp.id, today)
+        _eff_start, _eff_end = _effective_shift_window(shift, today, _hd)
+        minutes_late = _minutes_late_now(shift, now_local, effective_start=_eff_start)
+        # Enforce the same cap the /me/today UI honours: no self late-punch
+        # request once past the 2h half-day cutoff or after the shift has
+        # ended. Beyond that it's a half-day/no-show that needs admin
+        # regularization, not a quick late-punch.
+        _eff_span_min = (_eff_end - _eff_start).total_seconds() / 60.0
+        if _eff_span_min <= 0:
+            _eff_span_min += 24 * 60
+        _cutoff_min = int(min(_eff_span_min / 2.0, 120.0))
+        if minutes_late > _cutoff_min or now_local >= _eff_end:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "LATE_PUNCH_WINDOW_CLOSED",
+                    "message": (
+                        f"The self late-punch window has closed — you are {minutes_late} minutes late "
+                        f"(cap {_cutoff_min} min"
+                        + (", and your shift has already ended" if now_local >= _eff_end else "")
+                        + "). Contact HR to regularize today's attendance."
+                    ),
+                    "minutes_late": minutes_late,
+                    "cutoff_minutes": _cutoff_min,
+                    "shift_ended": now_local >= _eff_end,
+                },
+            )
+    else:
+        minutes_late = 0
     tag = f"[LATE_PUNCH] (late by {minutes_late} min) "
     reason = (tag + body.reason).strip()[:1000]
 
@@ -1812,6 +2158,7 @@ def me_day_detail(
         is_flagged=bool(att.is_flagged) if att else False,
         is_locked=bool(att.is_locked) if att else False,
         is_auto_closed=auto_closed,
+        lop_days=float(att.lop_days or 0) if att else 0.0,
         remarks=att.remarks if att else None,
         punches=[
             MyDayPunch(

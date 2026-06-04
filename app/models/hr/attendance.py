@@ -29,6 +29,11 @@ class AttendanceStatus(str, enum.Enum):
     HOLIDAY = "HOLIDAY"
     WEEK_OFF = "WEEK_OFF"
     ON_DUTY = "ON_DUTY"
+    # Authorised unpaid day: a no-show (no clock-in) whose unpaid portion was
+    # absorbed by the employee's LWP entitlement. Distinct from ABSENT, which is
+    # an *unauthorised* absence (no LWP balance to cover it). Value added live
+    # via ALTER TYPE — see add_lwp_attendance_status.py.
+    LWP = "LWP"
 
 
 class AttendanceSource(str, enum.Enum):
@@ -58,6 +63,11 @@ class Attendance(Base):
     overtime_hours = Column(Numeric(5, 2), nullable=False, default=0)
 
     status = Column(Enum(AttendanceStatus, name="hr_attendance_status"), nullable=False, default=AttendanceStatus.ABSENT, index=True)
+    # Intended Loss-of-Pay portion for the (future) payroll module. We only
+    # CLASSIFY here — balances are never mutated. 1.0 = full unpaid day
+    # (ABSENT), 0.5 = unpaid half-day (short/late day, no half-day request),
+    # 0.0 = fully paid/accounted. Payroll consumes this to compute deductions.
+    lop_days = Column(Numeric(3, 1), nullable=False, default=0, server_default="0")
     source = Column(Enum(AttendanceSource, name="hr_attendance_source"), nullable=False, default=AttendanceSource.SYSTEM)
 
     geo_lat = Column(Numeric(10, 7), nullable=True)
@@ -67,12 +77,20 @@ class Attendance(Base):
     remarks = Column(Text, nullable=True)
     is_flagged = Column(Boolean, nullable=False, default=False)  # outside-geofence or other anomalies
     is_locked = Column(Boolean, nullable=False, default=False, index=True)
+    # Admin waiver of a LATE mark — condoned lates don't count toward the
+    # monthly late-accumulation penalty (regularisation, not pay-affecting).
+    late_condoned = Column(Boolean, nullable=False, default=False, server_default="false")
 
     is_deleted = Column(Boolean, nullable=False, default=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     last_updated_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+    # When status==LEAVE (or half-day with one-half leave), the originating
+    # LeaveRequest row. Nullable + ON DELETE SET NULL so the Attendance row
+    # survives a leave-request soft-delete; daily_rollup re-stamps the link.
+    leave_request_id = Column(UUID(as_uuid=True), ForeignKey("hr_leave_requests.id", ondelete="SET NULL"), nullable=True, index=True)
 
     employee = relationship("Employee", foreign_keys=[employee_id])
 

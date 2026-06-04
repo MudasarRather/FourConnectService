@@ -409,6 +409,7 @@ def list_documents(
 
 @router.get("/queue", response_model=EmployeeDocumentListResponse)
 def verification_queue(
+    employee_id: Optional[UUID] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -421,7 +422,10 @@ def verification_queue(
         EmployeeDocument.verification_status.in_([
             DocVerificationStatus.PENDING, DocVerificationStatus.RESUBMIT_REQUIRED,
         ]),
-    ).order_by(EmployeeDocument.created_at.asc())
+    )
+    if employee_id:
+        query = query.filter(EmployeeDocument.employee_id == employee_id)
+    query = query.order_by(EmployeeDocument.created_at.asc())
     items, total, pages = _paginate(query, page, limit)
     return {
         "items": [_doc_to_response(d) for d in items],
@@ -433,6 +437,7 @@ def verification_queue(
 def expiring_documents(
     within: int = Query(90, ge=1, le=365),
     include_expired: bool = True,
+    employee_id: Optional[UUID] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -444,6 +449,8 @@ def expiring_documents(
         EmployeeDocument.is_archived == False,  # noqa: E712
         EmployeeDocument.expiry_date.isnot(None),
     )
+    if employee_id:
+        query = query.filter(EmployeeDocument.employee_id == employee_id)
     if include_expired:
         query = query.filter(EmployeeDocument.expiry_date <= hi)
     else:

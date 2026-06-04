@@ -47,6 +47,11 @@ def _to_response(h: Holiday) -> HolidayResponse:
         id=h.id, name=h.name, date=h.date, holiday_type=h.holiday_type,
         location_id=h.location_id, description=h.description,
         is_active=bool(h.is_active), created_at=h.created_at,
+        # Provenance — the admin Holidays UI shows an "IMPORTED" pill whenever
+        # this is not 'manual', so the admin can tell an activated import row
+        # apart from a hand-typed one.
+        source=getattr(h, "source", None) or "manual",
+        source_ref=getattr(h, "source_ref", None),
     )
 
 
@@ -346,6 +351,11 @@ def import_public_holidays(
         if exists:
             skipped += 1
             continue
+        # Provenance tag — distinguishes import-derived rows from rows the
+        # admin typed in the Holidays UI. Without this the admin can't see why
+        # an "Activate"-d row is exempted from leave deduction (the source of
+        # this ticket).
+        provenance = "import:in" if source.startswith("curated") else "import:nager"
         db.add(Holiday(
             name=name,
             date=hdate,
@@ -356,6 +366,8 @@ def import_public_holidays(
             # go live.
             is_active=False,
             created_by_id=admin.id,
+            source=provenance,
+            source_ref=f"{cc}:{year}",
         ))
         imported += 1
     db.commit()

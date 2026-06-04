@@ -41,6 +41,11 @@ class Shift(Base):
     end_time = Column(Time, nullable=False)
     break_minutes = Column(Integer, nullable=False, default=60)
     grace_minutes = Column(Integer, nullable=False, default=10)
+    # Grace applied when the day has an APPROVED half-day. Measured against
+    # the *effective* shift start (mid-shift for FIRST half off; nominal start
+    # for SECOND half off). Independent from `grace_minutes` so HR can give a
+    # tighter or looser allowance on half-day check-ins.
+    half_day_grace_minutes = Column(Integer, nullable=False, default=10)
     # 0=Mon .. 6=Sun (Python weekday()). Default = Saturday + Sunday off.
     weekly_off_days = Column(JSONB, nullable=False, default=lambda: [5, 6])
     half_day_hours = Column(Numeric(4, 2), nullable=False, default=4.0)

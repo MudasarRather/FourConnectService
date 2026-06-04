@@ -26,7 +26,7 @@ from app.models.hr.employee import Employee
 from app.models.hr.shift import Shift, EmployeeShiftAssignment
 from app.models.hr.attendance import Attendance, AttendanceStatus, AttendanceSource
 from app.models.hr.attendance_punch import AttendancePunch, PunchType
-from app.models.hr.wfh_request import WfhRequest, WfhStatus
+from app.models.hr.wfh_request import WfhRequest, WfhStatus, WfhRequestType
 from app.models.hr.holiday import Holiday
 from app.models.hr.attendance_log import AttendanceLog, AttendanceLogAction
 from app.models.hr.geo_fence import GeoFence
@@ -163,6 +163,10 @@ def compute_attendance_status(
     punches: List[AttendancePunch],
     shift: Optional[Shift],
     on_date: date,
+    *,
+    effective_start: Optional[datetime] = None,
+    effective_end: Optional[datetime] = None,
+    effective_grace: Optional[int] = None,
 ) -> ComputeResult:
     """Pure status computation from raw punches.
 
@@ -178,9 +182,12 @@ def compute_attendance_status(
         — wall-clock time worked past shift_end + grace (breaks excluded)
         — plus wall-clock time worked before shift_start - grace (rare, pre-OT)
         — floored by max(0, working_hours - full_day_hours) for sanity
-    This captures the corporate-standard case where an employee clocks out
-    past shift end and gets credit for the extra time, without inflating
-    OT by counting break minutes that happen to fall after shift end.
+
+    When the caller has resolved an effective shift window (i.e. a half-day
+    is approved — FIRST off shifts start to mid-shift, SECOND off shifts
+    end to mid-shift), pass `effective_start` / `effective_end` /
+    `effective_grace` so late_minutes / early_exit_minutes are measured
+    against the *actual* working half, not the nominal shift.
     """
     if not punches:
         return ComputeResult(
@@ -228,11 +235,18 @@ def compute_attendance_status(
         full_day = float(shift.full_day_hours or 8.0)
         half_day = float(shift.half_day_hours or 4.0)
 
+        # If the caller has resolved a half-day window, late / early-exit
+        # comparisons run against that — the nominal start/end are still used
+        # for OT detection (working past nominal end is still OT).
+        late_start_dt = effective_start or shift_start_dt
+        early_end_dt  = effective_end or shift_end_dt
+        late_grace    = grace if effective_grace is None else int(effective_grace or 0)
+
         if check_in_time:
-            delta_min = (check_in_time - shift_start_dt).total_seconds() / 60.0
-            late_minutes = max(0, int(delta_min - grace))
-        if check_out_time and check_out_time < shift_end_dt:
-            early_exit_minutes = max(0, int((shift_end_dt - check_out_time).total_seconds() / 60.0))
+            delta_min = (check_in_time - late_start_dt).total_seconds() / 60.0
+            late_minutes = max(0, int(delta_min - late_grace))
+        if check_out_time and check_out_time < early_end_dt:
+            early_exit_minutes = max(0, int((early_end_dt - check_out_time).total_seconds() / 60.0))
 
         # ── Corporate-grade OT detection ────────────────────────────────
         # Auto-OT = actual work time past shift_end + grace (breaks excluded)
@@ -257,6 +271,19 @@ def compute_attendance_status(
         sanity_ot = max(0.0, working_hours - full_day)
         overtime_hours = max(detected_ot, sanity_ot)
 
+        # Corporate half-day-on-late cutoff: a clock-in past the EARLIER of the
+        # shift mid-point or 2h-after-start, with no half-day request on file,
+        # is treated as a HALF_DAY (the employee missed the first half).
+        from datetime import timedelta as _td2
+        _shift_minutes = (shift_end_dt - shift_start_dt).total_seconds() / 60.0
+        if _shift_minutes <= 0:                      # overnight shift
+            _shift_minutes += 24 * 60
+        half_day_late_cutoff_min = min(_shift_minutes / 2.0, 120.0)
+        minutes_after_start = (
+            (check_in_time - late_start_dt).total_seconds() / 60.0
+            if check_in_time else 0.0
+        )
+
         if not check_in_time:
             status = AttendanceStatus.ABSENT
         elif not check_out_time:
@@ -265,6 +292,10 @@ def compute_attendance_status(
             # determined by check-in punctuality.
             status = AttendanceStatus.LATE if late_minutes > 0 else AttendanceStatus.PRESENT
         elif working_hours < half_day:
+            status = AttendanceStatus.HALF_DAY
+        elif minutes_after_start > half_day_late_cutoff_min:
+            # Clocked in after the half-day cutoff → HALF_DAY even if hours were
+            # later made up, since no half-day was requested in advance.
             status = AttendanceStatus.HALF_DAY
         elif late_minutes > 0:
             status = AttendanceStatus.LATE
@@ -457,7 +488,7 @@ def daily_rollup(
     # Short-circuit: approved Half-Day for this date
     # Imported locally so the half_day_request model isn't required at
     # module load time (keeps `daily_rollup` self-contained for tests).
-    from app.models.hr.half_day_request import HalfDayRequest, HalfDayStatus
+    from app.models.hr.half_day_request import HalfDayRequest, HalfDayStatus, HalfDayWhich
     half_day_match = (
         db.query(HalfDayRequest)
         .filter(
@@ -469,31 +500,155 @@ def daily_rollup(
         .first()
     )
 
+    # Short-circuit: approved Leave covering this date.
+    # Full-day leave overrides the punch-derived status to LEAVE. Half-day
+    # leave (is_half_day=True) is treated like the existing HalfDayRequest
+    # path so a working-half punch still computes hours but the day's status
+    # becomes HALF_DAY. The originating leave id is stashed on Attendance
+    # for downstream reports/audit.
+    from app.models.hr.leave_request import LeaveRequest
+    from app.models.hr.leave_type import LeaveStatus as _LeaveStatus
+    leave_match = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == employee_id,
+            LeaveRequest.from_date <= on_date,
+            LeaveRequest.to_date >= on_date,
+            LeaveRequest.status == _LeaveStatus.APPROVED,
+            LeaveRequest.is_deleted == False,  # noqa: E712
+        )
+        .order_by(LeaveRequest.created_at.desc())
+        .first()
+    )
+
+    # Resolve effective shift window when a half-day is active — so a FIRST-off
+    # employee who clocks in at 13:05 doesn't get tagged with ~4h late_minutes,
+    # and a SECOND-off employee who leaves at 13:31 doesn't get tagged with
+    # ~4.5h early_exit_minutes.
+    eff_start = eff_end = None
+    eff_grace = None
+    if shift and half_day_match:
+        s_start = _combine(on_date, shift.start_time)
+        s_end   = _combine(on_date, shift.end_time)
+        if s_end <= s_start:
+            from datetime import timedelta as _td2
+            s_end += _td2(days=1)
+        s_mid = s_start + (s_end - s_start) / 2
+        if half_day_match.which_half == HalfDayWhich.FIRST:
+            eff_start, eff_end = s_mid, s_end
+        else:
+            eff_start, eff_end = s_start, s_mid
+        eff_grace = int(getattr(shift, "half_day_grace_minutes", None) or shift.grace_minutes or 0)
+
     # Compute baseline from punches, then optionally override status
-    result = compute_attendance_status(punches, shift, on_date)
+    result = compute_attendance_status(
+        punches, shift, on_date,
+        effective_start=eff_start, effective_end=eff_end, effective_grace=eff_grace,
+    )
 
     if wfh_match:
-        result.status = AttendanceStatus.WFH
-        # Only credit a full WFH day's hours when the date has actually passed.
-        # For today (in-progress) or future dates, leave working_hours at 0 so
-        # the report modal / month tooltip don't show a phantom 8.00h before
-        # the day has even happened. Past WFH days assume the employee worked
-        # the full shift unless punches say otherwise.
+        # Honour the request discriminator — a REMOTE authorisation must show
+        # as REMOTE, not WFH. Both waive the geo-fence; they differ only in
+        # label/reporting. (Previously every approved request was hard-coded to
+        # WFH, so remote days were mislabelled.)
+        result.status = (
+            AttendanceStatus.REMOTE
+            if wfh_match.request_type == WfhRequestType.REMOTE
+            else AttendanceStatus.WFH
+        )
+        # working_hours is left at the punch-derived value — we do NOT
+        # fabricate `full_day_hours` for a punchless WFH/remote day. Crediting
+        # a phantom 8.00h "Worked" on a day with zero punches is the same
+        # misleading pattern fixed for half-days: the report modal would show
+        # hours that were never actually clocked. The day stays WFH/REMOTE
+        # (approved, paid — no loss-of-pay); hours are whatever the punches
+        # prove (0.00 when the employee didn't punch).
+    elif leave_match and not leave_match.is_half_day:
+        # Full-day leave wins over half-day / holiday / week-off. If the
+        # employee somehow punched in anyway, keep the working_hours for
+        # payroll but flag the day as LEAVE.
+        result.status = AttendanceStatus.LEAVE
         if not result.working_hours and shift and on_date < date.today():
-            result.working_hours = float(shift.full_day_hours or 8.0)
-    elif half_day_match:
-        # Approved half-day overrides the punch-based status. If the employee
-        # also punched in for the working half we keep the recorded
-        # check_in/working_hours so payroll can credit the actual time.
+            result.working_hours = 0.0
+    elif half_day_match or (leave_match and leave_match.is_half_day):
+        # Approved half-day overrides the punch-based status. working_hours is
+        # left at the punch-derived value — we do NOT fabricate
+        # `half_day_hours` here. Fabricating it showed "Worked 4.00h" on a day
+        # the employee never clocked in (no punches → no working half worked),
+        # which is impossible and misleading. The leave-covered half is paid
+        # via the leave balance; the working half is credited only by real
+        # punches. If the employee did punch in for the working half, their
+        # actual hours flow through unchanged.
         result.status = AttendanceStatus.HALF_DAY
-        if not result.working_hours and shift:
-            result.working_hours = float(shift.half_day_hours or 4.0)
     elif holiday_match:
         # Only override if there are no punches (employee may have worked OT)
         if not result.check_in_time:
             result.status = AttendanceStatus.HOLIDAY
     elif is_week_off and not result.check_in_time:
         result.status = AttendanceStatus.WEEK_OFF
+
+    # ── Loss-of-Pay tag (deferred to the payroll phase) ──────────────────
+    # We CLASSIFY only and DO NOT touch leave balances here. lop_days records
+    # the intended unpaid portion so the future payroll module can compute the
+    # deduction:  1.0 = full unpaid day (ABSENT),  0.5 = unpaid half-day (a
+    # short/late day with no half-day request),  0.0 = fully accounted/paid
+    # (PRESENT/LATE/WFH/LEAVE/HOLIDAY/WEEK_OFF, or an APPROVED half-day which is
+    # paid via the leave balance).
+    _half_day_is_approved = bool(half_day_match or (leave_match and leave_match.is_half_day))
+    if result.status == AttendanceStatus.ABSENT:
+        lop_days = 1.0
+    elif (
+        result.status in (AttendanceStatus.WFH, AttendanceStatus.REMOTE)
+        and result.check_in_time is None
+    ):
+        # Approved WFH/Remote but ZERO punches → full no-show. An off-site
+        # authorisation is not, by itself, proof of work — the employee still
+        # has to clock in. Routed through LWP coverage like any other no-show.
+        lop_days = 1.0
+    elif result.status == AttendanceStatus.HALF_DAY and not _half_day_is_approved:
+        # Unapproved short/late day — the missing half is unpaid.
+        lop_days = 0.5
+    elif (
+        result.status == AttendanceStatus.HALF_DAY
+        and _half_day_is_approved
+        and result.check_in_time is None
+    ):
+        # Approved half-day, but the employee never clocked in for the working
+        # half — that half is unworked → loss-of-pay. (The leave-covered half
+        # is paid via the leave balance, so this is 0.5, not 1.0.)
+        lop_days = 0.5
+    else:
+        lop_days = 0.0
+
+    # ── LWP coverage / ABSENT downgrade for elapsed no-show days ─────────
+    # A genuine no-show (no clock-in) on an elapsed working day is run through
+    # the employee's LWP entitlement: if LWP can absorb it we debit LWP (a full
+    # no-show becomes status LWP; an approved half-day stays HALF_DAY), else the
+    # day is an unauthorised ABSENT. A day the employee actually WORKED keeps its
+    # payroll lop_days but never consumes LWP. The helper also releases any
+    # stale auto-LWP debit when a day later gains punches — so it runs for every
+    # elapsed working day (it no-ops cheaply when there's nothing to do).
+    # Skipped for today/future (status still settling — see recompute caution)
+    # and for holiday/week-off (no unpaid portion).
+    if on_date < date.today() and not holiday_match and not is_week_off:
+        _is_no_show = result.check_in_time is None
+        if lop_days > 0 or _is_no_show:
+            from app.utils.hr.lwp_coverage import apply_lwp_coverage
+            _lwp = apply_lwp_coverage(
+                db, employee_id, on_date,
+                status=result.status, lop_days=lop_days,
+                is_no_show=_is_no_show, actor_id=actor_id,
+            )
+            result.status = _lwp.status
+            lop_days = _lwp.lop_days
+
+        # Monthly late-mark accumulation: every Nth non-condoned LATE in the
+        # month costs a fraction of a day, debited from LWP (drawn from whatever
+        # LWP remains after no-show coverage above). Reconciled per rollup so
+        # condoning / correcting a late releases the penalty. Worked LATE days
+        # keep their status — this is a pay penalty, not an absence.
+        from app.utils.hr.late_penalty import reconcile_late_penalty
+        reconcile_late_penalty(db, employee_id, on_date, actor_id=actor_id)
 
     # Upsert the row
     existing = (
@@ -512,6 +667,8 @@ def daily_rollup(
             geo_lng = first.geo_lng
             geo_verified = bool(first.geo_verified)
 
+    leave_request_id_val = leave_match.id if leave_match else None
+
     if existing:
         existing.shift_id = shift.id if shift else None
         existing.check_in_time = result.check_in_time
@@ -522,6 +679,10 @@ def daily_rollup(
         existing.early_exit_minutes = result.early_exit_minutes
         existing.overtime_hours = result.overtime_hours
         existing.status = result.status
+        existing.lop_days = lop_days
+        # Re-stamp the originating leave on every rollup so admin
+        # delete/restore of a LeaveRequest flips the row cleanly.
+        existing.leave_request_id = leave_request_id_val
         if not existing.is_locked:
             existing.source = source
         if geo_lat is not None:
@@ -542,10 +703,12 @@ def daily_rollup(
             early_exit_minutes=result.early_exit_minutes,
             overtime_hours=result.overtime_hours,
             status=result.status,
+            lop_days=lop_days,
             source=source,
             geo_lat=geo_lat,
             geo_lng=geo_lng,
             geo_verified=geo_verified,
+            leave_request_id=leave_request_id_val,
             created_by_id=actor_id,
             last_updated_by_id=actor_id,
         )
@@ -620,6 +783,107 @@ def daily_rollup(
                 payroll_status=OtPayrollStatus.PENDING,
             ))
         db.flush()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Auto-credit COMP_OFF when an employee worked through a Holiday or
+    # Week-Off for at least half a shift. Idempotent: a marker row in
+    # `hr_leave_balance_history` (kind=COMP_OFF_EARNED, earned_on=on_date)
+    # prevents double-credit. Manual admin grants land via the dedicated
+    # endpoint and never collide with this auto-detect because they don't
+    # share an `is_auto_generated=True` row for the same date.
+    # ──────────────────────────────────────────────────────────────────
+    if (
+        shift
+        and result.check_in_time is not None
+        and result.check_out_time is not None
+        and (holiday_match or is_week_off)
+        and float(result.working_hours or 0) >= float(shift.half_day_hours or 4.0) / 2.0
+    ):
+        from app.models.hr.leave_balance_history import LeaveBalanceHistory
+        from app.models.hr.leave_balance import LeaveBalance
+        from app.models.hr.leave_type import LeaveType, LedgerKind
+        from app.models.system_setting import SystemSetting
+        from decimal import Decimal as _Decimal
+        # Already credited?
+        marker = (
+            db.query(LeaveBalanceHistory.id)
+            .filter(
+                LeaveBalanceHistory.employee_id == employee_id,
+                LeaveBalanceHistory.leave_type == LeaveType.COMP_OFF,
+                LeaveBalanceHistory.kind == LedgerKind.COMP_OFF_EARNED,
+                LeaveBalanceHistory.earned_on == on_date,
+            )
+            .first()
+        )
+        if not marker:
+            # Decide credit size: full day if worked ≥ full_day_hours, else 0.5
+            full_h = float(shift.full_day_hours or 8.0)
+            worked_h = float(result.working_hours or 0)
+            credit = _Decimal("1.0") if worked_h >= full_h else _Decimal("0.5")
+            # Resolve current fiscal year (without circular-importing leaves router).
+            fy_setting = db.query(SystemSetting).filter(SystemSetting.key == "fiscal_year_start").first()
+            fy_start = fy_setting.value if fy_setting else "04-01"
+            try:
+                mm, dd = (int(x) for x in fy_start.split("-"))
+            except Exception:
+                mm, dd = 4, 1
+            boundary = date(on_date.year, mm, dd)
+            sy = on_date.year if on_date >= boundary else on_date.year - 1
+            fy = f"{sy}-{str(sy + 1)[-2:]}"
+            # Expiry window
+            exp_setting = db.query(SystemSetting).filter(SystemSetting.key == "comp_off_expiry_days").first()
+            try:
+                exp_days = int(exp_setting.value) if exp_setting else 90
+            except Exception:
+                exp_days = 90
+            expires = on_date + timedelta(days=exp_days)
+            # Get/create balance row
+            bal = (
+                db.query(LeaveBalance)
+                .filter(
+                    LeaveBalance.employee_id == employee_id,
+                    LeaveBalance.leave_type == LeaveType.COMP_OFF,
+                    LeaveBalance.fiscal_year == fy,
+                    LeaveBalance.is_deleted == False,  # noqa: E712
+                )
+                .first()
+            )
+            if not bal:
+                bal = LeaveBalance(
+                    employee_id=employee_id, leave_type=LeaveType.COMP_OFF, fiscal_year=fy,
+                    opening_balance=0, accrued=0, carry_forward_in=0,
+                    used=0, encashed=0, adjustments=0, closing_balance=0,
+                )
+                db.add(bal); db.flush()
+            before = (_Decimal(bal.opening_balance or 0) + _Decimal(bal.accrued or 0)
+                      + _Decimal(bal.carry_forward_in or 0) + _Decimal(bal.adjustments or 0)
+                      - _Decimal(bal.used or 0) - _Decimal(bal.encashed or 0))
+            bal.adjustments = _Decimal(bal.adjustments or 0) + credit
+            after = before + credit
+            bal.closing_balance = after
+            db.add(LeaveBalanceHistory(
+                employee_id=employee_id,
+                leave_type=LeaveType.COMP_OFF,
+                fiscal_year=fy,
+                kind=LedgerKind.COMP_OFF_EARNED,
+                delta=credit, balance_before=before, balance_after=after,
+                actor_user_id=actor_id,
+                note=("Auto-credited for working on " +
+                      ("holiday " + (holiday_match.name if holiday_match else "")
+                       if holiday_match else "week-off")),
+                is_auto_generated=True,
+                earned_on=on_date,
+                expires_on=expires,
+            ))
+            try:
+                log(db, actor_id=actor_id, action=AttendanceLogAction.COMP_OFF_EARNED,
+                    target_table="hr_leave_balances", target_id=bal.id, employee_id=employee_id,
+                    payload={"earned_on": on_date.isoformat(), "days": float(credit),
+                             "expires_on": expires.isoformat(),
+                             "reason": "holiday" if holiday_match else "week_off"})
+            except Exception:
+                pass
+            db.flush()
 
     return att
 

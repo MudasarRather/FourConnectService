@@ -51,6 +51,7 @@ class ShiftBase(BaseModel):
     end_time: time
     break_minutes: int = 60
     grace_minutes: int = 10
+    half_day_grace_minutes: int = 10
     weekly_off_days: List[int] = Field(default_factory=lambda: [5, 6])
     half_day_hours: float = 4.0
     full_day_hours: float = 8.0
@@ -73,6 +74,7 @@ class ShiftUpdate(BaseModel):
     end_time: Optional[time] = None
     break_minutes: Optional[int] = None
     grace_minutes: Optional[int] = None
+    half_day_grace_minutes: Optional[int] = None
     weekly_off_days: Optional[List[int]] = None
     half_day_hours: Optional[float] = None
     full_day_hours: Optional[float] = None
@@ -164,6 +166,8 @@ class AttendanceResponse(BaseModel):
     remarks: Optional[str]
     is_flagged: bool
     is_locked: bool
+    late_condoned: bool = False
+    lop_days: float = 0.0
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
@@ -459,12 +463,15 @@ class MeTodayResponse(BaseModel):
     holiday_name: Optional[str] = None
     is_week_off: bool = False
     wfh_approved: bool = False
-    next_action: str = "clock_in"  # clock_in | break_start | break_end | clock_out | done
+    wfh_request_type: Optional[str] = None   # "WFH" | "REMOTE" when wfh_approved
+    next_action: str = "clock_in"  # clock_in | break_start | break_end | clock_out | done | request_late_approval | wait_for_shift | late_window_closed
 
     # Policy state — drives the frontend UX
     is_late: bool = False                    # past shift.start + grace
     late_minutes_now: int = 0                # if employee clocked in right now
-    requires_late_approval: bool = False     # past start+grace+threshold AND policy on
+    requires_late_approval: bool = False     # past start+grace+threshold AND policy on, still inside the late-punch window
+    late_window_closed: bool = False         # too late to self-request a punch — past the 2h half-day cutoff OR shift already ended
+    late_punch_cutoff_minutes: int = 0       # the cap (min of mid-shift / 120m) beyond which self late-punch closes
     pending_late_request_id: Optional[UUID] = None
     pending_late_request_status: Optional[str] = None  # PENDING | APPROVED | REJECTED
 
@@ -486,6 +493,26 @@ class MeTodayResponse(BaseModel):
     current_break_window: Optional[CurrentBreakWindow] = None
     next_break_window: Optional[CurrentBreakWindow] = None
     in_break_window_now: bool = True         # if shift has no windows, True
+
+    # Half-day state — when an APPROVED HalfDayRequest exists for today, every
+    # late/early/grace computation above uses the *effective* shift window:
+    #   FIRST off  → effective_start = mid-shift, effective_end = shift_end
+    #   SECOND off → effective_start = shift_start, effective_end = mid-shift
+    # The grace allowance switches from `shift.grace_minutes` to
+    # `shift.half_day_grace_minutes`.
+    is_half_day: bool = False
+    half_day_which: Optional[str] = None              # "FIRST" | "SECOND"
+    half_day_reason: Optional[str] = None             # one-liner shown in UI
+    effective_shift_start: Optional[str] = None       # "HH:MM"
+    effective_shift_end: Optional[str] = None         # "HH:MM"
+    effective_grace_minutes: int = 0                  # the grace that actually applies right now
+
+    # Approved-leave state — a FULL-DAY approved leave covering today blocks
+    # self clock-in (the employee is officially off). Half-day leave does NOT
+    # block (they work the other half); it surfaces via is_half_day instead.
+    is_on_leave: bool = False
+    leave_type: Optional[str] = None                  # e.g. "CASUAL", "SICK"
+    leave_reference_no: Optional[str] = None          # the approved request's ref
 
 
 class LatePunchRequestCreate(BaseModel):
@@ -573,6 +600,7 @@ class MyDayDetailResponse(BaseModel):
     is_flagged: bool = False
     is_locked: bool = False
     is_auto_closed: bool = False    # True when AUTO_CHECKOUT log exists for this row
+    lop_days: float = 0.0           # unpaid portion: 0.5 half no-show, 1.0 full no-show (auto-LWP debited)
     remarks: Optional[str] = None
     punches: List[MyDayPunch] = Field(default_factory=list)
     breaks: List[MyDayBreakSegment] = Field(default_factory=list)
@@ -667,6 +695,12 @@ class HolidayResponse(BaseModel):
     description: Optional[str]
     is_active: bool
     created_at: datetime
+    # Provenance — 'manual' = admin typed it, 'import:in' / 'import:nager'
+    # = materialized by the bulk public-holiday importer. The Holidays admin
+    # surface shows a chip when source != 'manual' so the admin can tell an
+    # activated import apart from a hand-typed row.
+    source: str = "manual"
+    source_ref: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 

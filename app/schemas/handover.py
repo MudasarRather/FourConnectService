@@ -131,6 +131,27 @@ class HandoverApprovalResponse(HandoverApprovalBase):
     id: UUID
     class Config: from_attributes = True
 
+class HandoverDeliverableBase(BaseModel):
+    item_name: str
+    category: Optional[str] = None
+    status: Optional[str] = "Delivered"
+    client_remark: Optional[str] = None
+
+class HandoverDeliverableCreate(HandoverDeliverableBase): pass
+class HandoverDeliverableResponse(HandoverDeliverableBase):
+    id: UUID
+    class Config: from_attributes = True
+
+class HandoverFeedbackBase(BaseModel):
+    criterion: str
+    rating: Optional[str] = None
+    comment: Optional[str] = None
+
+class HandoverFeedbackCreate(HandoverFeedbackBase): pass
+class HandoverFeedbackResponse(HandoverFeedbackBase):
+    id: UUID
+    class Config: from_attributes = True
+
 
 # --- Main Handover ---
 
@@ -165,6 +186,8 @@ class HandoverBase(BaseModel):
     amount_received: Optional[float] = 0.0
     pending_amount: Optional[float] = 0.0
     currency: Optional[str] = "INR"
+    system_vendor: Optional[str] = None
+    client_remarks: Optional[str] = None
     status: Optional[str] = "Draft"
     rejection_reason: Optional[str] = None
     version: Optional[str] = "v1.0"
@@ -181,6 +204,8 @@ class HandoverCreate(HandoverBase):
     financial_invoices: List[HandoverFinancialCreate] = []
     issues: List[HandoverIssueCreate] = []
     approvals: List[HandoverApprovalCreate] = []
+    deliverables: List[HandoverDeliverableCreate] = []
+    feedback: List[HandoverFeedbackCreate] = []
 
 
 class HandoverResponse(HandoverBase):
@@ -199,6 +224,8 @@ class HandoverResponse(HandoverBase):
     financial_invoices: List[HandoverFinancialResponse] = []
     issues: List[HandoverIssueResponse] = []
     approvals: List[HandoverApprovalResponse] = []
+    deliverables: List[HandoverDeliverableResponse] = []
+    feedback: List[HandoverFeedbackResponse] = []
     class Config:
         from_attributes = True
 

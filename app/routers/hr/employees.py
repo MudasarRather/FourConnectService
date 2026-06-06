@@ -5,6 +5,7 @@ caller explicitly opts in via ?reveal_bank=true. Aadhaar is *only* stored
 as last 4 digits — there is no full-Aadhaar reveal at any time.
 """
 from datetime import datetime
+from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID
 
@@ -23,6 +24,7 @@ from app.models.hr.department import Department
 from app.models.hr.designation import Designation
 from app.models.hr.grade import Grade
 from app.models.hr.location import WorkLocation
+from app.utils.hr.payroll.service import create_compensation_revision
 from app.schemas.hr.employee import (
     EmployeeCreate, EmployeeUpdate,
     EmployeeResponse, EmployeeDetailResponse, EmployeeListResponse,
@@ -117,6 +119,11 @@ def _to_list_row(emp: Employee) -> dict:
         "avatar_url": getattr(emp.user, "avatar_url", None) if emp.user else None,
         "department_name": getattr(emp.department, "name", None) if emp.department else None,
         "designation_name": getattr(emp.designation, "name", None) if emp.designation else None,
+        # Compensation mirror — needed by the Payroll roster card (was omitted, so the
+        # card always showed "Not set" even after a revision was activated).
+        "monthly_ctc": emp.monthly_ctc,
+        "annual_ctc": emp.annual_ctc,
+        "tax_regime": emp.tax_regime.value if (emp.tax_regime and hasattr(emp.tax_regime, "value")) else emp.tax_regime,
         "created_at": emp.created_at,
         "updated_at": emp.updated_at,
     }
@@ -600,16 +607,37 @@ def lifecycle_promote(
         emp.grade_id = body.new_grade_id
     if body.new_pay_level:
         emp.pay_level = body.new_pay_level
+    eff_date = body.effective_date or datetime.utcnow().date()
+    # When the promotion changes pay, mint an effective-dated payroll compensation
+    # revision through the SAME service path the Compensation drawer uses — so the
+    # new CTC flows into Payroll → Compensation (and the revision timeline) with a
+    # "Promotion" reason, and the Employee mirror fields stay in sync. No second,
+    # divergent write path.
     if body.new_monthly_ctc is not None:
-        emp.monthly_ctc = body.new_monthly_ctc
-        emp.annual_ctc = body.new_monthly_ctc * 12
+        desig = db.query(Designation.name).filter(Designation.id == body.new_designation_id).first()
+        desig_name = desig[0] if desig else "new role"
+        reason = f"Promotion → {desig_name}"
+        if body.reason:
+            reason += f" · {body.reason}"
+        create_compensation_revision(
+            db, emp,
+            annual_ctc=Decimal(str(body.new_monthly_ctc)) * 12,
+            monthly_ctc=Decimal(str(body.new_monthly_ctc)),
+            effective_from=eff_date,
+            structure_id=None,            # use the employee's default structure
+            tax_regime=emp.tax_regime,
+            revision_reason=reason,
+            revision_ref="PROMOTION",
+            activate=True,
+            actor_id=admin.id,
+        )
     emp.last_updated_by_id = admin.id
     db.flush()
     _write_history(
         db, emp, EmployeeChangeType.PROMOTED,
         before=before, after=_serialise_employee_snapshot(emp),
         actor_id=admin.id, reason=body.reason,
-        effective_date=body.effective_date or datetime.utcnow().date(),
+        effective_date=eff_date,
     )
     db.commit()
     db.refresh(emp)

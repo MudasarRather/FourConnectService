@@ -1,6 +1,9 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from typing import List
 from uuid import UUID
 
@@ -10,7 +13,7 @@ from app.utils.dependencies import get_current_user
 from app.models.handover import (
     Handover, HandoverStakeholder, HandoverModule, HandoverAsset,
     HandoverServer, HandoverCredential, HandoverDocument, HandoverTraining,
-    HandoverFinancial, HandoverIssue, HandoverApproval
+    HandoverFinancial, HandoverIssue, HandoverApproval, HandoverDeliverable, HandoverFeedback
 )
 from app.models.notification import Notification
 from app.schemas.handover import HandoverCreate, HandoverUpdate, HandoverResponse
@@ -29,6 +32,8 @@ CHILD_MAP = {
     'financial_invoices': (HandoverFinancial, 'handover_id'),
     'issues': (HandoverIssue, 'handover_id'),
     'approvals': (HandoverApproval, 'handover_id'),
+    'deliverables': (HandoverDeliverable, 'handover_id'),
+    'feedback': (HandoverFeedback, 'handover_id'),
 }
 
 NESTED_KEYS = set(CHILD_MAP.keys())
@@ -92,7 +97,49 @@ def get_handover(handover_id: str, db: Session = Depends(get_db), current_user: 
     obj = db.query(Handover).filter(Handover.id == handover_id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Handover document not found")
+    # Ownership: creator OR superuser. (Drafts especially must not leak across users.)
+    if not current_user.is_superuser and obj.created_by_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
     return obj
+
+
+@router.get("/{handover_id}/export")
+def export_handover_pdf(handover_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Render the project handover to an ultra-modern PDF (WeasyPrint, server-side)."""
+    rels = (Handover.stakeholders, Handover.modules, Handover.assets, Handover.servers,
+            Handover.credentials, Handover.documents, Handover.training,
+            Handover.financial_invoices, Handover.issues, Handover.approvals,
+            Handover.deliverables, Handover.feedback)
+    obj = (
+        db.query(Handover)
+        .options(*[selectinload(r) for r in rels])
+        .filter(Handover.id == handover_id)
+        .first()
+    )
+    if not obj:
+        raise HTTPException(status_code=404, detail="Handover document not found")
+    if not current_user.is_superuser and obj.created_by_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        from app.utils.handover_pdf import render_handover_pdf
+        pdf = render_handover_pdf(obj)
+    except OSError as e:
+        if any(t in str(e) for t in ("libgobject", "libpango", "cannot load library")):
+            raise HTTPException(status_code=503, detail="WeasyPrint can't find GTK DLLs — run `python vendor/setup_gtk.py`")
+        raise
+
+    base = obj.project_name or obj.project_code or "Handover"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_") or "Handover"
+    stamp = (obj.updated_at or obj.created_at)
+    date_part = stamp.strftime("%Y-%m-%d") if stamp else "draft"
+    filename = f"Handover_{safe}_{date_part}.pdf"
+
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.put("/{handover_id}", response_model=HandoverResponse)

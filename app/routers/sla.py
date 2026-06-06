@@ -1,6 +1,9 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List
 from uuid import UUID
 
@@ -108,6 +111,49 @@ def get_sla(sla_id: UUID, db: Session = Depends(get_db), current_user: User = De
         raise HTTPException(status_code=404, detail="SLA agreement not found")
     return db_sla
 
+@router.get("/{sla_id}/export")
+def export_sla_pdf(sla_id: UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Render the SLA agreement to an ultra-modern PDF (WeasyPrint, server-side)."""
+    db_sla = (
+        db.query(SlaAgreement)
+        .options(
+            joinedload(SlaAgreement.services).joinedload(SlaServiceScope.metrics),
+            joinedload(SlaAgreement.escalations),
+            joinedload(SlaAgreement.penalties),
+            joinedload(SlaAgreement.signatories),
+        )
+        .filter(SlaAgreement.id == sla_id)
+        .first()
+    )
+    if not db_sla:
+        raise HTTPException(status_code=404, detail="SLA agreement not found")
+
+    # Ownership: the creator or any superuser may download the executed document.
+    if not current_user.is_superuser and db_sla.created_by_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        from app.utils.sla_pdf import render_sla_pdf
+        pdf = render_sla_pdf(db_sla)
+    except OSError as e:
+        if any(t in str(e) for t in ("libgobject", "libpango", "cannot load library")):
+            raise HTTPException(status_code=503, detail="WeasyPrint can't find GTK DLLs — run `python vendor/setup_gtk.py`")
+        raise
+
+    # Build a clean, filesystem-safe filename: SLA_<Client>_<YYYY-MM-DD>.pdf
+    org = db_sla.client_organization_name or "Agreement"
+    safe_org = re.sub(r"[^A-Za-z0-9._-]+", "_", org).strip("_") or "Agreement"
+    stamp = (db_sla.updated_at or db_sla.created_at)
+    date_part = stamp.strftime("%Y-%m-%d") if stamp else "draft"
+    filename = f"SLA_{safe_org}_{date_part}.pdf"
+
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.put("/{sla_id}", response_model=SlaAgreementResponse)
 def update_sla(sla_id: UUID, update_data: SlaAgreementUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     db_sla = db.query(SlaAgreement).filter(SlaAgreement.id == sla_id).first()
@@ -138,6 +184,20 @@ def update_sla(sla_id: UUID, update_data: SlaAgreementUpdate, db: Session = Depe
             )
             db.add(new_notif)
             db.commit()
+        elif new_status == 'Approved' and current_user.is_superuser:
+            # Mirror the rejection flow: notify the creator that their SLA is approved.
+            # (Previously no notification was sent on approval — the loop ended at
+            # Rejected/Pending, so the approval step was silent to the submitter.)
+            if db_sla.created_by_id:
+                db.add(Notification(
+                    user_id=db_sla.created_by_id,
+                    type="sla_approved",
+                    title="SLA Approved",
+                    message=f"Your SLA '{db_sla.title}' has been approved.",
+                    related_project_id=db_sla.project_id,
+                    related_user_id=current_user.id,
+                    action_url="/user/documents/sla?tab=approved"
+                ))
         elif new_status == 'Pending':
             admins = db.query(User).filter(User.is_superuser == True).all()
             for admin in admins:

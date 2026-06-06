@@ -52,6 +52,12 @@ class Handover(Base):
     pending_amount = Column(Float, default=0.0)
     currency = Column(String, default="INR")
 
+    # Step 1 (cont.): vendor responsible for the delivered system
+    system_vendor = Column(String, nullable=True)
+
+    # Step 15: Client remarks / acceptance notes (overall)
+    client_remarks = Column(Text, nullable=True)
+
     # Global
     status = Column(String, default="Draft")
     rejection_reason = Column(Text, nullable=True)
@@ -74,6 +80,8 @@ class Handover(Base):
     financial_invoices = relationship("HandoverFinancial", back_populates="handover", cascade="all, delete-orphan")
     issues = relationship("HandoverIssue", back_populates="handover", cascade="all, delete-orphan")
     approvals = relationship("HandoverApproval", back_populates="handover", cascade="all, delete-orphan")
+    deliverables = relationship("HandoverDeliverable", back_populates="handover", cascade="all, delete-orphan")
+    feedback = relationship("HandoverFeedback", back_populates="handover", cascade="all, delete-orphan")
 
 
 class HandoverStakeholder(Base):
@@ -182,6 +190,31 @@ class HandoverIssue(Base):
     owner = Column(String, nullable=True)
     expected_resolution = Column(String, nullable=True)
     handover = relationship("Handover", back_populates="issues")
+
+
+class HandoverDeliverable(Base):
+    """Step 15 — client-facing acceptance of delivered items, each with an optional
+    client remark. Seeded from delivered modules/assets in the wizard, then editable."""
+    __tablename__ = "handover_deliverables"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    handover_id = Column(UUID(as_uuid=True), ForeignKey("project_handovers.id", ondelete="CASCADE"), nullable=False)
+    item_name = Column(String, nullable=False)
+    category = Column(String, nullable=True)        # Module / Asset / Document / Server / Other
+    status = Column(String, default="Delivered")    # Delivered / Partial / Pending
+    client_remark = Column(Text, nullable=True)
+    handover = relationship("Handover", back_populates="deliverables")
+
+
+class HandoverFeedback(Base):
+    """Step 14 — corporate client acceptance: per-criterion rating + comment
+    (e.g. Installation, Service & Support, Training, Documentation, Timeliness)."""
+    __tablename__ = "handover_feedback"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    handover_id = Column(UUID(as_uuid=True), ForeignKey("project_handovers.id", ondelete="CASCADE"), nullable=False)
+    criterion = Column(String, nullable=False)
+    rating = Column(String, nullable=True)      # Excellent / Good / Satisfactory / Needs Improvement
+    comment = Column(Text, nullable=True)
+    handover = relationship("Handover", back_populates="feedback")
 
 
 class HandoverApproval(Base):

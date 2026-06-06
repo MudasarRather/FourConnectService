@@ -110,7 +110,7 @@ class Employee(Base):
     bank_name = Column(String(120), nullable=True)
     account_number = Column(String(40), nullable=True)  # TODO Phase 1.2: encrypt at rest with pgcrypto
     ifsc = Column(String(20), nullable=True)
-    salary_structure_id = Column(UUID(as_uuid=True), nullable=True)  # wired Phase 3 (Payroll)
+    salary_structure_id = Column(UUID(as_uuid=True), ForeignKey("hr_salary_structures.id", ondelete="SET NULL"), nullable=True, index=True)  # default structure (Payroll)
     monthly_ctc = Column(Numeric(12, 2), nullable=True)
     annual_ctc = Column(Numeric(14, 2), nullable=True)
 
@@ -149,6 +149,15 @@ class Employee(Base):
         back_populates="employee",
         cascade="all, delete-orphan",
         order_by="EmployeeHistory.created_at.desc()",
+    )
+    # Payroll (Phase 3): salary_structure_id is the DEFAULT structure; the
+    # authoritative per-period link is EmployeeCompensation.structure_id.
+    salary_structure = relationship("SalaryStructure", foreign_keys=[salary_structure_id])
+    compensations = relationship(
+        "EmployeeCompensation",
+        back_populates="employee",
+        foreign_keys="EmployeeCompensation.employee_id",
+        order_by="EmployeeCompensation.effective_from.desc()",
     )
 
     __table_args__ = (

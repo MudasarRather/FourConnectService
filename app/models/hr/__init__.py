@@ -118,6 +118,22 @@ from app.models.hr.geo_fence import GeoFence
 from app.models.hr.biometric_device import BiometricDevice, BiometricDeviceType, BiometricDeviceStatus
 from app.models.hr.attendance_log import AttendanceLog, AttendanceLogAction
 
+# Payroll module — Phase 3.0
+from app.models.hr.salary_structure import SalaryStructure
+from app.models.hr.salary_component import (
+    SalaryComponent, ComponentType, CalcType, StatutoryKind,
+)
+from app.models.hr.salary_structure_component import SalaryStructureComponent
+from app.models.hr.employee_compensation import EmployeeCompensation, CompensationStatus
+from app.models.hr.payroll_batch import PayrollBatch, PayrollBatchStatus
+from app.models.hr.payslip import Payslip, PayslipLine, PayslipStatus
+from app.models.hr.payroll_config import (
+    StatutoryConfig, PayrollAuditLog, PayrollAuditAction,
+)
+from app.models.hr.payroll_adjustment import (
+    PayrollAdjustment, AdjustmentType, AdjustmentStatus,
+)
+
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
 
@@ -243,4 +259,24 @@ __all__ = [
     "BiometricDeviceStatus",
     "AttendanceLog",
     "AttendanceLogAction",
+    # Payroll
+    "SalaryStructure",
+    "SalaryComponent",
+    "ComponentType",
+    "CalcType",
+    "StatutoryKind",
+    "SalaryStructureComponent",
+    "EmployeeCompensation",
+    "CompensationStatus",
+    "PayrollBatch",
+    "PayrollBatchStatus",
+    "Payslip",
+    "PayslipLine",
+    "PayslipStatus",
+    "StatutoryConfig",
+    "PayrollAuditLog",
+    "PayrollAuditAction",
+    "PayrollAdjustment",
+    "AdjustmentType",
+    "AdjustmentStatus",
 ]

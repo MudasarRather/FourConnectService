@@ -39,6 +39,17 @@ from app.routers.hr.attendance_reports import router as _attendance_reports_rout
 from app.routers.hr.half_day import router as _half_day_router
 from app.routers.hr.leaves import router as _leaves_router
 
+# Payroll module — Phase 3.0
+from app.routers.hr.payroll_config import router as _payroll_config_router
+from app.routers.hr.payroll_components import router as _payroll_components_router
+from app.routers.hr.payroll_structures import router as _payroll_structures_router
+from app.routers.hr.employee_compensation import router as _employee_compensation_router
+from app.routers.hr.payroll_batches import router as _payroll_batches_router
+from app.routers.hr.payroll_self import router as _payroll_self_router
+from app.routers.hr.payslips import router as _payslips_router
+from app.routers.hr.payroll_adjustments import router as _payroll_adjustments_router
+from app.routers.hr.payroll_reports import router as _payroll_reports_router
+
 router = APIRouter()
 router.include_router(_dashboard_router)
 router.include_router(_employees_router)
@@ -81,3 +92,16 @@ router.include_router(_overtime_router)
 router.include_router(_holidays_router)
 router.include_router(_geo_fences_router)
 router.include_router(_biometric_router)
+
+# Payroll — register config/dashboard + self-service before the broad payslips
+# router so /hr/payroll/dashboard, /hr/payroll/config/* and /hr/me/payslips/*
+# aren't shadowed by the `/{payslip_id}` route on the payslips router.
+router.include_router(_payroll_config_router)
+router.include_router(_payroll_reports_router)
+router.include_router(_payroll_adjustments_router)
+router.include_router(_payroll_components_router)
+router.include_router(_payroll_structures_router)
+router.include_router(_employee_compensation_router)
+router.include_router(_payroll_batches_router)
+router.include_router(_payroll_self_router)
+router.include_router(_payslips_router)

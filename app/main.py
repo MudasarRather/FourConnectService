@@ -55,6 +55,19 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Seed payroll defaults (statutory config, core components, default structure).
+    # Idempotent — only inserts rows that don't exist yet.
+    try:
+        from app.database import SessionLocal
+        from app.utils.hr.payroll import seed_payroll_defaults
+        _db = SessionLocal()
+        try:
+            seed_payroll_defaults(_db)
+        finally:
+            _db.close()
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
 
 # Configure CORS — local dev origins + production frontend domains.
 # Keep this list in sync with the global exception handler below.

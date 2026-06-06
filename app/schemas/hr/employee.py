@@ -265,6 +265,11 @@ class EmployeeResponse(BaseModel):
     department_name: Optional[str] = None
     designation_name: Optional[str] = None
 
+    # Compensation mirror (active payroll revision) — needed by the Payroll roster
+    monthly_ctc: Optional[Decimal] = None
+    annual_ctc: Optional[Decimal] = None
+    tax_regime: Optional[str] = None
+
     created_at: datetime
     updated_at: datetime
 

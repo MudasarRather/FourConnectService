@@ -23,3 +23,4 @@ weasyprint>=68.0
 # Both are used side-by-side — see app/utils/hr/attendance_reports/excel/.
 openpyxl>=3.1.5
 xlsxwriter>=3.2.0
+pypdf>=4.0.0

@@ -1,23 +1,32 @@
 """HR Shifts — templates + effective-dated employee assignments."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from math import ceil
 from typing import Optional, List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
-from sqlalchemy import or_, func
+from sqlalchemy import or_, and_, func, distinct, extract
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
-from app.models.hr.employee import Employee
+from app.models.hr.employee import Employee, LifecycleState
+from app.models.hr.department import Department
 from app.models.hr.shift import Shift, EmployeeShiftAssignment, ShiftType
+from app.models.hr.holiday import Holiday
+from app.models.hr.overtime import OvertimeRequest, OtStatus
+from app.models.hr.shift_rotation import ShiftRotation
+from app.models.hr.shift_coverage import ShiftCoverageRule
 from app.models.hr.attendance_log import AttendanceLogAction
 from app.schemas.hr.attendance import (
     ShiftCreate, ShiftUpdate, ShiftResponse, ShiftListResponse,
     EmployeeShiftAssignmentCreate, EmployeeShiftAssignmentResponse, ShiftAssignBulkBody,
+)
+from app.schemas.hr.shift_planning import (
+    ShiftDashboardResponse, ShiftKpis, ShiftDistributionItem, DeptAllocationItem,
+    TrendPoint, CoverageSnapshot, ShiftCalendarResponse, CalendarDay, CalendarAssignment,
 )
 from app.utils.dependencies import get_current_user, get_current_superuser
 from app.utils.hr.attendance_logic import log
@@ -107,6 +116,239 @@ def my_current_shift(
     from app.utils.hr.attendance_logic import resolve_shift
     s = resolve_shift(db, emp.id, date.today())
     return _to_shift_response(s) if s else None
+
+
+# ── Aggregations: dashboard + calendar (literal paths — declared before /{shift_id}) ──
+
+def _active_on(on_date: date):
+    """SQLAlchemy condition: an assignment is active on `on_date`."""
+    return and_(
+        EmployeeShiftAssignment.effective_from <= on_date,
+        or_(
+            EmployeeShiftAssignment.effective_until.is_(None),
+            EmployeeShiftAssignment.effective_until >= on_date,
+        ),
+    )
+
+
+def _type_str(v) -> str:
+    return v.value if hasattr(v, "value") else str(v)
+
+
+_MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+_DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+@router.get("/dashboard", response_model=ShiftDashboardResponse)
+def shifts_dashboard(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_current_superuser),
+):
+    today = date.today()
+    act = _active_on(today)
+
+    # ── KPIs ──
+    active_shifts = db.query(func.count(Shift.id)).filter(
+        Shift.is_deleted == False, Shift.is_active == True).scalar() or 0  # noqa: E712
+
+    employees_assigned = db.query(
+        func.count(distinct(EmployeeShiftAssignment.employee_id))).filter(act).scalar() or 0
+
+    night_shift_employees = (
+        db.query(func.count(distinct(EmployeeShiftAssignment.employee_id)))
+        .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
+        .filter(Shift.shift_type == ShiftType.NIGHT, act).scalar() or 0)
+
+    upcoming_rotations = db.query(func.count(ShiftRotation.id)).filter(
+        ShiftRotation.is_deleted == False, ShiftRotation.is_active == True).scalar() or 0  # noqa: E712
+
+    month_start = today.replace(day=1)
+    overtime_hours = float(
+        db.query(func.coalesce(func.sum(OvertimeRequest.ot_hours), 0))
+        .filter(OvertimeRequest.is_deleted == False,  # noqa: E712
+                OvertimeRequest.status == OtStatus.APPROVED,
+                OvertimeRequest.date >= month_start).scalar() or 0)
+
+    next_holiday = (
+        db.query(Holiday)
+        .filter(Holiday.is_deleted == False, Holiday.is_active == True,  # noqa: E712
+                Holiday.date >= today)
+        .order_by(Holiday.date.asc()).first())
+    holiday_shift_staff = 0
+    if next_holiday:
+        holiday_shift_staff = db.query(
+            func.count(distinct(EmployeeShiftAssignment.employee_id))
+        ).filter(_active_on(next_holiday.date)).scalar() or 0
+
+    # conflicts — employees holding >1 active assignment today
+    dupes = (
+        db.query(EmployeeShiftAssignment.employee_id)
+        .filter(act)
+        .group_by(EmployeeShiftAssignment.employee_id)
+        .having(func.count(EmployeeShiftAssignment.id) > 1).all())
+    shift_conflicts = len(dupes)
+
+    total_active_emp = db.query(func.count(Employee.id)).filter(
+        Employee.is_deleted == False,  # noqa: E712
+        Employee.lifecycle_state == LifecycleState.ACTIVE).scalar() or 0
+    assigned_active = (
+        db.query(func.count(distinct(Employee.id)))
+        .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
+        .filter(Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state == LifecycleState.ACTIVE, act).scalar() or 0)
+    unassigned_employees = max(0, total_active_emp - assigned_active)
+
+    kpis = ShiftKpis(
+        active_shifts=active_shifts, employees_assigned=employees_assigned,
+        night_shift_employees=night_shift_employees, upcoming_rotations=upcoming_rotations,
+        holiday_shift_staff=holiday_shift_staff, overtime_hours=round(overtime_hours, 2),
+        shift_conflicts=shift_conflicts, unassigned_employees=unassigned_employees,
+    )
+
+    # ── Shift distribution (assignments per active shift, today) ──
+    dist_rows = (
+        db.query(Shift, func.count(EmployeeShiftAssignment.id))
+        .outerjoin(EmployeeShiftAssignment,
+                   and_(EmployeeShiftAssignment.shift_id == Shift.id, _active_on(today)))
+        .filter(Shift.is_deleted == False, Shift.is_active == True)  # noqa: E712
+        .group_by(Shift.id).order_by(Shift.created_at.asc()).all())
+    shift_distribution = [
+        ShiftDistributionItem(shift_id=s.id, code=s.code, name=s.name,
+                              shift_type=_type_str(s.shift_type), count=c or 0)
+        for s, c in dist_rows]
+
+    # ── Department allocation ──
+    dept_total = dict(
+        db.query(Employee.department_id, func.count(distinct(EmployeeShiftAssignment.employee_id)))
+        .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
+        .filter(act, Employee.is_deleted == False)  # noqa: E712
+        .group_by(Employee.department_id).all())
+    dept_night = dict(
+        db.query(Employee.department_id, func.count(distinct(EmployeeShiftAssignment.employee_id)))
+        .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
+        .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
+        .filter(act, Shift.shift_type == ShiftType.NIGHT, Employee.is_deleted == False)  # noqa: E712
+        .group_by(Employee.department_id).all())
+    dept_names = dict(db.query(Department.id, Department.name).all())
+    dept_allocation = [
+        DeptAllocationItem(
+            department_id=did,
+            department_name=(dept_names.get(did) if did else None) or "Unassigned",
+            count=cnt or 0, night_count=dept_night.get(did, 0))
+        for did, cnt in dept_total.items()]
+    dept_allocation.sort(key=lambda d: d.count, reverse=True)
+
+    # ── Overtime trend (last 6 months, approved) ──
+    buckets, y, m = [], today.year, today.month
+    for _ in range(6):
+        buckets.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    buckets.reverse()
+    range_start = date(buckets[0][0], buckets[0][1], 1)
+    ot_map = {}
+    for yy, mm, tot in (
+        db.query(extract("year", OvertimeRequest.date),
+                 extract("month", OvertimeRequest.date),
+                 func.coalesce(func.sum(OvertimeRequest.ot_hours), 0))
+        .filter(OvertimeRequest.is_deleted == False,  # noqa: E712
+                OvertimeRequest.status == OtStatus.APPROVED,
+                OvertimeRequest.date >= range_start)
+        .group_by(extract("year", OvertimeRequest.date),
+                  extract("month", OvertimeRequest.date)).all()):
+        ot_map[(int(yy), int(mm))] = float(tot or 0)
+    overtime_trend = [TrendPoint(label=_MONTHS[mm], value=round(ot_map.get((yy, mm), 0.0), 1))
+                      for yy, mm in buckets]
+
+    # ── Night utilisation (last 7 days) ──
+    window_start = today - timedelta(days=6)
+    night_assigns = (
+        db.query(EmployeeShiftAssignment.effective_from, EmployeeShiftAssignment.effective_until)
+        .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
+        .filter(Shift.shift_type == ShiftType.NIGHT,
+                EmployeeShiftAssignment.effective_from <= today,
+                or_(EmployeeShiftAssignment.effective_until.is_(None),
+                    EmployeeShiftAssignment.effective_until >= window_start)).all())
+    night_utilization = []
+    for i in range(7):
+        d = window_start + timedelta(days=i)
+        cnt = sum(1 for ef, eu in night_assigns if ef <= d and (eu is None or eu >= d))
+        night_utilization.append(TrendPoint(label=_DOW[d.weekday()], value=float(cnt)))
+
+    # ── Weekly coverage (from active coverage rules) ──
+    rules = (db.query(ShiftCoverageRule)
+             .filter(ShiftCoverageRule.is_deleted == False,  # noqa: E712
+                     ShiftCoverageRule.is_active == True)
+             .order_by(ShiftCoverageRule.created_at.asc()).limit(12).all())
+    weekly_coverage = []
+    for r in rules:
+        cq = db.query(func.count(distinct(EmployeeShiftAssignment.employee_id))).filter(
+            EmployeeShiftAssignment.shift_id == r.shift_id, _active_on(today))
+        if r.department_id:
+            cq = cq.join(Employee, Employee.id == EmployeeShiftAssignment.employee_id).filter(
+                Employee.department_id == r.department_id)
+        assigned = cq.scalar() or 0
+        sh = db.query(Shift.name).filter(Shift.id == r.shift_id).first()
+        weekly_coverage.append(CoverageSnapshot(
+            label=r.label or (sh[0] if sh else "Shift"),
+            required=r.min_staff or 0, assigned=assigned))
+
+    return ShiftDashboardResponse(
+        kpis=kpis, shift_distribution=shift_distribution, dept_allocation=dept_allocation,
+        overtime_trend=overtime_trend, night_utilization=night_utilization,
+        weekly_coverage=weekly_coverage, generated_at=datetime.utcnow(),
+    )
+
+
+@router.get("/calendar", response_model=ShiftCalendarResponse)
+def shifts_calendar(
+    from_: date = Query(..., alias="from"),
+    to: date = Query(..., alias="to"),
+    department_id: Optional[UUID] = None,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_current_superuser),
+):
+    if to < from_:
+        raise HTTPException(400, "`to` must be on or after `from`")
+    if (to - from_).days > 92:
+        raise HTTPException(400, "Range too large (max 92 days)")
+
+    q = (
+        db.query(EmployeeShiftAssignment, Shift, User.full_name)
+        .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
+        .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
+        .join(User, User.id == Employee.user_id)
+        .filter(EmployeeShiftAssignment.effective_from <= to,
+                or_(EmployeeShiftAssignment.effective_until.is_(None),
+                    EmployeeShiftAssignment.effective_until >= from_)))
+    if department_id:
+        q = q.filter(Employee.department_id == department_id)
+    rows = q.all()
+
+    hol = {h.date: h.name for h in db.query(Holiday).filter(
+        Holiday.is_deleted == False, Holiday.is_active == True,  # noqa: E712
+        Holiday.date >= from_, Holiday.date <= to).all()}
+
+    days = []
+    d = from_
+    while d <= to:
+        day_assigns = []
+        for a, s, name in rows:
+            if a.effective_from <= d and (a.effective_until is None or a.effective_until >= d):
+                if s.weekly_off_days and d.weekday() in (s.weekly_off_days or []):
+                    continue  # the employee's weekly-off — not "on shift"
+                day_assigns.append(CalendarAssignment(
+                    employee_id=a.employee_id, employee_name=name, shift_id=s.id,
+                    shift_code=s.code, shift_name=s.name, shift_type=_type_str(s.shift_type),
+                    start_time=s.start_time, end_time=s.end_time))
+        days.append(CalendarDay(date=d, weekday=d.weekday(), is_holiday=d in hol,
+                                holiday_name=hol.get(d), assignments=day_assigns,
+                                count=len(day_assigns)))
+        d += timedelta(days=1)
+
+    return ShiftCalendarResponse(from_date=from_, to_date=to, days=days)
 
 
 # ── Assignments ───────────────────────────────────────────────────────────

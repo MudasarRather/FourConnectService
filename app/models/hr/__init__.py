@@ -107,6 +107,18 @@ from app.models.hr.document_request import (
 )
 # Attendance module — Phase 2.0
 from app.models.hr.shift import Shift, EmployeeShiftAssignment, ShiftType
+# Shifts & Rosters module — Phase 2.5 (Control Tower)
+from app.models.hr.shift_rotation import (
+    ShiftRotation, ShiftRotationStep, ShiftRotationMember, RotationCycle,
+)
+from app.models.hr.shift_roster import ShiftRoster, ShiftRosterEntry, RosterStatus
+from app.models.hr.shift_coverage import ShiftCoverageRule
+# Shifts & Rosters — Phase 2 (ops)
+from app.models.hr.overtime_rule import OvertimeRule
+from app.models.hr.shift_swap import ShiftSwapRequest, SwapStatus
+from app.models.hr.holiday_shift import HolidayShiftAssignment, HolidayCompType
+from app.models.hr.night_policy import NightShiftPolicy
+from app.models.hr.workforce_demand import WorkforceDemand
 from app.models.hr.attendance import Attendance, AttendanceStatus, AttendanceSource
 from app.models.hr.attendance_punch import AttendancePunch, PunchType
 from app.models.hr.attendance_correction import AttendanceCorrection, CorrectionStatus
@@ -235,6 +247,22 @@ __all__ = [
     "Shift",
     "EmployeeShiftAssignment",
     "ShiftType",
+    # Shifts & Rosters (Control Tower)
+    "ShiftRotation",
+    "ShiftRotationStep",
+    "ShiftRotationMember",
+    "RotationCycle",
+    "ShiftRoster",
+    "ShiftRosterEntry",
+    "RosterStatus",
+    "ShiftCoverageRule",
+    "OvertimeRule",
+    "ShiftSwapRequest",
+    "SwapStatus",
+    "HolidayShiftAssignment",
+    "HolidayCompType",
+    "NightShiftPolicy",
+    "WorkforceDemand",
     "Attendance",
     "AttendanceStatus",
     "AttendanceSource",

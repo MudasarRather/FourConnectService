@@ -26,6 +26,16 @@ from app.routers.hr.employee_document_reports import router as _employee_documen
 
 # Attendance module — Phase 2.0
 from app.routers.hr.shifts import router as _shifts_router
+# Shifts & Rosters module — Phase 2.5 (Control Tower)
+from app.routers.hr.shift_rotations import router as _shift_rotations_router
+from app.routers.hr.shift_rosters import router as _shift_rosters_router
+from app.routers.hr.shift_coverage import router as _shift_coverage_router
+# Shifts & Rosters Phase 2 (ops)
+from app.routers.hr.overtime_rules import router as _overtime_rules_router
+from app.routers.hr.shift_swaps import router as _shift_swaps_router
+from app.routers.hr.holiday_shifts import router as _holiday_shifts_router
+from app.routers.hr.night_policies import router as _night_policies_router
+from app.routers.hr.workforce import router as _workforce_router
 from app.routers.hr.attendance import router as _attendance_router
 from app.routers.hr.attendance_corrections import router as _att_corrections_router
 from app.routers.hr.wfh import router as _wfh_router
@@ -77,6 +87,15 @@ router.include_router(_employee_documents_router)
 # distinct prefixes don't actually collide, but keeping this order makes the
 # OpenAPI route table easier to scan.
 router.include_router(_shifts_router)
+# Shifts & Rosters — distinct prefixes (/hr/shift-rotations, /hr/shift-rosters, /hr/shift-coverage)
+router.include_router(_shift_rotations_router)
+router.include_router(_shift_rosters_router)
+router.include_router(_shift_coverage_router)
+router.include_router(_overtime_rules_router)
+router.include_router(_shift_swaps_router)
+router.include_router(_holiday_shifts_router)
+router.include_router(_night_policies_router)
+router.include_router(_workforce_router)
 router.include_router(_att_corrections_router)
 router.include_router(_att_policies_router)
 router.include_router(_attendance_logs_router)

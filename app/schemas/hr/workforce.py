@@ -65,6 +65,12 @@ class ForecastDay(BaseModel):
     required: int = 0
     assigned: int = 0
     shortfall: int = 0
+    # An active, non-RESTRICTED holiday rests the workforce this day — assigned
+    # capacity counts only employees with a HolidayShiftAssignment override.
+    # Surfaced so the UI can attribute a holiday-driven gap to the holiday
+    # rather than reading it as a staffing failure.
+    is_holiday: bool = False
+    holiday_name: Optional[str] = None
     cells: List[ForecastCell] = Field(default_factory=list)
 
 

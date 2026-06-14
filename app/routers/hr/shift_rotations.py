@@ -76,16 +76,25 @@ def _rotation_response(db: Session, r: ShiftRotation) -> ShiftRotationResponse:
             id=m.id, employee_id=m.employee_id,
             employee_name=names.get(m.employee_id), phase_offset=m.phase_offset)
         for m in members]
+    # Current step is derived from the calendar: how many periods have elapsed
+    # since the anchor. This keeps the orbit highlighting the step that is
+    # actually in effect today, independent of any stored cursor.
+    cur_idx = r.current_step_index or 0
+    if steps and r.anchor_date:
+        period = r.frequency_days or 7
+        today = date.today()
+        if today >= r.anchor_date and period > 0:
+            cur_idx = (today - r.anchor_date).days // period
     cur_label = None
     if steps:
-        cs = steps[r.current_step_index % len(steps)]
+        cs = steps[cur_idx % len(steps)]
         cur_label = cs.label or (smeta.get(cs.shift_id).name if smeta.get(cs.shift_id) else "Off")
     return ShiftRotationResponse(
         id=r.id, name=r.name, code=r.code,
         cycle=r.cycle.value if hasattr(r.cycle, "value") else str(r.cycle),
         frequency_days=r.frequency_days, description=r.description,
         department_ids=r.department_ids or [], anchor_date=r.anchor_date,
-        current_step_index=r.current_step_index, last_advanced_on=r.last_advanced_on,
+        current_step_index=cur_idx, last_advanced_on=r.last_advanced_on,
         is_active=r.is_active, created_at=r.created_at,
         steps=step_out, members=member_out, member_count=len(member_out),
         current_step_label=cur_label,
@@ -108,6 +117,92 @@ def _sync_members(db: Session, r: ShiftRotation, emp_ids):
     db.flush()
     for i, eid in enumerate(emp_ids or []):
         db.add(ShiftRotationMember(rotation_id=r.id, employee_id=eid, phase_offset=i % max(1, len(emp_ids or [1]))))
+
+
+def _rotation_note(r: ShiftRotation) -> str:
+    return f"Rotation · {r.name}"
+
+
+def _materialize_cycle(db: Session, r: ShiftRotation, actor_id, cycle_no: int) -> int:
+    """Write one full N-step cycle of the rotation into concrete shift
+    assignments, anchored at ``anchor_date``.
+
+    For cycle ``c`` and step-slot ``k`` (0-based), each member is placed on
+    ``steps[(c*N + k + phase_offset) % N]`` for the window
+    ``[anchor + (c*N+k)*period, … + period-1]``.  OFF steps (no shift) leave a
+    gap.  Idempotent on (employee, shift, effective_from); past windows are
+    skipped so we never backfill history; assignments on a *different* shift
+    that overlap a window are trimmed so the rotation stays authoritative.
+    """
+    steps = db.query(ShiftRotationStep).filter(
+        ShiftRotationStep.rotation_id == r.id).order_by(ShiftRotationStep.sequence).all()
+    members = db.query(ShiftRotationMember).filter(
+        ShiftRotationMember.rotation_id == r.id).all()
+    if not steps or not members:
+        return 0
+    n = len(steps)
+    period = r.frequency_days or 7
+    anchor = r.anchor_date or date.today()
+    today = date.today()
+    written = 0
+    for k in range(n):
+        gweek = cycle_no * n + k
+        wf = anchor + timedelta(days=gweek * period)
+        wt = wf + timedelta(days=period - 1)
+        if wt < today:
+            continue  # don't materialise windows entirely in the past
+        for mem in members:
+            step = steps[(gweek + (mem.phase_offset or 0)) % n]
+            if step.shift_id is None:
+                continue  # OFF — rest block
+            exists = db.query(EmployeeShiftAssignment).filter(
+                EmployeeShiftAssignment.employee_id == mem.employee_id,
+                EmployeeShiftAssignment.shift_id == step.shift_id,
+                EmployeeShiftAssignment.effective_from == wf).first()
+            if exists:
+                continue
+            # trim any overlapping assignment on a *different* shift
+            overlapping = (
+                db.query(EmployeeShiftAssignment)
+                .filter(EmployeeShiftAssignment.employee_id == mem.employee_id,
+                        EmployeeShiftAssignment.shift_id != step.shift_id,
+                        EmployeeShiftAssignment.effective_from <= wt,
+                        or_(EmployeeShiftAssignment.effective_until.is_(None),
+                            EmployeeShiftAssignment.effective_until >= wf))
+                .all())
+            for p in overlapping:
+                if p.effective_from < wf:
+                    p.effective_until = wf - timedelta(days=1)
+                elif p.effective_until is not None and p.effective_until <= wt:
+                    db.delete(p)  # fully inside this window
+                else:
+                    p.effective_from = wt + timedelta(days=1)  # starts inside, extends past
+            db.add(EmployeeShiftAssignment(
+                employee_id=mem.employee_id, shift_id=step.shift_id,
+                effective_from=wf, effective_until=wt,
+                notes=_rotation_note(r), created_by_id=actor_id))
+            written += 1
+    return written
+
+
+def _next_cycle(db: Session, r: ShiftRotation) -> int:
+    """The next un-materialised cycle index — used by ``advance`` to roll the
+    schedule forward one full cycle at a time."""
+    steps = db.query(ShiftRotationStep).filter(ShiftRotationStep.rotation_id == r.id).all()
+    n = len(steps) or 1
+    period = r.frequency_days or 7
+    anchor = r.anchor_date or date.today()
+    member_ids = [m.employee_id for m in
+                  db.query(ShiftRotationMember).filter(ShiftRotationMember.rotation_id == r.id).all()]
+    if not member_ids:
+        return 0
+    latest = (db.query(func.max(EmployeeShiftAssignment.effective_from))
+              .filter(EmployeeShiftAssignment.employee_id.in_(member_ids),
+                      EmployeeShiftAssignment.notes == _rotation_note(r)).scalar())
+    if not latest:
+        return 0
+    gweek = max(0, (latest - anchor).days // period)
+    return gweek // n + 1
 
 
 @router.get("/", response_model=dict)
@@ -153,6 +248,10 @@ def create_rotation(
     db.flush()
     _sync_steps(db, r, payload.steps)
     _sync_members(db, r, payload.member_employee_ids)
+    db.flush()
+    # Materialise the first full cycle from the anchor date so the schedule is
+    # live immediately — no manual "advance" required to see week-N shifts.
+    _materialize_cycle(db, r, admin.id, 0)
     db.commit()
     db.refresh(r)
     return _rotation_response(db, r)
@@ -199,23 +298,84 @@ def update_rotation(
         _sync_steps(db, r, payload.steps)
     if payload.member_employee_ids is not None:
         _sync_members(db, r, payload.member_employee_ids)
+    db.flush()
+    # Re-materialise: drop this rotation's *future* generated assignments (so a
+    # changed pattern/anchor doesn't leave stale rows) and re-write the cycle.
+    member_ids = [m.employee_id for m in
+                  db.query(ShiftRotationMember).filter(ShiftRotationMember.rotation_id == r.id).all()]
+    if member_ids:
+        (db.query(EmployeeShiftAssignment)
+         .filter(EmployeeShiftAssignment.employee_id.in_(member_ids),
+                 EmployeeShiftAssignment.notes == _rotation_note(r),
+                 EmployeeShiftAssignment.effective_from > date.today())
+         .delete(synchronize_session=False))
+    _materialize_cycle(db, r, _admin.id, 0)
     db.commit()
     db.refresh(r)
     return _rotation_response(db, r)
 
 
-@router.delete("/{rotation_id}", status_code=http_status.HTTP_204_NO_CONTENT)
-def delete_rotation(
+@router.get("/{rotation_id}/impact", response_model=dict)
+def rotation_impact(
     rotation_id: UUID,
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
-    r = db.query(ShiftRotation).filter(ShiftRotation.id == rotation_id).first()
+    """Pre-delete impact summary so the UI can warn before destroying a
+    rotation: how many members ride it and how many not-yet-started shift
+    assignments it has generated (the rows a "cancel upcoming" delete removes)."""
+    r = db.query(ShiftRotation).filter(
+        ShiftRotation.id == rotation_id, ShiftRotation.is_deleted == False).first()  # noqa: E712
     if not r:
         raise HTTPException(404, "Rotation not found")
+    member_ids = [m.employee_id for m in r.members]
+    future = 0
+    if member_ids:
+        future = (db.query(EmployeeShiftAssignment)
+                  .filter(EmployeeShiftAssignment.employee_id.in_(member_ids),
+                          EmployeeShiftAssignment.notes == _rotation_note(r),
+                          EmployeeShiftAssignment.effective_from > date.today())
+                  .count())
+    return {"member_count": len(member_ids), "future_assignments": future, "is_active": bool(r.is_active)}
+
+
+@router.delete("/{rotation_id}", response_model=dict)
+def delete_rotation(
+    rotation_id: UUID,
+    revoke_future: bool = False,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Soft-delete a rotation. By default the shifts it already scheduled are
+    KEPT (real commitments on employees' calendars) — the rotation just stops
+    generating new ones. With ``revoke_future=true`` the not-yet-started
+    generated assignments are also cancelled. Always audit-logged."""
+    r = db.query(ShiftRotation).filter(
+        ShiftRotation.id == rotation_id, ShiftRotation.is_deleted == False).first()  # noqa: E712
+    if not r:
+        raise HTTPException(404, "Rotation not found")
+
+    member_ids = [m.employee_id for m in r.members]
+    revoked = 0
+    if revoke_future and member_ids:
+        future = (db.query(EmployeeShiftAssignment)
+                  .filter(EmployeeShiftAssignment.employee_id.in_(member_ids),
+                          EmployeeShiftAssignment.notes == _rotation_note(r),
+                          EmployeeShiftAssignment.effective_from > date.today())
+                  .all())
+        revoked = len(future)
+        for a in future:
+            db.delete(a)
+
     r.is_deleted = True
     r.is_active = False
+    log(db, actor_id=admin.id, action=AttendanceLogAction.POLICY_CHANGE,
+        target_table="hr_shift_rotations", target_id=r.id,
+        payload={"event": "rotation_deleted", "rotation": r.name,
+                 "members": len(member_ids), "revoke_future": revoke_future,
+                 "future_assignments_revoked": revoked})
     db.commit()
+    return {"deleted": True, "future_assignments_revoked": revoked}
 
 
 @router.post("/{rotation_id}/advance", response_model=RotationAdvanceResult)
@@ -235,47 +395,21 @@ def advance_rotation(
     if not members:
         raise HTTPException(400, "Rotation has no members to schedule")
 
+    n = len(steps)
     period = r.frequency_days or 7
-    window_from = date.today()
-    window_to = window_from + timedelta(days=period - 1)
-    next_index = r.current_step_index + 1
+    anchor = r.anchor_date or date.today()
+    # Roll the schedule forward by one full cycle (the next un-materialised one).
+    cycle_no = _next_cycle(db, r)
+    written = _materialize_cycle(db, r, admin.id, cycle_no)
+    window_from = anchor + timedelta(days=cycle_no * n * period)
+    window_to = anchor + timedelta(days=((cycle_no + 1) * n * period) - 1)
 
-    written = 0
-    for mem in members:
-        step = steps[(next_index + mem.phase_offset) % len(steps)]
-        if step.shift_id is None:
-            continue  # OFF block — leave the member unassigned for this window
-        # idempotency — don't duplicate an identical window
-        if db.query(EmployeeShiftAssignment).filter(
-            EmployeeShiftAssignment.employee_id == mem.employee_id,
-            EmployeeShiftAssignment.shift_id == step.shift_id,
-            EmployeeShiftAssignment.effective_from == window_from,
-        ).first():
-            continue
-        # close prior overlapping assignments on a different shift
-        prior = (
-            db.query(EmployeeShiftAssignment)
-            .filter(EmployeeShiftAssignment.employee_id == mem.employee_id,
-                    EmployeeShiftAssignment.effective_from <= window_from,
-                    or_(EmployeeShiftAssignment.effective_until.is_(None),
-                        EmployeeShiftAssignment.effective_until >= window_from))
-            .all())
-        for p in prior:
-            if p.shift_id != step.shift_id:
-                p.effective_until = window_from - timedelta(days=1)
-        db.add(EmployeeShiftAssignment(
-            employee_id=mem.employee_id, shift_id=step.shift_id,
-            effective_from=window_from, effective_until=window_to,
-            notes=f"Rotation · {r.name}", created_by_id=admin.id))
-        written += 1
-
-    r.current_step_index = next_index
-    r.last_advanced_on = window_from
+    r.last_advanced_on = date.today()
     db.flush()
     log(db, actor_id=admin.id, action=AttendanceLogAction.SHIFT_ASSIGNED,
         target_table="hr_shift_rotations", target_id=r.id,
-        payload={"rotation": r.name, "advanced_to": next_index, "written": written})
+        payload={"rotation": r.name, "cycle": cycle_no, "written": written})
     db.commit()
     return RotationAdvanceResult(
-        rotation_id=r.id, advanced_to_step=next_index % len(steps),
+        rotation_id=r.id, advanced_to_step=cycle_no % n,
         assignments_written=written, window_from=window_from, window_to=window_to)

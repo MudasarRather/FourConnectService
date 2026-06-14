@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from math import ceil
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -33,6 +33,7 @@ def _to_response(db: Session, l: AttendanceLog) -> AttendanceLogResponse:
 @router.get("/", response_model=AttendanceLogListResponse)
 def list_logs(
     action: Optional[AttendanceLogAction] = None,
+    target_table: Optional[List[str]] = Query(None),
     employee_id: Optional[UUID] = None,
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
@@ -42,6 +43,11 @@ def list_logs(
     q = db.query(AttendanceLog)
     if action:
         q = q.filter(AttendanceLog.action == action)
+    # Filter by one or more target tables — lets the Shifts audit view pull every
+    # shift-scoped event (assignments, rotations, rosters, swaps, OT rules) in one
+    # time-ordered call regardless of the action enum used to record each.
+    if target_table:
+        q = q.filter(AttendanceLog.target_table.in_(target_table))
     if employee_id:
         q = q.filter(AttendanceLog.employee_id == employee_id)
     total = q.count()

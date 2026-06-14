@@ -37,6 +37,16 @@ class HolidayShiftAssignment(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
+    # Stand-down audit — captured by the Holiday Roster "remove" modal so a removal
+    # records WHY (category + free note + who + when) instead of vanishing. Set on
+    # soft-delete; cleared when the same (holiday, employee) pair is re-assigned
+    # (a tombstoned row is resurrected rather than re-inserted — uq_holiday_emp does
+    # not account for is_deleted, so re-INSERT would violate the unique constraint).
+    removal_reason = Column(Text, nullable=True)
+    removal_category = Column(String(64), nullable=True)
+    removed_at = Column(DateTime(timezone=True), nullable=True)
+    removed_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
     holiday = relationship("Holiday", foreign_keys=[holiday_id])
     employee = relationship("Employee", foreign_keys=[employee_id])
 

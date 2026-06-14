@@ -730,10 +730,16 @@ def daily_rollup(
     # Only auto-create OT once the day has actually closed (clock-out exists).
     # Open in-progress rows shouldn't queue OT yet — we don't know if the
     # employee is genuinely working OT or just hasn't punched out.
+    # Never queue OT on an approved-LEAVE day: the employee booked the day off,
+    # so any punches there are not OT. To legitimately work (and earn OT) on a
+    # booked day the leave must first be cancelled — which flips the day off LEAVE
+    # and lets the next rollup queue the OT. (Payroll also refuses to pay OT on a
+    # LEAVE day as a backstop — see _OT_NONWORK_STATUSES.)
     if (
         result.overtime_hours
         and result.overtime_hours > 0
         and result.check_out_time is not None
+        and result.status != AttendanceStatus.LEAVE
     ):
         from app.models.hr.overtime import OvertimeRequest, OtStatus, OtPayrollStatus, OtType
         existing_ot = (
@@ -815,7 +821,24 @@ def daily_rollup(
             )
             .first()
         )
-        if not marker:
+        # No double-dip: if this HOLIDAY is cash-compensated via a holiday-shift
+        # assignment (DOUBLE_PAY / OVERTIME → paid as double wages / OT in payroll),
+        # do NOT also grant a comp-off leave day. Comp-off still applies to COMP_OFF
+        # assignments, holiday-allowance, unassigned holiday work, and all week-off
+        # work. (Indian N&FH / Factories Act: double wages OR a compensatory holiday.)
+        cash_in_lieu = False
+        if holiday_match:
+            from app.models.hr.holiday_shift import HolidayShiftAssignment, HolidayCompType
+            _hsa = (
+                db.query(HolidayShiftAssignment.compensation)
+                .filter(HolidayShiftAssignment.employee_id == employee_id,
+                        HolidayShiftAssignment.holiday_id == holiday_match.id,
+                        HolidayShiftAssignment.is_deleted == False)  # noqa: E712
+                .first()
+            )
+            if _hsa and _hsa[0] in (HolidayCompType.DOUBLE_PAY, HolidayCompType.OVERTIME):
+                cash_in_lieu = True
+        if not marker and not cash_in_lieu:
             # Decide credit size: full day if worked ≥ full_day_hours, else 0.5
             full_h = float(shift.full_day_hours or 8.0)
             worked_h = float(result.working_hours or 0)

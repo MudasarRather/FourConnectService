@@ -900,6 +900,41 @@ def _rollup_leave_dates(db: Session, leave: LeaveRequest, actor_id: UUID) -> Non
         d += timedelta(days=1)
 
 
+def _unwind_leave_effects(db: Session, leave: LeaveRequest, actor: User, *, was_approved: bool) -> None:
+    """Undo the side-effects of a leave that is being rejected / withdrawn.
+
+    If the leave had reached APPROVED, its balance debit is reversed; in EVERY
+    case daily_rollup is re-run across the covered dates so any stale `LEAVE`
+    attendance rows flip back to what the punches / holiday / week-off imply.
+    This is the mirror of the delete handler and closes the gap where a
+    previously-approved leave stayed marked LEAVE in attendance after rejection.
+    Idempotent and best-effort — must never block the decision it follows.
+
+    GATED on `was_approved`: a leave that never reached APPROVED has no debited
+    balance and never stamped any LEAVE attendance row, so there is nothing to
+    unwind. Re-running daily_rollup in that case would only fabricate ABSENT
+    rows for the (possibly future) covered dates — the very recompute anti-pattern
+    we avoid. So when the leave was never approved this is a deliberate no-op.
+    """
+    if not was_approved:
+        return
+    if leave.leave_type != LeaveType.LWP:
+        for fy_label, days in (leave.fy_breakdown or {}).items():
+            try:
+                b = _get_or_create_balance(db, leave.employee_id, leave.leave_type, fy_label)
+                _apply_ledger(
+                    db, b, kind=LedgerKind.REQUEST_CANCELLED,
+                    delta=Decimal(str(float(days))), actor=actor,
+                    note=f"Reversed on rejection {leave.reference_no}",
+                    related_request_id=leave.id,
+                )
+            except HTTPException:
+                pass
+        db.commit()
+    _rollup_leave_dates(db, leave, actor_id=actor.id)
+    db.commit()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Self-service endpoints
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1558,6 +1593,7 @@ def manager_decide(
     ).with_for_update().first()
     if not leave:
         raise HTTPException(404, "Leave request not found")
+    was_approved = leave.status == LeaveStatus.APPROVED
     # Verify the current user actually manages this employee
     emp = db.query(Employee).filter(Employee.id == leave.employee_id).first()
     if not emp or emp.reporting_manager_id != user.id:
@@ -1614,6 +1650,11 @@ def manager_decide(
         leave.manager_notes = body.notes
     db.commit()
     db.refresh(leave)
+
+    # Reject unwinds any approved side-effects (balance) + flips stale LEAVE
+    # attendance rows back via daily_rollup.
+    if leave.status in (LeaveStatus.MANAGER_REJECTED, LeaveStatus.REJECTED):
+        _unwind_leave_effects(db, leave, user, was_approved=was_approved)
 
     try:
         action = AttendanceLogAction.LEAVE_MANAGER_APPROVED if body.decision == LeaveDecision.APPROVED else AttendanceLogAction.LEAVE_MANAGER_REJECTED
@@ -1741,6 +1782,7 @@ def chain_decide(
     ).with_for_update().first()
     if not leave:
         raise HTTPException(404, "Leave request not found")
+    was_approved = leave.status == LeaveStatus.APPROVED
     if _has_legacy_steps(leave):
         raise HTTPException(409, "This request predates Phase 4 — use /manager or /hr decide")
 
@@ -1793,6 +1835,8 @@ def chain_decide(
     if leave.status == LeaveStatus.APPROVED:
         _rollup_leave_dates(db, leave, actor_id=user.id)
         db.commit()
+    elif leave.status in (LeaveStatus.REJECTED, LeaveStatus.MANAGER_REJECTED):
+        _unwind_leave_effects(db, leave, user, was_approved=was_approved)
 
     try:
         if body.decision == LeaveDecision.APPROVED:
@@ -1961,6 +2005,7 @@ def hr_decide(
     ).with_for_update().first()
     if not leave:
         raise HTTPException(404, "Leave request not found")
+    was_approved = leave.status == LeaveStatus.APPROVED
 
     # Phase 4 — chain-aware path: the HR decide endpoint advances whatever the
     # current stage is, provided it is an HR-type stage. (USER stages flow
@@ -2039,6 +2084,8 @@ def hr_decide(
     if leave.status == LeaveStatus.APPROVED:
         _rollup_leave_dates(db, leave, actor_id=admin.id)
         db.commit()
+    elif leave.status in (LeaveStatus.REJECTED, LeaveStatus.MANAGER_REJECTED):
+        _unwind_leave_effects(db, leave, admin, was_approved=was_approved)
 
     try:
         action = AttendanceLogAction.LEAVE_HR_APPROVED if body.decision == LeaveDecision.APPROVED else AttendanceLogAction.LEAVE_HR_REJECTED

@@ -29,7 +29,7 @@ from app.schemas.hr.payroll import (
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.payroll.service import (
     next_batch_no, write_audit, generate_batch, can_transition, month_bounds,
-    post_adjustments_paid, resolve_eligibility,
+    post_adjustments_paid, post_overtime_processed, resolve_eligibility,
 )
 
 router = APIRouter(prefix="/hr/payroll/batches", tags=["HR — Payroll Batches"])
@@ -153,6 +153,7 @@ def _transition(db, b: PayrollBatch, action: str, actor: User, body: Optional[Ba
             {"status": PayslipStatus.RELEASED}, synchronize_session=False)
         _post_encashment(db, b, actor.id)
         post_adjustments_paid(db, b, actor.id)
+        post_overtime_processed(db, b, actor.id)
     elif action == "lock":
         b.locked_at, b.locked_by_id = now, actor.id
         start, end = month_bounds(b.period_year, b.period_month)

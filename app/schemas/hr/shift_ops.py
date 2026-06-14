@@ -124,6 +124,13 @@ class HolidayShiftUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+class HolidayShiftRemoveBody(BaseModel):
+    """Stand-down payload sent in the DELETE body by the Holiday Roster remove modal."""
+    model_config = ConfigDict(extra="ignore")
+    reason: Optional[str] = Field(default=None, max_length=500)
+    reason_category: Optional[str] = Field(default=None, max_length=64)
+
+
 class HolidayShiftResponse(BaseModel):
     id: UUID
     holiday_id: UUID

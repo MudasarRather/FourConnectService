@@ -18,12 +18,33 @@ from app.database import get_db
 from app.models.user import User
 from app.models.hr.overtime import OtType
 from app.models.hr.overtime_rule import OvertimeRule
+from app.models.hr.attendance_log import AttendanceLogAction
 from app.schemas.hr.shift_ops import (
     OvertimeRuleCreate, OvertimeRuleUpdate, OvertimeRuleResponse, OtResolveResult,
 )
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.attendance_logic import log as _audit
 
 router = APIRouter(prefix="/hr/overtime-rules", tags=["HR — Overtime Rules"])
+
+
+def _audit_rule(db: Session, admin: User, r: OvertimeRule, op: str, reason: str | None = None) -> None:
+    """Write an OT-rule lifecycle event into the shared HR audit stream
+    (hr_attendance_logs) so it surfaces on the Shifts → Audit Logs timeline,
+    alongside assignments/rotations/rosters. Reuses POLICY_CHANGE (OT rules are
+    config/policy) + target_table to differentiate. Caller commits."""
+    payload = {
+        "op": op,
+        "name": r.name,
+        "ot_type": r.ot_type.value if hasattr(r.ot_type, "value") else str(r.ot_type),
+        "multiplier": float(r.multiplier or 1),
+        "max_ot_hours": float(r.max_ot_hours) if r.max_ot_hours is not None else None,
+        "priority": int(r.priority or 0),
+    }
+    if reason:
+        payload["reason"] = reason.strip()[:500]
+    _audit(db, actor_id=admin.id, action=AttendanceLogAction.POLICY_CHANGE,
+           target_table="hr_overtime_rules", target_id=r.id, payload=payload)
 
 
 def _resp(r: OvertimeRule) -> OvertimeRuleResponse:
@@ -96,6 +117,8 @@ def create_rule(
         department_ids=[str(d) for d in (payload.department_ids or [])],
         priority=payload.priority, description=payload.description, created_by_id=admin.id)
     db.add(r)
+    db.flush()
+    _audit_rule(db, admin, r, "created")
     db.commit()
     db.refresh(r)
     return _resp(r)
@@ -106,7 +129,7 @@ def update_rule(
     rule_id: UUID,
     payload: OvertimeRuleUpdate,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     r = db.query(OvertimeRule).filter(OvertimeRule.id == rule_id, OvertimeRule.is_deleted == False).first()  # noqa: E712
     if not r:
@@ -120,6 +143,8 @@ def update_rule(
         r.department_ids = [str(d) for d in data.pop("department_ids")]
     for k, v in data.items():
         setattr(r, k, v)
+    db.flush()
+    _audit_rule(db, admin, r, "updated")
     db.commit()
     db.refresh(r)
     return _resp(r)
@@ -128,11 +153,17 @@ def update_rule(
 @router.delete("/{rule_id}", status_code=http_status.HTTP_204_NO_CONTENT)
 def delete_rule(
     rule_id: UUID,
+    reason: Optional[str] = Query(None, max_length=500),
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     r = db.query(OvertimeRule).filter(OvertimeRule.id == rule_id).first()
     if not r:
         raise HTTPException(404, "Rule not found")
+    if r.is_deleted:
+        return  # idempotent — already soft-deleted, safe to resubmit
     r.is_deleted = True
+    # Append-only audit row on the shared HR stream (who, what rule, why) so it
+    # shows on the Shifts → Audit Logs timeline. Soft-delete keeps it recoverable.
+    _audit_rule(db, admin, r, "deleted", reason)
     db.commit()

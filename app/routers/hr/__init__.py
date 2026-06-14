@@ -36,6 +36,7 @@ from app.routers.hr.shift_swaps import router as _shift_swaps_router
 from app.routers.hr.holiday_shifts import router as _holiday_shifts_router
 from app.routers.hr.night_policies import router as _night_policies_router
 from app.routers.hr.workforce import router as _workforce_router
+from app.routers.hr.shift_reports import router as _shift_reports_router
 from app.routers.hr.attendance import router as _attendance_router
 from app.routers.hr.attendance_corrections import router as _att_corrections_router
 from app.routers.hr.wfh import router as _wfh_router
@@ -86,6 +87,9 @@ router.include_router(_employee_documents_router)
 # (corrections, policies, logs) before the broad /hr/attendance router. The
 # distinct prefixes don't actually collide, but keeping this order makes the
 # OpenAPI route table easier to scan.
+# Shift reports sub-router (prefix /hr/shifts/reports) before the broad shifts
+# router so /reports/... isn't shadowed by the `/{shift_id}` route.
+router.include_router(_shift_reports_router)
 router.include_router(_shifts_router)
 # Shifts & Rosters — distinct prefixes (/hr/shift-rotations, /hr/shift-rosters, /hr/shift-coverage)
 router.include_router(_shift_rotations_router)

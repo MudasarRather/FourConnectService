@@ -23,6 +23,10 @@ from app.models.hr.employee import Employee
 from app.models.hr.department import Department
 from app.models.hr.shift import Shift, EmployeeShiftAssignment
 from app.models.hr.workforce_demand import WorkforceDemand
+from app.models.hr.leave_request import LeaveRequest
+from app.models.hr.leave_type import LeaveStatus
+from app.models.hr.holiday import Holiday, HolidayType
+from app.models.hr.holiday_shift import HolidayShiftAssignment
 from app.schemas.hr.workforce import (
     WorkforceDemandCreate, WorkforceDemandUpdate, WorkforceDemandResponse,
     ForecastCell, ForecastDay, WorkforceForecastSummary, WorkforceForecastResponse,
@@ -136,11 +140,58 @@ def forecast(
     assigns = (
         db.query(EmployeeShiftAssignment.employee_id, EmployeeShiftAssignment.shift_id,
                  EmployeeShiftAssignment.effective_from, EmployeeShiftAssignment.effective_until,
-                 Employee.department_id)
+                 Employee.department_id, Employee.work_location_id)
         .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
         .filter(EmployeeShiftAssignment.effective_from <= to,
                 or_(EmployeeShiftAssignment.effective_until.is_(None),
                     EmployeeShiftAssignment.effective_until >= from_)).all())
+
+    # Approved FULL-DAY leave overlapping the window. An assigned employee on
+    # leave is NOT available capacity that day — mirrors the attendance rollup,
+    # where full-day APPROVED leave overrides presence (attendance_logic.py).
+    # Half-day leave still counts as a head. Without this the forecast
+    # over-states coverage and hides real shortfalls.
+    on_leave: set = set()
+    leave_rows = (
+        db.query(LeaveRequest.employee_id, LeaveRequest.from_date, LeaveRequest.to_date)
+        .filter(LeaveRequest.status == LeaveStatus.APPROVED,
+                LeaveRequest.is_deleted == False,  # noqa: E712
+                LeaveRequest.is_half_day == False,  # noqa: E712
+                LeaveRequest.from_date <= to,
+                LeaveRequest.to_date >= from_).all())
+    for _emp_id, _lf, _lt in leave_rows:
+        _d = max(_lf, from_)
+        _end = min(_lt, to)
+        while _d <= _end:
+            on_leave.add((_emp_id, _d))
+            _d += timedelta(days=1)
+
+    # Active, non-RESTRICTED holidays rest the workforce — mirrors the shift
+    # calendar + attendance rollup. RESTRICTED = optional/floating (claimed
+    # per-employee), so excluded. A date may carry several holidays (company-wide
+    # + location-specific); the per-employee location match below resolves which
+    # apply. A HolidayShiftAssignment override keeps an employee on-shift.
+    hol_by_date: dict = defaultdict(list)
+    for _h in (db.query(Holiday).filter(
+            Holiday.is_deleted == False, Holiday.is_active == True,  # noqa: E712
+            Holiday.holiday_type != HolidayType.RESTRICTED,
+            Holiday.date >= from_, Holiday.date <= to).all()):
+        hol_by_date[_h.date].append(_h)
+    hol_override_by_date: dict = defaultdict(set)
+    for _ovr_emp, _ovr_date in (
+        db.query(HolidayShiftAssignment.employee_id, Holiday.date)
+        .join(Holiday, Holiday.id == HolidayShiftAssignment.holiday_id)
+        .filter(HolidayShiftAssignment.is_deleted == False,  # noqa: E712
+                Holiday.is_deleted == False,  # noqa: E712
+                Holiday.date >= from_, Holiday.date <= to).all()):
+        hol_override_by_date[_ovr_date].add(_ovr_emp)
+
+    def _holiday_name_for(hs):
+        # Prefer a company-wide holiday's name; fall back to the first one.
+        for h in hs:
+            if h.location_id is None:
+                return h.name
+        return hs[0].name if hs else None
 
     def label_for(d):
         sh = shift_meta.get(d.shift_id)
@@ -157,6 +208,8 @@ def forecast(
     while cur <= to:
         cells = []
         day_req = day_assigned = day_short = 0
+        day_hols = hol_by_date.get(cur, [])
+        day_overrides = hol_override_by_date.get(cur, set())
         for d in demands:
             if d.valid_from > cur or (d.valid_to and d.valid_to < cur):
                 continue
@@ -165,12 +218,19 @@ def forecast(
                 continue  # shift not operating this weekday
             # assigned: distinct employees active on this shift (+dept) on `cur`
             emp_set = set()
-            for emp_id, shid, ef, eu, edept in assigns:
+            for emp_id, shid, ef, eu, edept, ewloc in assigns:
                 if shid != d.shift_id:
                     continue
                 if ef > cur or (eu is not None and eu < cur):
                     continue
                 if d.department_id and edept != d.department_id:
+                    continue
+                if (emp_id, cur) in on_leave:
+                    continue  # on approved full-day leave → not available capacity
+                # A holiday rests this employee unless it doesn't apply to their
+                # location, or they hold a holiday-shift override for the day.
+                if day_hols and emp_id not in day_overrides and any(
+                        h.location_id is None or h.location_id == ewloc for h in day_hols):
                     continue
                 emp_set.add(emp_id)
             assigned = len(emp_set)
@@ -186,7 +246,9 @@ def forecast(
             day_short += short
             shortfall_by_demand[label_for(d)] += short
         days.append(ForecastDay(date=cur, weekday=cur.weekday(), required=day_req,
-                                assigned=day_assigned, shortfall=day_short, cells=cells))
+                                assigned=day_assigned, shortfall=day_short,
+                                is_holiday=bool(day_hols), holiday_name=_holiday_name_for(day_hols),
+                                cells=cells))
         tot_req += day_req
         tot_assigned += day_assigned
         tot_short += day_short

@@ -58,12 +58,20 @@ def _to_response(h: Holiday) -> HolidayResponse:
 @router.get("/", response_model=HolidayListResponse)
 def list_holidays(
     year: Optional[int] = None,
+    active_only: bool = Query(
+        False,
+        description="Only return APPLIED (is_active) holidays. Shift planning passes "
+                    "this so draft/imported holidays can't be staffed before they are "
+                    "applied in Attendance · Holidays.",
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
     q = db.query(Holiday).filter(Holiday.is_deleted == False)  # noqa: E712
+    if active_only:
+        q = q.filter(Holiday.is_active == True)  # noqa: E712
     if year is not None:
         from datetime import date as _date
         q = q.filter(Holiday.date >= _date(year, 1, 1), Holiday.date <= _date(year, 12, 31))

@@ -16,7 +16,14 @@ from sqlalchemy.orm import Session, joinedload
 from app.models.system_setting import SystemSetting
 from app.models.user import User
 from app.models.hr.employee import Employee, LifecycleState
-from app.models.hr.attendance import Attendance
+from app.models.hr.attendance import Attendance, AttendanceStatus
+from app.models.hr.shift import Shift, ShiftType
+from app.models.hr.night_policy import NightShiftPolicy
+from app.models.hr.holiday import Holiday
+from app.models.hr.holiday_shift import HolidayShiftAssignment, HolidayCompType
+from app.models.hr.overtime import OvertimeRequest, OtStatus, OtPayrollStatus
+from app.models.hr.overtime_rule import OvertimeRule
+from app.models.hr.salary_component import ComponentType
 from app.models.hr.employee_compensation import EmployeeCompensation, CompensationStatus
 from app.models.hr.leave_encashment import LeaveEncashment
 from app.models.hr.leave_type import EncashmentStatus
@@ -30,6 +37,10 @@ from app.utils.hr.payroll import (
 )
 
 Q2 = Decimal("0.01")
+# Standard paid hours/day used as the OT hourly-rate divisor:
+#   hourly = full monthly Basic(+DA) / (days_in_month × OT_HOURS_PER_DAY)
+# One-line tunable if a different OT convention (e.g. fixed 26-day month) is needed.
+OT_HOURS_PER_DAY = Decimal("8")
 
 
 # ─────────────────────────────── numbering ───────────────────────────────
@@ -416,6 +427,252 @@ def _pending_adjustments(db: Session, employee_id, year: int, month: int) -> lis
     } for r in rows]
 
 
+# Statuses that prove the employee actually WORKED that day (earns night allowance
+# / holiday premium). ABSENT / LEAVE / WEEK_OFF / HOLIDAY / LWP do NOT. HALF_DAY = half.
+_WORKED_STATUSES = (
+    AttendanceStatus.PRESENT, AttendanceStatus.LATE, AttendanceStatus.ON_DUTY,
+    AttendanceStatus.WFH, AttendanceStatus.REMOTE, AttendanceStatus.HALF_DAY,
+)
+
+# OT must never pay on a day the employee did NOT actually work. Paying OT on top
+# of a paid LEAVE day is double-pay; ABSENT / LWP / rested HOLIDAY / WEEK_OFF are
+# likewise non-worked. A holiday or week-off that was actually worked carries a
+# worked status (PRESENT/LATE) — daily_rollup only stamps HOLIDAY/WEEK_OFF when
+# there was no clock-in — so those legitimately keep their OT.
+_OT_NONWORK_STATUSES = (
+    AttendanceStatus.ABSENT, AttendanceStatus.LEAVE, AttendanceStatus.LWP,
+    AttendanceStatus.WEEK_OFF, AttendanceStatus.HOLIDAY,
+)
+
+
+def _night_allowance(db: Session, employee_id, year: int, month: int):
+    """Per-night allowance the employee earned this period.
+
+    Paid per night ACTUALLY WORKED on a NIGHT-type shift that has an active night
+    policy with a positive allowance (set in the Night Shifts console at
+    /admin/hr/shifts/night). Counted from the daily Attendance rows — which carry
+    the shift used that day — so it reflects attendance truth and is idempotent on
+    re-generate (re-derived, never stored as a pending row → no double-pay).
+    HALF_DAY earns half a night's allowance. Returns (total Decimal, nights Decimal).
+    """
+    start, end = month_bounds(year, month)
+    # {shift_id: per-night allowance} for NIGHT shifts that carry a live policy.
+    pol_map = dict(
+        db.query(NightShiftPolicy.shift_id, NightShiftPolicy.allowance_amount)
+        .join(Shift, Shift.id == NightShiftPolicy.shift_id)
+        .filter(NightShiftPolicy.is_deleted == False,  # noqa: E712
+                NightShiftPolicy.allowance_amount > 0,
+                Shift.shift_type == ShiftType.NIGHT,
+                Shift.is_deleted == False)  # noqa: E712
+        .all()
+    )
+    if not pol_map:
+        return Decimal("0"), Decimal("0")
+    rows = (
+        db.query(Attendance.shift_id, Attendance.status, sa_func.count(Attendance.id))
+        .filter(Attendance.employee_id == employee_id,
+                Attendance.is_deleted == False,  # noqa: E712
+                Attendance.date >= start, Attendance.date <= end,
+                Attendance.shift_id.in_(list(pol_map.keys())),
+                Attendance.status.in_(_WORKED_STATUSES))
+        .group_by(Attendance.shift_id, Attendance.status)
+        .all()
+    )
+    total = Decimal("0")
+    nights = Decimal("0")
+    for shift_id, status, cnt in rows:
+        weight = Decimal("0.5") if status == AttendanceStatus.HALF_DAY else Decimal("1")
+        n = Decimal(str(cnt)) * weight
+        nights += n
+        total += n * Decimal(str(pol_map.get(shift_id) or 0))
+    return total.quantize(Q2), nights
+
+
+def _holiday_premium(db: Session, employee: Employee, year: int, month: int, day_salary_base) -> tuple:
+    """Premium pay for working holidays this period (HolidayShiftAssignment).
+
+    Corporate rule: working a holiday pays DOUBLE the day's salary. A holiday is
+    already paid once inside the monthly salary, so we add only the PREMIUM above
+    normal pay per holiday actually worked:
+        premium = (pay_multiplier - 1) × daily_salary
+        daily_salary = day_salary_base / days_in_month   (a full day's pay)
+    DOUBLE_PAY @ 2.0 → +1 day's salary ⇒ that day totals 2× = double pay. HALF_DAY
+    earns half. COMP_OFF is a comp-off LEAVE credit, not cash → excluded here.
+    Attendance-gated (only paid if the employee actually worked the holiday) and
+    re-derived every run (no stored flag) → idempotent, no double-pay.
+    Returns (total Decimal, holidays_worked Decimal).
+    """
+    start, end = month_bounds(year, month)
+    rows = (
+        db.query(HolidayShiftAssignment, Holiday.date)
+        .join(Holiday, Holiday.id == HolidayShiftAssignment.holiday_id)
+        .filter(HolidayShiftAssignment.employee_id == employee.id,
+                HolidayShiftAssignment.is_deleted == False,  # noqa: E712
+                HolidayShiftAssignment.compensation != HolidayCompType.COMP_OFF,
+                Holiday.is_deleted == False,  # noqa: E712
+                # Only APPLIED holidays are live. A draft holiday never short-circuits
+                # the daily rollup, so the day is normal work — never pay a premium for it.
+                Holiday.is_active == True,  # noqa: E712
+                Holiday.date >= start, Holiday.date <= end)
+        .all()
+    )
+    if not rows:
+        return Decimal("0"), Decimal("0")
+    days = Decimal(str(days_in_month(year, month)))
+    base = Decimal(str(day_salary_base or 0))
+    if base <= 0 or days <= 0:
+        return Decimal("0"), Decimal("0")
+    daily = base / days
+    # Attendance proof: did they actually work the holiday? (HOLIDAY status = rested)
+    want_dates = {d for _, d in rows}
+    att = dict(
+        db.query(Attendance.date, Attendance.status)
+        .filter(Attendance.employee_id == employee.id, Attendance.is_deleted == False,  # noqa: E712
+                Attendance.date.in_(list(want_dates))).all()
+    )
+    total = Decimal("0")
+    worked = Decimal("0")
+    for a, hdate in rows:
+        st = att.get(hdate)
+        if st not in _WORKED_STATUSES:
+            continue
+        premium = Decimal(str(a.pay_multiplier or 0)) - Decimal("1")
+        if premium <= 0:  # multiplier ≤ 1 (e.g. plain allowance / comp-off) → no cash premium
+            continue
+        weight = Decimal("0.5") if st == AttendanceStatus.HALF_DAY else Decimal("1")
+        worked += weight
+        total += weight * daily * premium
+    return total.quantize(Q2), worked
+
+
+def _overtime_pay(db: Session, employee: Employee, year: int, month: int,
+                  slip_result: Dict, working_days: Decimal, fallback_base) -> tuple:
+    """Payable overtime for the period from APPROVED, not-yet-processed requests.
+
+    Per OvertimeRequest dated in the period:
+      payable_hours × hourly_rate × multiplier
+      • hourly_rate = full monthly Basic(+DA) / (days_in_month × OT_HOURS_PER_DAY),
+        falling back to monthly gross/CTC when the structure has no BASIC line.
+      • multiplier = the NIGHT-shift differential (NightShiftPolicy.overtime_rate)
+        when that date's attendance shift is a NIGHT shift with a policy; otherwise
+        the highest-priority active OvertimeRule for the ot_type (with its hour cap).
+
+    Re-derived every run from APPROVED+PENDING requests, so re-generating a batch
+    can't double-pay; release marks them PROCESSED (see post_overtime_processed).
+    Returns (total Decimal, hours Decimal).
+    """
+    start, end = month_bounds(year, month)
+    reqs = (
+        db.query(OvertimeRequest)
+        .filter(OvertimeRequest.employee_id == employee.id,
+                OvertimeRequest.is_deleted == False,  # noqa: E712
+                OvertimeRequest.status == OtStatus.APPROVED,
+                OvertimeRequest.payroll_status == OtPayrollStatus.PENDING,
+                OvertimeRequest.date >= start, OvertimeRequest.date <= end)
+        .all()
+    )
+    if not reqs:
+        return Decimal("0"), Decimal("0")
+
+    # Hourly base — full (un-prorated) monthly Basic(+DA) from the computed slip.
+    by_code = {l["component_code"]: l for l in slip_result.get("lines", [])}
+    base = Decimal("0")
+    if "BASIC" in by_code:
+        base = Decimal(str(by_code["BASIC"]["full_amount"] or 0))
+        for da_code in ("DA", "DEARNESS_ALLOWANCE", "DEARNESS"):
+            if da_code in by_code:
+                base += Decimal(str(by_code[da_code]["full_amount"] or 0))
+                break
+    if base <= 0:
+        base = Decimal(str(fallback_base or 0))
+    days = Decimal(str(working_days or 0))
+    if base <= 0 or days <= 0:
+        return Decimal("0"), Decimal("0")
+    hourly = base / (days * OT_HOURS_PER_DAY)
+
+    # Highest-priority active OT rule per type (mirrors /overtime-rules/resolve).
+    rule_by_type = {}
+    for r in (db.query(OvertimeRule)
+              .filter(OvertimeRule.is_deleted == False, OvertimeRule.is_active == True)  # noqa: E712
+              .order_by(OvertimeRule.priority.desc(), OvertimeRule.created_at.desc()).all()):
+        rule_by_type.setdefault(r.ot_type, r)
+
+    # Night differential: {date: shift_id} this period × {night shift_id: ot_rate}.
+    # Also capture {date: status} so OT can be skipped on non-worked days.
+    _att_rows = (
+        db.query(Attendance.date, Attendance.shift_id, Attendance.status)
+        .filter(Attendance.employee_id == employee.id, Attendance.is_deleted == False,  # noqa: E712
+                Attendance.date >= start, Attendance.date <= end).all()
+    )
+    att = {d: sid for d, sid, _st in _att_rows}
+    att_status = {d: _st for d, _sid, _st in _att_rows}
+    night_rate = dict(
+        db.query(NightShiftPolicy.shift_id, NightShiftPolicy.overtime_rate)
+        .join(Shift, Shift.id == NightShiftPolicy.shift_id)
+        .filter(NightShiftPolicy.is_deleted == False,  # noqa: E712
+                NightShiftPolicy.overtime_rate > 1,
+                Shift.shift_type == ShiftType.NIGHT, Shift.is_deleted == False)  # noqa: E712
+        .all()
+    )
+
+    total = Decimal("0")
+    hours_paid = Decimal("0")
+    for req in reqs:
+        hrs = Decimal(str(req.ot_hours or 0))
+        if hrs <= 0:
+            continue
+        # Skip OT on a day the employee didn't actually work (paid LEAVE, ABSENT,
+        # LWP, or a rested holiday/week-off) — paying it would double-pay the day.
+        # To earn OT on a booked-off day the leave must first be cancelled, which
+        # flips the day back to a worked status (then this pays it on a later run).
+        if att_status.get(req.date) in _OT_NONWORK_STATUSES:
+            continue
+        sid = att.get(req.date)
+        nrate = night_rate.get(sid) if sid else None
+        if nrate:  # OT worked on a night shift → night differential
+            mult, cap = Decimal(str(nrate)), None
+        else:
+            rule = rule_by_type.get(req.ot_type)
+            mult = Decimal(str(rule.multiplier)) if rule else Decimal("1")
+            cap = Decimal(str(rule.max_ot_hours)) if (rule and rule.max_ot_hours is not None) else None
+        payable = min(hrs, cap) if cap is not None else hrs
+        hours_paid += payable
+        total += payable * hourly * mult
+    return total.quantize(Q2), hours_paid
+
+
+def post_overtime_processed(db: Session, batch: PayrollBatch, actor_id) -> None:
+    """On release, mark this batch's APPROVED+PENDING in-period OT as PROCESSED so
+    it is never picked up by a later run. Mirrors post_adjustments_paid."""
+    emp_ids = [r[0] for r in db.query(Payslip.employee_id).filter(Payslip.batch_id == batch.id).all()]
+    if not emp_ids:
+        return
+    start, end = month_bounds(batch.period_year, batch.period_month)
+    rows = db.query(OvertimeRequest).filter(
+        OvertimeRequest.employee_id.in_(emp_ids),
+        OvertimeRequest.is_deleted == False,  # noqa: E712
+        OvertimeRequest.status == OtStatus.APPROVED,
+        OvertimeRequest.payroll_status == OtPayrollStatus.PENDING,
+        OvertimeRequest.date >= start, OvertimeRequest.date <= end,
+    ).all()
+    # Mirror the _overtime_pay gate: only OT that was actually PAYABLE (a worked
+    # day) is marked PROCESSED. OT skipped because the day was LEAVE/ABSENT/etc.
+    # stays PENDING, so it can still pay later if that day is converted to a
+    # worked day (e.g. the leave for it is cancelled) — never silently consumed.
+    att_status = {
+        (e, d): st for e, d, st in db.query(
+            Attendance.employee_id, Attendance.date, Attendance.status
+        ).filter(
+            Attendance.employee_id.in_(emp_ids), Attendance.is_deleted == False,  # noqa: E712
+            Attendance.date >= start, Attendance.date <= end,
+        ).all()
+    }
+    for r in rows:
+        if att_status.get((r.employee_id, r.date)) in _OT_NONWORK_STATUSES:
+            continue
+        r.payroll_status = OtPayrollStatus.PROCESSED
+
+
 def post_adjustments_paid(db: Session, batch: PayrollBatch, actor_id) -> None:
     """On release, mark this batch's matching approved adjustments as PAID."""
     emp_ids = [r[0] for r in db.query(Payslip.employee_id).filter(Payslip.batch_id == batch.id).all()]
@@ -496,6 +753,31 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     encash = _approved_encashment(db, employee.id)
     adjustments = _pending_adjustments(db, employee.id, year, month)
 
+    # Night-shift allowance — per night actually worked on a NIGHT shift that
+    # carries an active policy (rate set in /admin/hr/shifts/night). Injected as a
+    # taxable earning line; it is RE-DERIVED from attendance every generate (never
+    # a stored pending row), so re-running a batch can't double-pay it.
+    night_total, night_nights = _night_allowance(db, employee.id, year, month)
+    if night_total > 0:
+        adjustments = list(adjustments) + [{
+            "code": "NIGHT_ALLOWANCE", "adjustment_type": "NIGHT_ALLOWANCE",
+            "title": "Night Shift Allowance", "amount": night_total,
+            "is_deduction": False, "is_taxable": True,
+            "note": f"{night_nights} night(s) worked × per-shift allowance",
+        }]
+
+    # Holiday pay — premium for working a holiday (HolidayShiftAssignment). Double-pay
+    # rule: the day is already paid in monthly salary, so we add (multiplier-1)× a
+    # day's salary (2.0× ⇒ +1 day ⇒ double pay). Re-derived each run → no double-pay.
+    hol_total, hol_worked = _holiday_premium(db, employee, year, month, monthly_gross_hint or monthly_ctc)
+    if hol_total > 0:
+        adjustments = list(adjustments) + [{
+            "code": "HOLIDAY_PAY", "adjustment_type": "HOLIDAY_PAY",
+            "title": "Holiday Pay (premium)", "amount": hol_total,
+            "is_deduction": False, "is_taxable": True,
+            "note": f"{hol_worked} holiday(s) worked × premium over normal day pay",
+        }]
+
     # Apply this employee's structure PF policy (cap at ceiling vs full Basic) for
     # this computation. cfg is shared across the batch, so set it per employee.
     cfg["PF_RESTRICT_TO_CEILING"] = pf_restrict_for(db, structure_id)
@@ -506,6 +788,27 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
         cfg=cfg, encashment_amount=encash, remaining_months=remaining_months_in_fy(month),
         adjustments=adjustments,
     )
+    # Overtime — APPROVED, not-yet-processed OT dated in this period. Appended
+    # after the slip is computed so the hourly rate can use the actual computed
+    # Basic(+DA); ×OT-rule multiplier, or the night-shift differential when the OT
+    # was worked on a night shift. Idempotent: re-derived each run, marked
+    # PROCESSED only on release (post_overtime_processed) → no double-pay.
+    ot_total, ot_hours = _overtime_pay(db, employee, year, month, result, working,
+                                       monthly_gross_hint or monthly_ctc)
+    if ot_total > 0:
+        result["lines"].append({
+            "component_id": None, "component_code": "OVERTIME",
+            "component_name": "Overtime", "component_type": ComponentType.EARNING,
+            "statutory_kind": None, "sequence": 47,
+            "full_amount": ot_total, "amount": ot_total,
+            "is_taxable": True, "is_employer_cost": False,
+            "calc_note": f"{ot_hours} OT hr(s) this period",
+        })
+        result["lines"].sort(key=lambda x: (x["sequence"], x["component_code"]))
+        result["gross_earnings"] = (Decimal(str(result["gross_earnings"])) + ot_total).quantize(Q2)
+        result["net_pay"] = (Decimal(str(result["net_pay"])) + ot_total).quantize(Q2)
+        result["ctc_value"] = (Decimal(str(result["ctc_value"])) + ot_total).quantize(Q2)
+
     result["_comp"] = comp
     result["_regime"] = regime
     result["_encash"] = encash

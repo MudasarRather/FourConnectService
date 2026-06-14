@@ -228,15 +228,41 @@ def publish_roster(
         ).first():
             skipped += 1
             continue
-        # close prior assignments overlapping this single day on a different shift
-        prior = (db.query(EmployeeShiftAssignment)
-                 .filter(EmployeeShiftAssignment.employee_id == e.employee_id,
-                         EmployeeShiftAssignment.effective_from <= e.day,
-                         or_(EmployeeShiftAssignment.effective_until.is_(None),
-                             EmployeeShiftAssignment.effective_until >= e.day)).all())
-        for p in prior:
-            if p.shift_id != e.shift_id:
+        # Every standing assignment that covers this single day.
+        covering = (db.query(EmployeeShiftAssignment)
+                    .filter(EmployeeShiftAssignment.employee_id == e.employee_id,
+                            EmployeeShiftAssignment.effective_from <= e.day,
+                            or_(EmployeeShiftAssignment.effective_until.is_(None),
+                                EmployeeShiftAssignment.effective_until >= e.day)).all())
+        # Already on this shift today (via a standing assignment or rotation
+        # window)? The roster adds nothing — don't write a duplicate row.
+        if any(p.shift_id == e.shift_id for p in covering):
+            skipped += 1
+            continue
+        # SPLIT each different-shift assignment AROUND this one day so the
+        # employee's normal shift RESUMES the next day. This is a one-day
+        # override, not a permanent truncation — coverage before and after the
+        # rostered day is preserved.
+        for p in covering:
+            if p.shift_id == e.shift_id:
+                continue
+            orig_until = p.effective_until
+            starts_on = p.effective_from == e.day
+            ends_on = orig_until == e.day
+            if starts_on and ends_on:
+                db.delete(p)                                  # was a 1-day diff-shift → replaced
+            elif starts_on:
+                p.effective_from = e.day + timedelta(days=1)  # shave the leading day
+            elif ends_on:
+                p.effective_until = e.day - timedelta(days=1)  # shave the trailing day
+            else:
+                # the day sits strictly inside [from … until] → keep the head,
+                # re-open an identical tail the day AFTER the override.
                 p.effective_until = e.day - timedelta(days=1)
+                db.add(EmployeeShiftAssignment(
+                    employee_id=p.employee_id, shift_id=p.shift_id,
+                    effective_from=e.day + timedelta(days=1), effective_until=orig_until,
+                    is_default=p.is_default, notes=p.notes, created_by_id=p.created_by_id))
         db.add(EmployeeShiftAssignment(
             employee_id=e.employee_id, shift_id=e.shift_id,
             effective_from=e.day, effective_until=e.day,

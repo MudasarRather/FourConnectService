@@ -19,7 +19,11 @@ from app.models.user import User
 from app.models.hr.employee import Employee
 from app.models.hr.shift import Shift, EmployeeShiftAssignment
 from app.models.hr.shift_swap import ShiftSwapRequest, SwapStatus
+from app.models.hr.holiday import Holiday
 from app.models.hr.attendance_log import AttendanceLogAction
+
+# Python weekday(): 0 = Monday … 6 = Sunday — matches Shift.weekly_off_days.
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 from app.schemas.hr.shift_ops import ShiftSwapCreate, SwapDecisionBody, ShiftSwapResponse
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.attendance_logic import log
@@ -40,6 +44,18 @@ def _shift_code(db: Session, shift_id) -> Optional[str]:
         return None
     row = db.query(Shift.code).filter(Shift.id == shift_id).first()
     return row[0] if row else None
+
+
+def _active_shift_on(db: Session, emp_id, day):
+    """The shift an employee is actively assigned on `day` (latest-starting window wins), or None."""
+    a = (db.query(EmployeeShiftAssignment)
+         .filter(EmployeeShiftAssignment.employee_id == emp_id,
+                 EmployeeShiftAssignment.effective_from <= day,
+                 or_(EmployeeShiftAssignment.effective_until.is_(None),
+                     EmployeeShiftAssignment.effective_until >= day))
+         .order_by(EmployeeShiftAssignment.effective_from.desc())
+         .first())
+    return a.shift_id if a else None
 
 
 def _resp(db: Session, s: ShiftSwapRequest) -> ShiftSwapResponse:
@@ -113,11 +129,45 @@ def create_swap(
     for eid in (payload.requester_employee_id, payload.counterparty_employee_id):
         if not db.query(Employee).filter(Employee.id == eid, Employee.is_deleted == False).first():  # noqa: E712
             raise HTTPException(404, "Employee not found")
+
+    # ── Integrity: you can only swap shifts the employees are ACTUALLY assigned
+    # on swap_date. Derive both authoritatively from live assignments (ignore any
+    # client-supplied shift ids) and reject impossible swaps. ──
+    req_shift = _active_shift_on(db, payload.requester_employee_id, payload.swap_date)
+    cpt_shift = _active_shift_on(db, payload.counterparty_employee_id, payload.swap_date)
+    day_str = payload.swap_date.isoformat()
+    if not req_shift:
+        raise HTTPException(409, f"{_emp_name(db, payload.requester_employee_id) or 'Requester'} has no shift assigned on {day_str}")
+    if not cpt_shift:
+        raise HTTPException(409, f"{_emp_name(db, payload.counterparty_employee_id) or 'Counterparty'} has no shift assigned on {day_str}")
+
+    # Not a public holiday — regular shifts don't run; holiday duty goes through Holiday Shifts.
+    holiday = (db.query(Holiday)
+               .filter(Holiday.date == payload.swap_date,
+                       Holiday.is_active == True, Holiday.is_deleted == False)  # noqa: E712
+               .first())
+    if holiday:
+        raise HTTPException(409, f"{day_str} is a holiday ({holiday.name}) — shifts don't run that day. Use Holiday Shifts for holiday duty.")
+
+    # Neither employee's shift may be a weekly-off on swap_date (Python weekday: 0=Mon…6=Sun).
+    weekday = payload.swap_date.weekday()
+    for emp_id, shift_id, who in (
+        (payload.requester_employee_id, req_shift, "requester"),
+        (payload.counterparty_employee_id, cpt_shift, "counterparty"),
+    ):
+        sh = db.query(Shift).filter(Shift.id == shift_id).first()
+        if sh and weekday in (sh.weekly_off_days or []):
+            name = _emp_name(db, emp_id) or who.capitalize()
+            raise HTTPException(409, f"{name}'s shift ({sh.code}) is off on {_WEEKDAYS[weekday]} (weekly off) — nothing to swap that day.")
+
+    if req_shift == cpt_shift:
+        raise HTTPException(409, "Both employees are already on the same shift that day — nothing to exchange")
+
     s = ShiftSwapRequest(
         requester_employee_id=payload.requester_employee_id,
         counterparty_employee_id=payload.counterparty_employee_id,
-        swap_date=payload.swap_date, requester_shift_id=payload.requester_shift_id,
-        counterparty_shift_id=payload.counterparty_shift_id, reason=payload.reason,
+        swap_date=payload.swap_date, requester_shift_id=req_shift,
+        counterparty_shift_id=cpt_shift, reason=payload.reason,
         status=SwapStatus.PENDING_PEER, created_by_id=admin.id)
     db.add(s)
     db.commit()
@@ -181,13 +231,15 @@ def reject_swap(swap_id: UUID, body: SwapDecisionBody = SwapDecisionBody(), db: 
 
 
 @router.post("/{swap_id}/cancel", response_model=ShiftSwapResponse)
-def cancel_swap(swap_id: UUID, db: Session = Depends(get_db), _admin: User = Depends(get_current_superuser)):
+def cancel_swap(swap_id: UUID, body: SwapDecisionBody = SwapDecisionBody(), db: Session = Depends(get_db), _admin: User = Depends(get_current_superuser)):
     s = db.query(ShiftSwapRequest).filter(ShiftSwapRequest.id == swap_id, ShiftSwapRequest.is_deleted == False).first()  # noqa: E712
     if not s:
         raise HTTPException(404, "Swap not found")
     if s.status == SwapStatus.APPROVED:
         raise HTTPException(409, "Cannot cancel an approved swap")
     s.status = SwapStatus.CANCELLED
+    if body and body.notes:
+        s.decision_notes = body.notes
     db.commit()
     db.refresh(s)
     return _resp(db, s)

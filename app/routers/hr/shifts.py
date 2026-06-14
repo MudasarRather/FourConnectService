@@ -15,7 +15,8 @@ from app.models.user import User
 from app.models.hr.employee import Employee, LifecycleState
 from app.models.hr.department import Department
 from app.models.hr.shift import Shift, EmployeeShiftAssignment, ShiftType
-from app.models.hr.holiday import Holiday
+from app.models.hr.holiday import Holiday, HolidayType
+from app.models.hr.holiday_shift import HolidayShiftAssignment
 from app.models.hr.overtime import OvertimeRequest, OtStatus
 from app.models.hr.shift_rotation import ShiftRotation
 from app.models.hr.shift_coverage import ShiftCoverageRule
@@ -177,9 +178,14 @@ def shifts_dashboard(
         .order_by(Holiday.date.asc()).first())
     holiday_shift_staff = 0
     if next_holiday:
+        # Staff genuinely working the next holiday = explicit holiday-shift
+        # overrides, NOT everyone whose regular assignment window happens to
+        # span the date. A holiday rests the workforce by default (matching the
+        # calendar + attendance rollup); only Holiday Shift rostered staff work.
         holiday_shift_staff = db.query(
-            func.count(distinct(EmployeeShiftAssignment.employee_id))
-        ).filter(_active_on(next_holiday.date)).scalar() or 0
+            func.count(distinct(HolidayShiftAssignment.employee_id))
+        ).filter(HolidayShiftAssignment.holiday_id == next_holiday.id,
+                 HolidayShiftAssignment.is_deleted == False).scalar() or 0  # noqa: E712
 
     # conflicts — employees holding >1 active assignment today
     dupes = (
@@ -316,36 +322,89 @@ def shifts_calendar(
         raise HTTPException(400, "Range too large (max 92 days)")
 
     q = (
-        db.query(EmployeeShiftAssignment, Shift, User.full_name)
+        db.query(EmployeeShiftAssignment, Shift, User.full_name, Employee.work_location_id)
         .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
         .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
         .join(User, User.id == Employee.user_id)
-        .filter(EmployeeShiftAssignment.effective_from <= to,
+        .filter(Shift.is_deleted == False,  # noqa: E712 — don't roster deleted shifts
+                Employee.is_deleted == False,  # noqa: E712 — or exited/deleted employees
+                EmployeeShiftAssignment.effective_from <= to,
                 or_(EmployeeShiftAssignment.effective_until.is_(None),
                     EmployeeShiftAssignment.effective_until >= from_)))
     if department_id:
         q = q.filter(Employee.department_id == department_id)
     rows = q.all()
 
-    hol = {h.date: h.name for h in db.query(Holiday).filter(
+    # Active holidays in range that actually rest the workforce. RESTRICTED
+    # (optional/floating) holidays are claimed per-employee, not company-wide,
+    # so — exactly like the attendance daily rollup (attendance_logic.py) — we
+    # exclude them here so they neither show a calendar-wide badge nor suppress
+    # shifts. A single date can carry more than one holiday (e.g. a company-wide
+    # one plus a location-specific one), so we keep the full list per date and
+    # resolve the location match at the individual-employee level below.
+    hol_rows = db.query(Holiday).filter(
         Holiday.is_deleted == False, Holiday.is_active == True,  # noqa: E712
-        Holiday.date >= from_, Holiday.date <= to).all()}
+        Holiday.holiday_type != HolidayType.RESTRICTED,
+        Holiday.date >= from_, Holiday.date <= to).all()
+    hol_by_date: dict = {}
+    for h in hol_rows:
+        hol_by_date.setdefault(h.date, []).append(h)
+
+    # Explicit holiday-shift overrides: employees rostered to ACTUALLY work a
+    # given holiday (with a comp rule, via the Holiday Shifts register). These
+    # stay counted as "on shift" instead of being moved to the holiday-rest
+    # bucket. Keyed by the holiday's date.
+    override_by_date: dict = {}
+    for hsa_emp_id, hsa_date in (
+        db.query(HolidayShiftAssignment.employee_id, Holiday.date)
+        .join(Holiday, Holiday.id == HolidayShiftAssignment.holiday_id)
+        .filter(HolidayShiftAssignment.is_deleted == False,  # noqa: E712
+                Holiday.is_deleted == False,  # noqa: E712
+                Holiday.date >= from_, Holiday.date <= to).all()):
+        override_by_date.setdefault(hsa_date, set()).add(hsa_emp_id)
+
+    def _holiday_name_for_day(hs: list):
+        # Prefer a company-wide holiday's name for the day badge; fall back to
+        # the first location-specific one.
+        for h in hs:
+            if h.location_id is None:
+                return h.name
+        return hs[0].name if hs else None
 
     days = []
     d = from_
     while d <= to:
         day_assigns = []
-        for a, s, name in rows:
+        day_off = []
+        day_hol_off = []
+        day_hols = hol_by_date.get(d, [])
+        overrides = override_by_date.get(d, set())
+        for a, s, name, work_location_id in rows:
             if a.effective_from <= d and (a.effective_until is None or a.effective_until >= d):
-                if s.weekly_off_days and d.weekday() in (s.weekly_off_days or []):
-                    continue  # the employee's weekly-off — not "on shift"
-                day_assigns.append(CalendarAssignment(
+                ca = CalendarAssignment(
                     employee_id=a.employee_id, employee_name=name, shift_id=s.id,
                     shift_code=s.code, shift_name=s.name, shift_type=_type_str(s.shift_type),
-                    start_time=s.start_time, end_time=s.end_time))
-        days.append(CalendarDay(date=d, weekday=d.weekday(), is_holiday=d in hol,
-                                holiday_name=hol.get(d), assignments=day_assigns,
-                                count=len(day_assigns)))
+                    start_time=s.start_time, end_time=s.end_time)
+                # A holiday rests this employee only if it applies to them:
+                # company-wide (location_id is None) OR their own work location.
+                emp_on_holiday = any(
+                    h.location_id is None or h.location_id == work_location_id
+                    for h in day_hols)
+                if emp_on_holiday and a.employee_id not in overrides:
+                    # Holiday wins over weekly-off for the rest classification,
+                    # matching attendance (holiday short-circuits before week-off).
+                    day_hol_off.append(ca)
+                elif s.weekly_off_days and d.weekday() in (s.weekly_off_days or []):
+                    day_off.append(ca)  # assigned, but it's their weekly-off — resting
+                else:
+                    # Normal working day, or an explicit holiday-shift worker.
+                    day_assigns.append(ca)
+        days.append(CalendarDay(
+            date=d, weekday=d.weekday(),
+            is_holiday=bool(day_hols), holiday_name=_holiday_name_for_day(day_hols),
+            assignments=day_assigns, count=len(day_assigns),
+            week_off=day_off, week_off_count=len(day_off),
+            holiday_off=day_hol_off, holiday_off_count=len(day_hol_off)))
         d += timedelta(days=1)
 
     return ShiftCalendarResponse(from_date=from_, to_date=to, days=days)
@@ -363,6 +422,7 @@ def list_assignments(
     employee_id: Optional[UUID] = None,
     shift_id: Optional[UUID] = None,
     active_on: Optional[date] = None,
+    upcoming: bool = False,
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
@@ -372,7 +432,11 @@ def list_assignments(
     if shift_id:
         q = q.filter(EmployeeShiftAssignment.shift_id == shift_id)
     if active_on:
-        q = q.filter(EmployeeShiftAssignment.effective_from <= active_on)
+        # Default: assignments active *on* the date. With upcoming=True, also
+        # include windows that start after the date (current + future) so a
+        # rotation's later-week shifts show as scheduled before they begin.
+        if not upcoming:
+            q = q.filter(EmployeeShiftAssignment.effective_from <= active_on)
         q = q.filter(or_(EmployeeShiftAssignment.effective_until.is_(None),
                         EmployeeShiftAssignment.effective_until >= active_on))
     rows = q.order_by(EmployeeShiftAssignment.effective_from.desc()).limit(500).all()
@@ -532,6 +596,8 @@ def bulk_assign_shift(
     target_shift = db.query(Shift).filter(Shift.id == shift_id, Shift.is_deleted == False).first()  # noqa: E712
     if not target_shift:
         raise HTTPException(404, "Shift not found")
+    if not target_shift.is_active:
+        raise HTTPException(409, "Shift is archived; reactivate it before assigning crew.")
 
     new_from = body.effective_from
     new_until = body.effective_until  # may be None for indefinite

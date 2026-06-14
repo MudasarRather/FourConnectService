@@ -80,6 +80,17 @@ class CalendarDay(BaseModel):
     holiday_name: Optional[str] = None
     assignments: List[CalendarAssignment] = Field(default_factory=list)
     count: int = 0
+    # Employees assigned to a shift whose weekly-off lands on this day (resting,
+    # not "on shift") — surfaced so the calendar can show rest coverage too.
+    week_off: List[CalendarAssignment] = Field(default_factory=list)
+    week_off_count: int = 0
+    # Employees who would normally be on shift but the day is a holiday for
+    # them (company-wide or their work-location) and they have NO explicit
+    # holiday-shift override — i.e. resting because of the holiday. Anyone WITH
+    # a HolidayShiftAssignment for this holiday stays in `assignments` (they're
+    # genuinely working). Mirrors the attendance daily-rollup holiday logic.
+    holiday_off: List[CalendarAssignment] = Field(default_factory=list)
+    holiday_off_count: int = 0
 
 
 class ShiftCalendarResponse(BaseModel):

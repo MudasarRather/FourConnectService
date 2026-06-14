@@ -62,6 +62,36 @@ def _to_response(db: Session, o: OvertimeRequest) -> OvertimeResponse:
     )
 
 
+def _assert_not_on_full_day_leave(db: Session, employee_id: UUID, on_date: date) -> None:
+    """Reject logging/approving OT on a day the employee has APPROVED full-day leave.
+
+    A booked-off day can't also be an OT day — that would double-pay. To work
+    (and earn OT) on such a day the leave must be cancelled first, which flips
+    the day back to a worked status. Half-day leave is allowed (the employee
+    works the other half). Mirrors the leave gate in payroll/attendance.
+    """
+    from app.models.hr.leave_request import LeaveRequest
+    from app.models.hr.leave_type import LeaveStatus
+    lv = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id == employee_id,
+            LeaveRequest.from_date <= on_date,
+            LeaveRequest.to_date >= on_date,
+            LeaveRequest.status == LeaveStatus.APPROVED,
+            LeaveRequest.is_half_day == False,  # noqa: E712
+            LeaveRequest.is_deleted == False,   # noqa: E712
+        )
+        .first()
+    )
+    if lv:
+        raise HTTPException(
+            409,
+            f"Approved leave ({lv.reference_no}) covers {on_date.isoformat()} — "
+            f"cancel that day's leave before logging or approving overtime.",
+        )
+
+
 @router.get("/", response_model=OvertimeListResponse)
 def list_ot(
     status_filter: Optional[OtStatus] = Query(None, alias="status"),
@@ -91,6 +121,7 @@ def create_ot(
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
+    _assert_not_on_full_day_leave(db, payload.employee_id, payload.date)
     o = OvertimeRequest(**payload.model_dump())
     db.add(o)
     db.commit()
@@ -112,6 +143,7 @@ def approve_ot(
         raise HTTPException(409, "OT already payroll-processed; cannot change")
     if o.status != OtStatus.PENDING:
         raise HTTPException(409, f"OT already {o.status.value}")
+    _assert_not_on_full_day_leave(db, o.employee_id, o.date)
     o.status = OtStatus.APPROVED
     o.approved_by_id = admin.id
     o.approved_at = datetime.now(timezone.utc)
@@ -209,6 +241,7 @@ def create_my_ot(
     )
     if dup:
         raise HTTPException(409, f"An OT request for {payload.date.isoformat()} already exists in status {dup.status.value}.")
+    _assert_not_on_full_day_leave(db, emp.id, payload.date)
     o = OvertimeRequest(
         employee_id=emp.id,
         date=payload.date,

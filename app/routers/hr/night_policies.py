@@ -86,6 +86,8 @@ def night_roster(
         .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
         .join(User, User.id == Employee.user_id)
         .filter(Shift.shift_type == ShiftType.NIGHT,
+                Shift.is_deleted == False,  # noqa: E712 — don't roster decommissioned shifts
+                Employee.is_deleted == False,  # noqa: E712 — or exited/deleted employees
                 EmployeeShiftAssignment.effective_from <= target,
                 or_(EmployeeShiftAssignment.effective_until.is_(None),
                     EmployeeShiftAssignment.effective_until >= target)).all())

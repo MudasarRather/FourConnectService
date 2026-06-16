@@ -146,6 +146,16 @@ from app.models.hr.payroll_adjustment import (
     PayrollAdjustment, AdjustmentType, AdjustmentStatus,
 )
 
+# Reimbursements / Employee Claims module — Phase 3.5
+from app.models.hr.reimbursement_type import (
+    ClaimStatus, ClaimDecision, SettlementMethod, ClaimApproverType, ClaimAuditAction,
+)
+from app.models.hr.claim_category import ClaimCategory
+from app.models.hr.claim_policy import ClaimPolicy
+from app.models.hr.claim import Claim
+from app.models.hr.claim_settlement import ClaimSettlement
+from app.models.hr.claim_audit_log import ClaimAuditLog
+
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
 
@@ -307,4 +317,15 @@ __all__ = [
     "PayrollAdjustment",
     "AdjustmentType",
     "AdjustmentStatus",
+    # Reimbursements / Employee Claims
+    "ClaimStatus",
+    "ClaimDecision",
+    "SettlementMethod",
+    "ClaimApproverType",
+    "ClaimAuditAction",
+    "ClaimCategory",
+    "ClaimPolicy",
+    "Claim",
+    "ClaimSettlement",
+    "ClaimAuditLog",
 ]

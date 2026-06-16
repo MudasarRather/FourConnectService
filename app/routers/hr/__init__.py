@@ -61,6 +61,13 @@ from app.routers.hr.payslips import router as _payslips_router
 from app.routers.hr.payroll_adjustments import router as _payroll_adjustments_router
 from app.routers.hr.payroll_reports import router as _payroll_reports_router
 
+# Reimbursements / Employee Claims module — Phase 3.5
+from app.routers.hr.reimbursement_categories import router as _reimb_categories_router
+from app.routers.hr.reimbursement_policies import router as _reimb_policies_router
+from app.routers.hr.reimbursement_reports import router as _reimb_reports_router
+from app.routers.hr.reimbursement_self import router as _reimb_self_router
+from app.routers.hr.reimbursements import router as _reimbursements_router
+
 router = APIRouter()
 router.include_router(_dashboard_router)
 router.include_router(_employees_router)
@@ -128,3 +135,12 @@ router.include_router(_employee_compensation_router)
 router.include_router(_payroll_batches_router)
 router.include_router(_payroll_self_router)
 router.include_router(_payslips_router)
+
+# Reimbursements — register the specific prefixes (categories, policies, reports,
+# self) BEFORE the broad /hr/reimbursements router so its `/{claim_id}` route
+# never shadows /categories, /policies, /reports, /stats, etc.
+router.include_router(_reimb_categories_router)
+router.include_router(_reimb_policies_router)
+router.include_router(_reimb_reports_router)
+router.include_router(_reimb_self_router)
+router.include_router(_reimbursements_router)

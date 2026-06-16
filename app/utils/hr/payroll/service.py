@@ -687,11 +687,32 @@ def post_adjustments_paid(db: Session, batch: PayrollBatch, actor_id) -> None:
         sa_func.coalesce(PayrollAdjustment.period_month, batch.period_month) == batch.period_month,
     ).all()
     now = datetime.now(timezone.utc)
+    paid_adj_ids = []
     for r in rows:
         r.status = AdjustmentStatus.PAID
         r.paid_at = now
         r.batch_id = batch.id
         r.payroll_ref = batch.batch_no
+        paid_adj_ids.append(r.id)
+
+    # Keep reimbursement claims in lockstep: any SETTLED claim whose payroll
+    # adjustment was just paid flips to PAID with the batch's payroll ref.
+    if paid_adj_ids:
+        try:
+            from app.models.hr.claim import Claim
+            from app.models.hr.reimbursement_type import ClaimStatus
+            claims = db.query(Claim).filter(
+                Claim.payroll_adjustment_id.in_(paid_adj_ids),
+                Claim.status == ClaimStatus.SETTLED,
+                Claim.is_deleted == False,  # noqa: E712
+            ).all()
+            for c in claims:
+                c.status = ClaimStatus.PAID
+                c.paid_at = now
+                c.payroll_ref = batch.batch_no
+        except Exception:
+            # Reimbursement module may not be present in older deployments.
+            pass
 
 
 def _serialize_cfg(cfg: Dict) -> Dict:

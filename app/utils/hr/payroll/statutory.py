@@ -213,6 +213,26 @@ def _surcharge(taxable: Decimal, tax_after_rebate: Decimal, regime: str,
     return surcharge
 
 
+def old_regime_deductions(declarations: Optional[Dict], cfg: Dict) -> Decimal:
+    """Total Chapter VI-A + exemption deductions an employee declares on Form 12BB,
+    applied under the OLD regime only (the NEW regime ignores all of these). Each
+    head is capped per Indian law (FY2025-26 / AY2026-27); caps are config-driven
+    where a key exists, else a statutory default. Excludes the standard deduction
+    (handled separately). Keys mirror Form 12BB."""
+    decl = declarations or {}
+    total = Decimal("0")
+    total += min(_dec(decl.get("sec_80c")), _dec(cfg.get("SEC_80C_CAP"), "150000"))           # 80C/80CCC/80CCD(1)
+    total += min(_dec(decl.get("sec_80ccd_1b")), _dec(cfg.get("SEC_80CCD1B_CAP"), "50000"))    # NPS additional
+    total += min(_dec(decl.get("sec_80d")), _dec(cfg.get("SEC_80D_CAP"), "100000"))            # medical insurance (self+senior parents)
+    total += _dec(decl.get("sec_80e"))                                                          # education-loan interest (no cap)
+    total += _dec(decl.get("sec_80g"))                                                          # donations (simplified — no qualifying-limit math)
+    total += min(_dec(decl.get("sec_80tta")), _dec(cfg.get("SEC_80TTA_CAP"), "10000"))          # savings-interest
+    total += min(_dec(decl.get("home_loan_interest")), _dec(cfg.get("SEC_24B_CAP"), "200000"))  # Sec 24(b), self-occupied
+    total += _dec(decl.get("hra_exemption"))                                                    # HRA (employee-computed)
+    total += _dec(decl.get("lta_exemption"))                                                    # LTA
+    return total
+
+
 def calc_annual_tds(annual_gross: Decimal, regime: str, declarations: Optional[Dict], cfg: Dict) -> Decimal:
     """Annual income-tax liability (slab tax − 87A rebate + surcharge, then cess)
     for a projected annual gross. FY2025-26 / AY2026-27 rules."""
@@ -220,10 +240,7 @@ def calc_annual_tds(annual_gross: Decimal, regime: str, declarations: Optional[D
     regime = (regime or "NEW").upper()
     if regime == "OLD":
         std = _dec(cfg.get("STD_DEDUCTION_OLD"), "50000")
-        c80 = min(_dec(decl.get("sec_80c")), _dec(cfg.get("SEC_80C_CAP"), "150000"))
-        d80 = min(_dec(decl.get("sec_80d")), _dec(cfg.get("SEC_80D_CAP"), "25000"))
-        hra = _dec(decl.get("hra_exemption"))
-        taxable = annual_gross - std - c80 - d80 - hra
+        taxable = annual_gross - std - old_regime_deductions(decl, cfg)
         slabs = cfg.get("TDS_SLABS_OLD") or _DEFAULT_TDS_OLD
     else:
         std = _dec(cfg.get("STD_DEDUCTION_NEW"), "75000")

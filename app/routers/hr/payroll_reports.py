@@ -1,7 +1,7 @@
 """HR Payroll — Tax projection, TDS & compliance summaries, report exports."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 from urllib.parse import quote
@@ -18,14 +18,18 @@ from app.models.hr.employee import Employee
 from app.models.hr.employee_compensation import EmployeeCompensation, CompensationStatus
 from app.models.hr.payslip import Payslip, PayslipLine
 from app.models.hr.salary_component import StatutoryKind
+from app.models.hr.tax_document import TaxDocument, TaxDocStatus, TaxDocType
 from app.schemas.hr.payroll import (
     TaxProjectionRequest, TaxProjectionResponse, TaxRegimeResult,
     TdsSummaryResponse, ComplianceSummary, ReportIndexResponse,
+    Form16GenerateRequest, TaxDocumentResponse, TaxDocumentListResponse,
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.payroll import load_config, fy_for
-from app.utils.hr.payroll.statutory import calc_annual_tds, _dec
+from app.utils.hr.payroll.statutory import calc_annual_tds, old_regime_deductions, _dec
 from app.utils.hr.payroll.service import fy_for_period
+from app.utils.hr.tax_summary import aggregate_statutory
+from app.utils.hr.form16_pdf import render_form16_pdf
 from app.utils.hr import payroll_reports as pr
 
 router = APIRouter(prefix="/hr/payroll", tags=["HR — Payroll Reports"])
@@ -46,17 +50,19 @@ def _fy_month_range(fy: str):
 
 # ─────────────────────────── Tax projection ───────────────────────────
 
-@router.post("/tax/project", response_model=TaxProjectionResponse)
-def project_tax(payload: TaxProjectionRequest, db: Session = Depends(get_db),
-                current_user: User = Depends(get_current_superuser)):
-    emp = db.query(Employee).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first()  # noqa: E712
-    if not emp:
-        raise HTTPException(404, "Employee not found")
+def project_tax_for(db: Session, emp: Employee, annual_gross=None, declarations=None):
+    """Project annual income-tax for one employee under both regimes.
+
+    Returns ``(fiscal_year, old_result, new_result, comp)``. Shared by the admin
+    endpoint below and the self-service projection endpoint (payroll_self.py) so
+    the slab / standard-deduction logic lives in exactly one place. Falls back to
+    the employee's CTC for annual_gross and to their saved declarations when the
+    caller passes none. Never commits.
+    """
     comp = db.query(EmployeeCompensation).filter(
         EmployeeCompensation.employee_id == emp.id, EmployeeCompensation.status == CompensationStatus.ACTIVE,
         EmployeeCompensation.is_deleted == False).order_by(EmployeeCompensation.effective_from.desc()).first()  # noqa: E712
 
-    annual_gross = payload.annual_gross
     if not annual_gross:
         if comp and comp.monthly_gross:
             annual_gross = Decimal(str(comp.monthly_gross)) * 12
@@ -67,7 +73,7 @@ def project_tax(payload: TaxProjectionRequest, db: Session = Depends(get_db),
         else:
             annual_gross = Decimal("0")
     annual_gross = Decimal(str(annual_gross))
-    decl = payload.declarations or (comp.tds_declarations if comp else None) or {}
+    decl = declarations or (comp.tds_declarations if comp else None) or {}
 
     fy = fy_for(date.today())
     cfg = load_config(db, fy, None)
@@ -75,10 +81,7 @@ def project_tax(payload: TaxProjectionRequest, db: Session = Depends(get_db),
     def regime_result(regime):
         if regime == "OLD":
             std = _dec(cfg.get("STD_DEDUCTION_OLD"), "50000")
-            c80 = min(_dec(decl.get("sec_80c")), _dec(cfg.get("SEC_80C_CAP"), "150000"))
-            d80 = min(_dec(decl.get("sec_80d")), _dec(cfg.get("SEC_80D_CAP"), "25000"))
-            hra = _dec(decl.get("hra_exemption"))
-            taxable = max(Decimal("0"), annual_gross - std - c80 - d80 - hra)
+            taxable = max(Decimal("0"), annual_gross - std - old_regime_deductions(decl, cfg))
         else:
             std = _dec(cfg.get("STD_DEDUCTION_NEW"), "75000")
             taxable = max(Decimal("0"), annual_gross - std)
@@ -86,13 +89,19 @@ def project_tax(payload: TaxProjectionRequest, db: Session = Depends(get_db),
         return TaxRegimeResult(regime=regime, annual_gross=annual_gross, taxable_income=taxable,
                                annual_tax=annual_tax, monthly_tds=(annual_tax / 12).quantize(Decimal("0.01")))
 
-    old_r = regime_result("OLD")
-    new_r = regime_result("NEW")
+    return fy, regime_result("OLD"), regime_result("NEW"), comp
 
+
+@router.post("/tax/project", response_model=TaxProjectionResponse)
+def project_tax(payload: TaxProjectionRequest, db: Session = Depends(get_db),
+                current_user: User = Depends(get_current_superuser)):
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first()  # noqa: E712
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    fy, old_r, new_r, comp = project_tax_for(db, emp, payload.annual_gross, payload.declarations)
     if payload.save_declarations and comp is not None:
         comp.tds_declarations = payload.declarations  # whole reassignment → tracked by SQLAlchemy
         db.commit()
-
     return TaxProjectionResponse(
         employee_id=emp.id, employee_name=_emp_name(emp), fiscal_year=fy,
         old_regime=old_r, new_regime=new_r,
@@ -286,3 +295,89 @@ def export_report(key: str,
         headers={"Content-Disposition": f'attachment; filename="{fname}"; '
                                         f"filename*=UTF-8''{quote(fname)}"},
     )
+
+
+# ─────────────────────────── Form-16 / tax documents ───────────────────────────
+
+def _tax_doc_out(d: TaxDocument) -> dict:
+    return {
+        "id": d.id, "employee_id": d.employee_id, "fiscal_year": d.fiscal_year,
+        "doc_type": d.doc_type.value if hasattr(d.doc_type, "value") else d.doc_type,
+        "title": d.title,
+        "status": d.status.value if hasattr(d.status, "value") else d.status,
+        "tds_total": d.tds_total, "gross_total": d.gross_total,
+        "generated_at": d.generated_at, "published_at": d.published_at,
+    }
+
+
+def build_form16_pdf(db: Session, doc: TaxDocument) -> bytes:
+    """Render a Form-16 PDF for a tax-document row. Shared by the admin download
+    below and the self-service download (payroll_self.py)."""
+    emp = db.query(Employee).options(joinedload(Employee.user)).filter(Employee.id == doc.employee_id).first()
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    agg = aggregate_statutory(db, emp, doc.fiscal_year)
+    _, old_r, new_r, _ = project_tax_for(db, emp)
+    emp_regime = agg.get("regime")
+    chosen = old_r if emp_regime == "OLD" else (
+        new_r if emp_regime == "NEW" else (old_r if old_r.annual_tax < new_r.annual_tax else new_r))
+    projection = {"regime": chosen.regime, "annual_gross": chosen.annual_gross,
+                  "taxable_income": chosen.taxable_income, "annual_tax": chosen.annual_tax}
+    try:
+        return render_form16_pdf(
+            agg, employee_name=_emp_name(emp) or "Employee",
+            employee_code=getattr(emp, "employee_id", "") or "", fiscal_year=doc.fiscal_year,
+            projection=projection)
+    except OSError as exc:
+        if any(s in str(exc).lower() for s in ("libgobject", "libpango", "cannot load library")):
+            raise HTTPException(503, "WeasyPrint can't find GTK DLLs — run `python vendor/setup_gtk.py`") from exc
+        raise
+
+
+@router.post("/tax-documents/generate", response_model=TaxDocumentResponse)
+def generate_form16(payload: Form16GenerateRequest, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_superuser)):
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first()  # noqa: E712
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    fy = payload.fiscal_year or fy_for(date.today())
+    agg = aggregate_statutory(db, emp, fy)
+    doc = db.query(TaxDocument).filter(
+        TaxDocument.employee_id == emp.id, TaxDocument.fiscal_year == fy,
+        TaxDocument.doc_type == TaxDocType.FORM16, TaxDocument.is_deleted == False).first()  # noqa: E712
+    now = datetime.now(timezone.utc)
+    if not doc:
+        doc = TaxDocument(employee_id=emp.id, fiscal_year=fy, doc_type=TaxDocType.FORM16,
+                          generated_by_id=current_user.id)
+        db.add(doc)
+    doc.title = f"Form 16 · FY {fy}"
+    doc.tds_total = agg["tds"]
+    doc.gross_total = agg["gross"]
+    doc.generated_at = now
+    doc.status = TaxDocStatus.PUBLISHED if payload.publish else TaxDocStatus.DRAFT
+    doc.published_at = now if payload.publish else None
+    db.commit(); db.refresh(doc)
+    return _tax_doc_out(doc)
+
+
+@router.get("/tax-documents", response_model=TaxDocumentListResponse)
+def list_tax_documents(employee_id: Optional[UUID] = None, fiscal_year: Optional[str] = None,
+                       db: Session = Depends(get_db), current_user: User = Depends(get_current_superuser)):
+    q = db.query(TaxDocument).filter(TaxDocument.is_deleted == False)  # noqa: E712
+    if employee_id:
+        q = q.filter(TaxDocument.employee_id == employee_id)
+    if fiscal_year:
+        q = q.filter(TaxDocument.fiscal_year == fiscal_year)
+    rows = q.order_by(TaxDocument.fiscal_year.desc(), TaxDocument.created_at.desc()).all()
+    return {"items": [_tax_doc_out(d) for d in rows], "total": len(rows)}
+
+
+@router.get("/tax-documents/{doc_id}/pdf")
+def download_tax_document(doc_id: UUID, db: Session = Depends(get_db),
+                          current_user: User = Depends(get_current_superuser)):
+    doc = db.query(TaxDocument).filter(TaxDocument.id == doc_id, TaxDocument.is_deleted == False).first()  # noqa: E712
+    if not doc:
+        raise HTTPException(404, "Tax document not found")
+    pdf = build_form16_pdf(db, doc)
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="Form16-{doc.fiscal_year}.pdf"'})

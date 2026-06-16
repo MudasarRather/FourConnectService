@@ -68,6 +68,19 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Seed reimbursement defaults (claim categories + per-category policies).
+    # Idempotent — only inserts rows that don't exist yet.
+    try:
+        from app.database import SessionLocal
+        from app.utils.hr.reimbursements import seed_reimbursement_defaults
+        _db = SessionLocal()
+        try:
+            seed_reimbursement_defaults(_db)
+        finally:
+            _db.close()
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
 
 # Configure CORS — local dev origins + production frontend domains.
 # Keep this list in sync with the global exception handler below.

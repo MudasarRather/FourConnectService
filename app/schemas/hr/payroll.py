@@ -456,6 +456,54 @@ class MyAnnualEarnings(BaseModel):
     unlinked: bool = False
 
 
+class MyTaxSummary(BaseModel):
+    """Self-service: an employee's OWN statutory/tax picture for one FY,
+    aggregated from their RELEASED payslip lines (by statutory_kind)."""
+    fiscal_year: str
+    regime: Optional[str] = None
+    pan: Optional[str] = None
+    uan: Optional[str] = None
+    pf_number: Optional[str] = None
+    esic_number: Optional[str] = None
+    tds: Decimal = Decimal(0)
+    pf_employee: Decimal = Decimal(0)
+    pf_employer: Decimal = Decimal(0)
+    esi_employee: Decimal = Decimal(0)
+    esi_employer: Decimal = Decimal(0)
+    professional_tax: Decimal = Decimal(0)
+    lwf: Decimal = Decimal(0)
+    gross: Decimal = Decimal(0)
+    total_deductions: Decimal = Decimal(0)
+    net_pay: Decimal = Decimal(0)
+    slips_count: int = 0
+    months: List[Dict[str, Any]] = Field(default_factory=list)  # [{month, year, label, tds, pf, esi, pt, gross}]
+    declarations: Optional[Dict[str, Any]] = None   # the employee's saved Form-12BB heads (prefill)
+    unlinked: bool = False
+
+
+class MyTaxDeclarations(BaseModel):
+    """Self-service Form 12BB (Rule 26C) — the investment / exemption declaration the
+    employee submits to the employer. Saved to EmployeeCompensation.tds_declarations
+    (+ tax_regime). All amounts optional; the OLD regime applies them (with statutory
+    caps), the NEW regime ignores them."""
+    sec_80c: Optional[Decimal] = None            # 80C/80CCC/80CCD(1) — cap 1.5L
+    sec_80ccd_1b: Optional[Decimal] = None       # 80CCD(1B) NPS — cap 50k
+    sec_80d: Optional[Decimal] = None            # medical insurance
+    sec_80e: Optional[Decimal] = None            # education-loan interest
+    sec_80g: Optional[Decimal] = None            # donations
+    sec_80tta: Optional[Decimal] = None          # savings-interest — cap 10k
+    home_loan_interest: Optional[Decimal] = None  # Sec 24(b) — cap 2L
+    hra_exemption: Optional[Decimal] = None      # HRA
+    lta_exemption: Optional[Decimal] = None      # LTA
+    tax_regime: Optional[str] = None             # "OLD" | "NEW"
+
+
+class MyTaxProjectionRequest(BaseModel):
+    """Live (non-persisting) tax projection for the current employee."""
+    annual_gross: Optional[Decimal] = None
+    declarations: Optional[Dict[str, Any]] = None
+
+
 # ═══════════════════════════ Statutory Config ═══════════════════════════
 
 class StatutoryConfigCreate(BaseModel):
@@ -655,6 +703,34 @@ class ComplianceSummary(BaseModel):
     professional_tax: Decimal
     tds: Decimal
     total_statutory: Decimal
+
+
+# ─────────────────────────── Tax documents (Form-16 / TDS certs) ───────────────────────────
+
+class TaxDocumentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    employee_id: UUID
+    fiscal_year: str
+    doc_type: str
+    title: Optional[str] = None
+    status: str
+    tds_total: Decimal = Decimal(0)
+    gross_total: Decimal = Decimal(0)
+    generated_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
+
+
+class TaxDocumentListResponse(BaseModel):
+    items: List[TaxDocumentResponse]
+    total: int
+    unlinked: bool = False
+
+
+class Form16GenerateRequest(BaseModel):
+    employee_id: UUID
+    fiscal_year: Optional[str] = None
+    publish: bool = True
 
 
 class ReportInfo(BaseModel):

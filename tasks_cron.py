@@ -31,6 +31,12 @@ def run_cron():
         n = finalize_due_attendance(db)
         print(f"- Attendance finalizer processed {n} record(s) for today.")
 
+        # 5. Training & Development: certification-expiry sweep + compliance
+        #    auto-reassign (also runs in-process on a 6-hour thread).
+        from app.utils.hr.training.expiry_monitor import run_training_maintenance
+        tr = run_training_maintenance(db)
+        print(f"- Training maintenance: {tr}")
+
         print("Success: All transitions processed.")
     except Exception as e:
         print(f"Error during task transitions: {e}")

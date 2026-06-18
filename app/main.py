@@ -45,6 +45,23 @@ app = FastAPI(
 @app.on_event("startup")
 def startup_db():
     Base.metadata.create_all(bind=engine)
+    # Training & Development (Phase 5): add additive columns to the existing
+    # hr_training_* tables that create_all() can't add. Idempotent + fully guarded.
+    try:
+        from app.utils.hr.training.migrate import ensure_training_columns
+        ensure_training_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Start the certification-expiry monitor + compliance auto-reassign engine on a
+    # daily-ish cadence. Both run on their own NullPool engine, are idempotent, and
+    # are fully guarded so they can never block boot or contend with StaticPool.
+    try:
+        from app.utils.hr.training.expiry_monitor import start_training_monitor
+        start_training_monitor(6 * 3600)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     # Start the shift-end attendance finalizer (classifies un-actioned days as
     # ABSENT / HALF_DAY / WEEK_OFF / … shortly after each shift ends). Fully
     # guarded + runs on its own NullPool engine so it can never block boot or

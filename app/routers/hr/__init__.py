@@ -18,6 +18,24 @@ from app.routers.hr.onboarding_documents import router as _onb_documents_router
 from app.routers.hr.identity import router as _identity_router
 from app.routers.hr.assets import router as _assets_router
 from app.routers.hr.training import router as _training_router
+# Training & Development module — Phase 5 (Learning Observatory / LTCMS).
+# All share prefix /hr/training (distinct literal roots) + a self-service
+# /hr/me/training router; registered BEFORE the broad _training_router below.
+from app.routers.hr.training_dashboard import router as _training_dashboard_router
+from app.routers.hr.training_skills import router as _training_skills_router
+from app.routers.hr.training_certifications import router as _training_certifications_router
+from app.routers.hr.training_compliance import router as _training_compliance_router
+from app.routers.hr.training_requests import router as _training_requests_router
+from app.routers.hr.training_trainers import router as _training_trainers_router
+from app.routers.hr.training_materials import router as _training_materials_router
+from app.routers.hr.training_feedback import router as _training_feedback_router
+from app.routers.hr.training_audit import router as _training_audit_router
+# Training & Development — Phase 2 (Assessments, Budget, Calendar, Reports)
+from app.routers.hr.training_assessments import router as _training_assessments_router
+from app.routers.hr.training_budget import router as _training_budget_router
+from app.routers.hr.training_calendar import router as _training_calendar_router
+from app.routers.hr.training_reports import router as _training_reports_router
+from app.routers.hr.training_self import router as _training_self_router
 from app.routers.hr.induction import router as _induction_router
 from app.routers.hr.account_provisioning import router as _account_provisioning_router
 from app.routers.hr.welcome_kit import router as _welcome_kit_router
@@ -80,6 +98,25 @@ router.include_router(_onboarding_router)
 router.include_router(_onb_documents_router)
 router.include_router(_identity_router)
 router.include_router(_assets_router)
+# Training & Development — register the specific training sub-routers (dashboard,
+# skills, certifications, compliance, requests, trainers, materials, feedback,
+# audit) and the self-service router BEFORE the broad _training_router so its
+# /programs/{program_id} & /assignments/{assignment_id} routes never shadow the
+# new literal roots (/stats, /skills, /certifications, /compliance, /requests, …).
+router.include_router(_training_dashboard_router)
+router.include_router(_training_skills_router)
+router.include_router(_training_certifications_router)
+router.include_router(_training_compliance_router)
+router.include_router(_training_requests_router)
+router.include_router(_training_trainers_router)
+router.include_router(_training_materials_router)
+router.include_router(_training_feedback_router)
+router.include_router(_training_audit_router)
+router.include_router(_training_assessments_router)
+router.include_router(_training_budget_router)
+router.include_router(_training_calendar_router)
+router.include_router(_training_reports_router)
+router.include_router(_training_self_router)
 router.include_router(_training_router)
 router.include_router(_induction_router)
 router.include_router(_account_provisioning_router)

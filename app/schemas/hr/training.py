@@ -21,6 +21,8 @@ class TrainingProgramCreate(BaseModel):
     certification_required: bool = False
     is_mandatory_for_new_joiners: bool = False
     materials_url: Optional[str] = None
+    delivery_mode: Optional[str] = None
+    is_compliance: bool = False
 
 
 class TrainingProgramUpdate(BaseModel):
@@ -33,6 +35,8 @@ class TrainingProgramUpdate(BaseModel):
     certification_required: Optional[bool] = None
     is_mandatory_for_new_joiners: Optional[bool] = None
     materials_url: Optional[str] = None
+    delivery_mode: Optional[str] = None
+    is_compliance: Optional[bool] = None
     is_active: Optional[bool] = None
 
 
@@ -49,8 +53,11 @@ class TrainingProgramResponse(BaseModel):
     certification_required: bool
     is_mandatory_for_new_joiners: bool
     materials_url: Optional[str] = None
+    delivery_mode: Optional[str] = None
+    is_compliance: Optional[bool] = None
     is_active: bool
     created_at: datetime
+    enrollment_count: int = 0
 
 
 class TrainingAssignmentCreate(BaseModel):
@@ -86,3 +93,4 @@ class TrainingAssignmentResponse(BaseModel):
     score: Optional[Decimal] = None
     certification_url: Optional[str] = None
     notes: Optional[str] = None
+    feedback_submitted: Optional[bool] = None

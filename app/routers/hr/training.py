@@ -20,6 +20,8 @@ from app.schemas.hr.training import (
     TrainingProgramCreate, TrainingProgramUpdate, TrainingProgramResponse,
     TrainingAssignmentCreate, TrainingAssignmentUpdate, TrainingAssignmentResponse,
 )
+from app.models.hr.training_audit_log import TrainingAuditAction
+from app.utils.hr.training.audit import write_training_audit
 from app.utils.dependencies import get_current_superuser
 
 
@@ -45,6 +47,47 @@ def _emp_name(db: Session, eid: Optional[UUID]) -> Optional[str]:
     return r[0] if r else None
 
 
+def _program_response(db: Session, p: TrainingProgram, enrollment_count: int = 0) -> TrainingProgramResponse:
+    """Single source of truth for the outbound program shape."""
+    return TrainingProgramResponse(
+        id=p.id, name=p.name, code=p.code, training_type=p.training_type,
+        description=p.description, duration_hours=p.duration_hours,
+        trainer_user_id=p.trainer_user_id, trainer_name=_user_name(db, p.trainer_user_id),
+        certification_required=p.certification_required,
+        is_mandatory_for_new_joiners=p.is_mandatory_for_new_joiners,
+        materials_url=p.materials_url, delivery_mode=p.delivery_mode,
+        is_compliance=bool(p.is_compliance), is_active=p.is_active,
+        created_at=p.created_at, enrollment_count=enrollment_count,
+    )
+
+
+def _enrollment_count(db: Session, program_id: UUID) -> int:
+    return (
+        db.query(func.count(TrainingAssignment.id))
+        .filter(TrainingAssignment.program_id == program_id)
+        .scalar()
+    ) or 0
+
+
+# In-flight states. Only these block archiving a program — COMPLETED / FAILED /
+# WAIVED are terminal *history* that must be preserved, so they never block.
+_ACTIVE_ASSIGNMENT_STATUSES = (
+    TrainingAssignmentStatus.NOT_STARTED,
+    TrainingAssignmentStatus.IN_PROGRESS,
+)
+
+
+def _active_enrollment_count(db: Session, program_id: UUID) -> int:
+    return (
+        db.query(func.count(TrainingAssignment.id))
+        .filter(
+            TrainingAssignment.program_id == program_id,
+            TrainingAssignment.status.in_(_ACTIVE_ASSIGNMENT_STATUSES),
+        )
+        .scalar()
+    ) or 0
+
+
 @router.get("/programs", response_model=List[TrainingProgramResponse])
 def list_programs(
     training_type: Optional[TrainingType] = None,
@@ -58,16 +101,13 @@ def list_programs(
     if mandatory_only:
         q = q.filter(TrainingProgram.is_mandatory_for_new_joiners == True)  # noqa: E712
     rows = q.order_by(TrainingProgram.created_at.desc()).all()
-    return [
-        TrainingProgramResponse(
-            id=p.id, name=p.name, code=p.code, training_type=p.training_type,
-            description=p.description, duration_hours=p.duration_hours,
-            trainer_user_id=p.trainer_user_id, trainer_name=_user_name(db, p.trainer_user_id),
-            certification_required=p.certification_required,
-            is_mandatory_for_new_joiners=p.is_mandatory_for_new_joiners,
-            materials_url=p.materials_url, is_active=p.is_active, created_at=p.created_at,
-        ) for p in rows
-    ]
+    # One grouped count query for all programs — avoids an N+1 per card.
+    counts = dict(
+        db.query(TrainingAssignment.program_id, func.count(TrainingAssignment.id))
+        .group_by(TrainingAssignment.program_id)
+        .all()
+    )
+    return [_program_response(db, p, counts.get(p.id, 0)) for p in rows]
 
 
 @router.post("/programs", response_model=TrainingProgramResponse, status_code=http_status.HTTP_201_CREATED)
@@ -80,16 +120,15 @@ def create_program(
         raise HTTPException(400, "Program name already exists")
     p = TrainingProgram(**payload.model_dump(), created_by_id=admin.id)
     db.add(p)
+    db.flush()
+    write_training_audit(
+        db, entity_type="PROGRAM", entity_id=p.id, action=TrainingAuditAction.CREATE,
+        actor_id=admin.id, note=f"Created program “{p.name}”",
+        payload={"training_type": str(p.training_type), "code": p.code},
+    )
     db.commit()
     db.refresh(p)
-    return TrainingProgramResponse(
-        id=p.id, name=p.name, code=p.code, training_type=p.training_type,
-        description=p.description, duration_hours=p.duration_hours,
-        trainer_user_id=p.trainer_user_id, trainer_name=_user_name(db, p.trainer_user_id),
-        certification_required=p.certification_required,
-        is_mandatory_for_new_joiners=p.is_mandatory_for_new_joiners,
-        materials_url=p.materials_url, is_active=p.is_active, created_at=p.created_at,
-    )
+    return _program_response(db, p, 0)
 
 
 @router.patch("/programs/{program_id}", response_model=TrainingProgramResponse)
@@ -102,41 +141,48 @@ def update_program(
     p = db.query(TrainingProgram).filter(TrainingProgram.id == program_id, TrainingProgram.is_deleted == False).first()  # noqa: E712
     if not p:
         raise HTTPException(404, "Program not found")
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    for k, v in changes.items():
         setattr(p, k, v)
+    write_training_audit(
+        db, entity_type="PROGRAM", entity_id=p.id, action=TrainingAuditAction.UPDATE,
+        actor_id=_admin.id, note=f"Updated program “{p.name}”",
+        payload={"fields": sorted(changes.keys())},
+    )
     db.commit()
     db.refresh(p)
-    return TrainingProgramResponse(
-        id=p.id, name=p.name, code=p.code, training_type=p.training_type,
-        description=p.description, duration_hours=p.duration_hours,
-        trainer_user_id=p.trainer_user_id, trainer_name=_user_name(db, p.trainer_user_id),
-        certification_required=p.certification_required,
-        is_mandatory_for_new_joiners=p.is_mandatory_for_new_joiners,
-        materials_url=p.materials_url, is_active=p.is_active, created_at=p.created_at,
-    )
+    return _program_response(db, p, _enrollment_count(db, p.id))
 
 
 @router.delete("/programs/{program_id}", status_code=http_status.HTTP_204_NO_CONTENT)
 def delete_program(
     program_id: UUID,
+    reason: Optional[str] = Query(None, max_length=60),
+    note: Optional[str] = Query(None, max_length=240),
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
-    p = db.query(TrainingProgram).filter(TrainingProgram.id == program_id).first()
+    p = db.query(TrainingProgram).filter(
+        TrainingProgram.id == program_id, TrainingProgram.is_deleted == False,  # noqa: E712
+    ).first()
     if not p:
         raise HTTPException(404, "Not found")
-    active = (
-        db.query(func.count(TrainingAssignment.id))
-        .filter(TrainingAssignment.program_id == program_id)
-        .scalar()
-    )
+    active = _active_enrollment_count(db, program_id)
     if active:
         raise HTTPException(
             409,
-            f"Cannot delete a program with {active} assignment(s); "
-            "remove the assignees from this training first.",
+            f"Cannot archive — {active} learner(s) still in progress. "
+            "Complete, waive, or un-enrol them first. Finished records are kept.",
         )
     p.is_deleted = True
+    audit_note = f"Archived program “{p.name}”"
+    if reason:
+        audit_note += f" · {reason}"
+    write_training_audit(
+        db, entity_type="PROGRAM", entity_id=p.id, action=TrainingAuditAction.DELETE,
+        actor_id=_admin.id, note=audit_note[:300],
+        payload={"reason": reason, "note": note, "name": p.name},
+    )
     db.commit()
 
 
@@ -146,6 +192,7 @@ def delete_program(
 def list_assignments(
     employee_id: Optional[UUID] = None,
     process_id: Optional[UUID] = None,
+    program_id: Optional[UUID] = None,
     assignment_status: Optional[TrainingAssignmentStatus] = None,
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
@@ -157,6 +204,8 @@ def list_assignments(
         q = q.filter(TrainingAssignment.employee_id == employee_id)
     if process_id:
         q = q.filter(TrainingAssignment.process_id == process_id)
+    if program_id:
+        q = q.filter(TrainingAssignment.program_id == program_id)
     if assignment_status:
         q = q.filter(TrainingAssignment.status == assignment_status)
     rows = q.order_by(TrainingAssignment.created_at.desc()).limit(500).all()
@@ -236,11 +285,23 @@ def update_assignment(
 @router.delete("/assignments/{assignment_id}", status_code=http_status.HTTP_204_NO_CONTENT)
 def delete_assignment(
     assignment_id: UUID,
+    reason: Optional[str] = Query(None, max_length=60),
+    note: Optional[str] = Query(None, max_length=240),
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
     a = db.query(TrainingAssignment).filter(TrainingAssignment.id == assignment_id).first()
     if not a:
         raise HTTPException(404, "Not found")
+    p = db.query(TrainingProgram).filter(TrainingProgram.id == a.program_id).first()
+    emp = _emp_name(db, a.employee_id)
+    audit_note = f"Un-enrolled {emp or 'employee'} from “{p.name if p else 'program'}”"
+    if reason:
+        audit_note += f" · {reason}"
+    write_training_audit(
+        db, entity_type="ASSIGNMENT", entity_id=a.id, action=TrainingAuditAction.DELETE,
+        actor_id=_admin.id, from_status=str(a.status), note=audit_note[:300],
+        payload={"reason": reason, "note": note, "program": p.name if p else None, "employee": emp},
+    )
     db.delete(a)
     db.commit()

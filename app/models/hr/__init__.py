@@ -79,6 +79,28 @@ from app.models.hr.training import (
     TrainingType,
     TrainingAssignmentStatus,
 )
+# Training & Development module — Phase 5 (Learning Observatory / LTCMS)
+from app.models.hr.skill import (
+    Skill, EmployeeSkill, SkillRequirement, SkillCategory, SkillSource,
+)
+from app.models.hr.certification import (
+    Certification, EmployeeCertification, CertificationStatus,
+)
+from app.models.hr.compliance_training import (
+    ComplianceTraining, ComplianceFrequency, FREQUENCY_MONTHS,
+)
+from app.models.hr.training_request import (
+    TrainingRequest, TrainingRequestStatus, TrainingRequestDecision,
+)
+from app.models.hr.trainer import Trainer, TrainerType
+from app.models.hr.training_material import TrainingMaterial, MaterialType
+from app.models.hr.training_feedback import TrainingFeedback
+from app.models.hr.training_audit_log import TrainingAuditLog, TrainingAuditAction
+# Training & Development — Phase 2 (Assessments + Budget)
+from app.models.hr.assessment import Assessment, AssessmentResult, AssessmentType
+from app.models.hr.training_budget import (
+    TrainingBudget, TrainingBudgetItem, BudgetPeriodType, BudgetCostType,
+)
 from app.models.hr.induction import (
     InductionSession,
     InductionAttendance,
@@ -231,6 +253,35 @@ __all__ = [
     "TrainingAssignment",
     "TrainingType",
     "TrainingAssignmentStatus",
+    # Training & Development (Phase 5 — LTCMS)
+    "Skill",
+    "EmployeeSkill",
+    "SkillRequirement",
+    "SkillCategory",
+    "SkillSource",
+    "Certification",
+    "EmployeeCertification",
+    "CertificationStatus",
+    "ComplianceTraining",
+    "ComplianceFrequency",
+    "FREQUENCY_MONTHS",
+    "TrainingRequest",
+    "TrainingRequestStatus",
+    "TrainingRequestDecision",
+    "Trainer",
+    "TrainerType",
+    "TrainingMaterial",
+    "MaterialType",
+    "TrainingFeedback",
+    "TrainingAuditLog",
+    "TrainingAuditAction",
+    "Assessment",
+    "AssessmentResult",
+    "AssessmentType",
+    "TrainingBudget",
+    "TrainingBudgetItem",
+    "BudgetPeriodType",
+    "BudgetCostType",
     # Induction
     "InductionSession",
     "InductionAttendance",

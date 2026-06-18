@@ -47,6 +47,12 @@ class TrainingProgram(Base):
     certification_required = Column(Boolean, default=False, nullable=False)
     is_mandatory_for_new_joiners = Column(Boolean, default=False, nullable=False, index=True)
     materials_url = Column(String(600), nullable=True)
+    # ── Training & Development (Phase 5) additive columns ──
+    # Nullable / defaulted so existing rows + the onboarding flow are unaffected.
+    # NOTE: create_all() won't ALTER existing tables — `add_training_columns.py`
+    # (and ensure_training_columns() at startup) add these on the live DB.
+    delivery_mode = Column(String(30), nullable=True)        # CLASSROOM | ONLINE | BLENDED | SELF_PACED | WORKSHOP | WEBINAR
+    is_compliance = Column(Boolean, default=False, nullable=True)  # fast filter; authoritative config in hr_compliance_trainings
     is_active = Column(Boolean, default=True, nullable=False)
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -72,6 +78,12 @@ class TrainingAssignment(Base):
     score = Column(Numeric(5, 2), nullable=True)
     certification_url = Column(String(600), nullable=True)
     notes = Column(Text, nullable=True)
+    # ── Training & Development (Phase 5) additive columns ──
+    # ONBOARDING | COMPLIANCE | REQUEST | MANUAL | SELF — distinguishes career
+    # enrollments from onboarding ones (NULL == legacy/onboarding).
+    enrollment_source = Column(String(30), nullable=True)
+    valid_until = Column(Date, nullable=True)            # completion validity (compliance / cert expiry)
+    feedback_submitted = Column(Boolean, default=False, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

@@ -53,6 +53,15 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Asset Management (Phase 5 "Asset Hangar"): add additive columns to the
+    # existing hr_assets table that create_all() can't add. Idempotent + guarded.
+    try:
+        from app.utils.hr.assets.migrate import ensure_asset_columns, ensure_asset_enum_values
+        ensure_asset_columns(engine)
+        ensure_asset_enum_values(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     # Start the certification-expiry monitor + compliance auto-reassign engine on a
     # daily-ish cadence. Both run on their own NullPool engine, are idempotent, and
     # are fully guarded so they can never block boot or contend with StaticPool.

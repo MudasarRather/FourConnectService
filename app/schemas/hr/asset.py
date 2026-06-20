@@ -11,7 +11,29 @@ from app.models.hr.asset import (
 )
 
 
-class AssetCreate(BaseModel):
+class _AssetExtras(BaseModel):
+    """Lifecycle/procurement fields shared by Create + Update (all optional)."""
+    category_id: Optional[UUID] = None
+    vendor_id: Optional[UUID] = None
+    department_id: Optional[UUID] = None
+    project_id: Optional[UUID] = None
+    purchase_order_no: Optional[str] = None
+    invoice_no: Optional[str] = None
+    warranty_start: Optional[date] = None
+    warranty_end: Optional[date] = None
+    depreciation_method: Optional[str] = None
+    salvage_value: Optional[Decimal] = None
+    current_book_value: Optional[Decimal] = None
+    building: Optional[str] = None
+    floor: Optional[str] = None
+    room: Optional[str] = None
+    tag: Optional[str] = None
+    photo_path: Optional[str] = None
+    invoice_path: Optional[str] = None
+    warranty_doc_path: Optional[str] = None
+
+
+class AssetCreate(_AssetExtras):
     asset_code: str
     asset_type: AssetType
     brand: Optional[str] = None
@@ -25,8 +47,9 @@ class AssetCreate(BaseModel):
     notes: Optional[str] = None
 
 
-class AssetUpdate(BaseModel):
+class AssetUpdate(_AssetExtras):
     asset_code: Optional[str] = None
+    asset_type: Optional[AssetType] = None
     brand: Optional[str] = None
     model: Optional[str] = None
     serial_number: Optional[str] = None
@@ -54,6 +77,27 @@ class AssetResponse(BaseModel):
     assigned_employee_name: Optional[str] = None
     location_id: Optional[UUID] = None
     notes: Optional[str] = None
+    # Lifecycle / procurement extensions
+    category_id: Optional[UUID] = None
+    category_name: Optional[str] = None
+    vendor_id: Optional[UUID] = None
+    vendor_name: Optional[str] = None
+    department_id: Optional[UUID] = None
+    project_id: Optional[UUID] = None
+    purchase_order_no: Optional[str] = None
+    invoice_no: Optional[str] = None
+    warranty_start: Optional[date] = None
+    warranty_end: Optional[date] = None
+    depreciation_method: Optional[str] = None
+    salvage_value: Optional[Decimal] = None
+    current_book_value: Optional[Decimal] = None
+    building: Optional[str] = None
+    floor: Optional[str] = None
+    room: Optional[str] = None
+    tag: Optional[str] = None
+    photo_path: Optional[str] = None
+    invoice_path: Optional[str] = None
+    warranty_doc_path: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -82,12 +126,22 @@ class AssetAllocationReturnBody(BaseModel):
     notes: Optional[str] = None
 
 
+class ReturnRequestBody(BaseModel):
+    """Employee self-service return request — a note for HR, no authoritative state."""
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
 class AssetAllocationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     asset_id: UUID
     asset_code: Optional[str] = None
     asset_type: Optional[AssetType] = None
+    # Asset descriptors (additive — power the holding-card detail view; non-financial).
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    warranty_end: Optional[date] = None
     employee_id: UUID
     employee_name: Optional[str] = None
     process_id: Optional[UUID] = None
@@ -99,5 +153,9 @@ class AssetAllocationResponse(BaseModel):
     status: AllocationStatus
     acknowledged_by_employee: bool
     acknowledged_at: Optional[datetime] = None
+    # Self-service return request (employee-flagged; HR completes from Returns tab).
+    return_requested: bool = False
+    return_requested_at: Optional[datetime] = None
+    return_request_note: Optional[str] = None
     notes: Optional[str] = None
     created_at: datetime

@@ -17,6 +17,22 @@ from app.routers.hr.onboarding import router as _onboarding_router
 from app.routers.hr.onboarding_documents import router as _onb_documents_router
 from app.routers.hr.identity import router as _identity_router
 from app.routers.hr.assets import router as _assets_router
+# Asset Management — Phase 5 ("Asset Hangar"). Distinct-prefix sub-routers
+# (categories, vendors, transfers, maintenance, damages) + a self-service
+# /hr/me/assets router. The broad _assets_router declares its literal /stats,
+# /allocations and /{asset_id}/history routes BEFORE its /{asset_id} catch-all,
+# so registration order vs. _assets_router doesn't matter here.
+from app.routers.hr.asset_categories import router as _asset_categories_router
+from app.routers.hr.asset_vendors import router as _asset_vendors_router
+from app.routers.hr.asset_transfers import router as _asset_transfers_router
+from app.routers.hr.asset_maintenance import router as _asset_maintenance_router
+from app.routers.hr.asset_damages import router as _asset_damages_router
+from app.routers.hr.asset_self import router as _asset_self_router
+# Asset Management Phase 2 — audits, disposal, reports. The reports router shares
+# the /hr/assets root, so it registers BEFORE the broad _assets_router below.
+from app.routers.hr.asset_audits import router as _asset_audits_router
+from app.routers.hr.asset_disposals import router as _asset_disposals_router
+from app.routers.hr.asset_reports import router as _asset_reports_router
 from app.routers.hr.training import router as _training_router
 # Training & Development module — Phase 5 (Learning Observatory / LTCMS).
 # All share prefix /hr/training (distinct literal roots) + a self-service
@@ -97,7 +113,21 @@ router.include_router(_recruitment_router)
 router.include_router(_onboarding_router)
 router.include_router(_onb_documents_router)
 router.include_router(_identity_router)
+# Asset reports sub-router (prefix /hr/assets/reports) registers BEFORE the broad
+# _assets_router so /reports/... isn't shadowed by its /{asset_id} route.
+router.include_router(_asset_reports_router)
 router.include_router(_assets_router)
+# Asset Management — distinct prefixes (/hr/asset-categories, /hr/asset-vendors,
+# /hr/asset-transfers, /hr/asset-maintenance, /hr/asset-damages, /hr/asset-audits,
+# /hr/asset-disposals, /hr/me/assets).
+router.include_router(_asset_categories_router)
+router.include_router(_asset_vendors_router)
+router.include_router(_asset_transfers_router)
+router.include_router(_asset_maintenance_router)
+router.include_router(_asset_damages_router)
+router.include_router(_asset_audits_router)
+router.include_router(_asset_disposals_router)
+router.include_router(_asset_self_router)
 # Training & Development — register the specific training sub-routers (dashboard,
 # skills, certifications, compliance, requests, trainers, materials, feedback,
 # audit) and the self-service router BEFORE the broad _training_router so its

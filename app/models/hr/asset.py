@@ -73,6 +73,28 @@ class Asset(Base):
     status = Column(Enum(AssetStatus, name="hr_asset_status"), nullable=False, default=AssetStatus.AVAILABLE, index=True)
     assigned_employee_id = Column(UUID(as_uuid=True), ForeignKey("hr_employees.id"), nullable=True, index=True)
     location_id = Column(UUID(as_uuid=True), ForeignKey("hr_work_locations.id"), nullable=True)
+
+    # ── Lifecycle extensions (Phase 5 Asset Hangar). All additive / nullable so the
+    # idempotent migrate (app/utils/hr/assets/migrate.py) can backfill the live DB. ──
+    category_id = Column(UUID(as_uuid=True), ForeignKey("hr_asset_categories.id"), nullable=True, index=True)
+    vendor_id = Column(UUID(as_uuid=True), ForeignKey("hr_asset_vendors.id"), nullable=True, index=True)
+    department_id = Column(UUID(as_uuid=True), ForeignKey("hr_departments.id"), nullable=True, index=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True, index=True)
+    purchase_order_no = Column(String(60), nullable=True)
+    invoice_no = Column(String(60), nullable=True)
+    warranty_start = Column(Date, nullable=True)
+    warranty_end = Column(Date, nullable=True, index=True)
+    depreciation_method = Column(String(30), nullable=True)
+    salvage_value = Column(Numeric(12, 2), nullable=True)
+    current_book_value = Column(Numeric(12, 2), nullable=True)
+    building = Column(String(80), nullable=True)
+    floor = Column(String(40), nullable=True)
+    room = Column(String(40), nullable=True)
+    tag = Column(String(80), nullable=True, index=True)  # barcode / QR / asset tag — distinct from asset_code
+    photo_path = Column(String(300), nullable=True)
+    invoice_path = Column(String(300), nullable=True)
+    warranty_doc_path = Column(String(300), nullable=True)
+
     notes = Column(Text, nullable=True)
     extra = Column(JSONB, default=dict, nullable=False)
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
@@ -81,6 +103,8 @@ class Asset(Base):
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
     assigned_employee = relationship("Employee", foreign_keys=[assigned_employee_id])
+    category = relationship("AssetCategory", foreign_keys=[category_id])
+    vendor = relationship("Vendor", foreign_keys=[vendor_id])
 
     __table_args__ = (
         Index("ix_hr_assets_type_status", "asset_type", "status"),
@@ -104,6 +128,11 @@ class AssetAllocation(Base):
     status = Column(Enum(AllocationStatus, name="hr_asset_allocation_status"), nullable=False, default=AllocationStatus.ALLOCATED, index=True)
     acknowledged_by_employee = Column(Boolean, default=False, nullable=False)
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    # ── Self-service return request (employee flags it; HR completes it from the
+    # Returns tab). Additive / defaulted so the idempotent migrate can backfill. ──
+    return_requested = Column(Boolean, default=False, nullable=False, server_default="false")
+    return_requested_at = Column(DateTime(timezone=True), nullable=True)
+    return_request_note = Column(Text, nullable=True)
     issued_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     returned_to_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     notes = Column(Text, nullable=True)

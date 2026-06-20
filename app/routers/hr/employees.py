@@ -795,6 +795,14 @@ def lifecycle_exit(
         actor_id=admin.id, reason=body.reason,
         effective_date=body.exit_date,
     )
+    # Asset offboarding: surface the exiting employee's still-held assets as
+    # return-to-store tasks. Fully guarded — never blocks the exit flow.
+    try:
+        from app.utils.hr.assets.offboarding import flag_open_allocations_on_exit
+        flag_open_allocations_on_exit(db, emp.id, admin.id)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     db.commit()
     db.refresh(emp)
     return _to_detail(emp, reveal_bank=False)

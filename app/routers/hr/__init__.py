@@ -102,6 +102,14 @@ from app.routers.hr.reimbursement_reports import router as _reimb_reports_router
 from app.routers.hr.reimbursement_self import router as _reimb_self_router
 from app.routers.hr.reimbursements import router as _reimbursements_router
 
+# Travel Management module — Phase 4.0 (Aviation Command Deck)
+from app.routers.hr.travel_categories import router as _travel_categories_router
+from app.routers.hr.travel_policies import router as _travel_policies_router
+from app.routers.hr.travel_da_rates import router as _travel_da_rates_router
+from app.routers.hr.travel_reports import router as _travel_reports_router
+from app.routers.hr.travel_self import router as _travel_self_router
+from app.routers.hr.travel import router as _travel_router
+
 router = APIRouter()
 router.include_router(_dashboard_router)
 router.include_router(_employees_router)
@@ -211,3 +219,14 @@ router.include_router(_reimb_policies_router)
 router.include_router(_reimb_reports_router)
 router.include_router(_reimb_self_router)
 router.include_router(_reimbursements_router)
+
+# Travel Management — register the specific prefixes (categories, policies, da-rates,
+# reports, self) BEFORE the broad /hr/travel router. The broad router declares its
+# literal roots (/stats, /queue, /bookings, /advances, /da, /settlements, …) and a
+# /{request_id:uuid} converter, so the catch-all never shadows /reports etc.
+router.include_router(_travel_categories_router)
+router.include_router(_travel_policies_router)
+router.include_router(_travel_da_rates_router)
+router.include_router(_travel_reports_router)
+router.include_router(_travel_self_router)
+router.include_router(_travel_router)

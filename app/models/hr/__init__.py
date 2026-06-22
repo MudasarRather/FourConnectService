@@ -178,6 +178,22 @@ from app.models.hr.claim import Claim
 from app.models.hr.claim_settlement import ClaimSettlement
 from app.models.hr.claim_audit_log import ClaimAuditLog
 
+# Travel Management module — Phase 4.0 (Aviation Command Deck)
+from app.models.hr.travel_type import (
+    TravelRequestStatus, TravelDecision, TravelApproverType, TravelPriority,
+    CityCategory, BookingType, BookingStatus, AdvanceStatus, DaRecordStatus,
+    TravelSettlementStatus, TravelSettlementMethod, TravelExpenseCategory,
+    TravelAuditAction,
+)
+from app.models.hr.travel_category import TravelCategory
+from app.models.hr.travel_policy import TravelPolicy
+from app.models.hr.travel_request import TravelRequest
+from app.models.hr.travel_booking import TravelBooking
+from app.models.hr.travel_da import TravelDaRate, TravelDaRecord
+from app.models.hr.travel_advance import TravelAdvance
+from app.models.hr.travel_settlement import TravelSettlement
+from app.models.hr.travel_audit_log import TravelAuditLog
+
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
 
@@ -379,4 +395,27 @@ __all__ = [
     "Claim",
     "ClaimSettlement",
     "ClaimAuditLog",
+    # Travel Management
+    "TravelRequestStatus",
+    "TravelDecision",
+    "TravelApproverType",
+    "TravelPriority",
+    "CityCategory",
+    "BookingType",
+    "BookingStatus",
+    "AdvanceStatus",
+    "DaRecordStatus",
+    "TravelSettlementStatus",
+    "TravelSettlementMethod",
+    "TravelExpenseCategory",
+    "TravelAuditAction",
+    "TravelCategory",
+    "TravelPolicy",
+    "TravelRequest",
+    "TravelBooking",
+    "TravelDaRate",
+    "TravelDaRecord",
+    "TravelAdvance",
+    "TravelSettlement",
+    "TravelAuditLog",
 ]

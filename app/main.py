@@ -81,6 +81,15 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Start the travel lifecycle scheduler: auto-START approved tours on their
+    # departure date and auto-COMPLETE in-progress tours after their return date.
+    # Own NullPool engine, idempotent, fully guarded — never blocks boot.
+    try:
+        from app.utils.hr.travel.scheduler import start_travel_scheduler
+        start_travel_scheduler(3600)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     # Seed payroll defaults (statutory config, core components, default structure).
     # Idempotent — only inserts rows that don't exist yet.
     try:
@@ -102,6 +111,19 @@ def startup_db():
         _db = SessionLocal()
         try:
             seed_reimbursement_defaults(_db)
+        finally:
+            _db.close()
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Seed travel defaults (travel categories + DA rate matrix + a default policy).
+    # Idempotent — only inserts rows that don't exist yet.
+    try:
+        from app.database import SessionLocal
+        from app.utils.hr.travel import seed_travel_defaults
+        _db = SessionLocal()
+        try:
+            seed_travel_defaults(_db)
         finally:
             _db.close()
     except Exception:

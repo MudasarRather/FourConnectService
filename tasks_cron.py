@@ -37,6 +37,12 @@ def run_cron():
         tr = run_training_maintenance(db)
         print(f"- Training maintenance: {tr}")
 
+        # 6. Travel lifecycle: auto-start tours on their departure date and
+        #    auto-complete them after their return date (also runs in-process hourly).
+        from app.utils.hr.travel.scheduler import run_travel_auto_transitions
+        tv = run_travel_auto_transitions(db)
+        print(f"- Travel auto-transitions: {tv}")
+
         print("Success: All transitions processed.")
     except Exception as e:
         print(f"Error during task transitions: {e}")

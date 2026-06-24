@@ -21,6 +21,7 @@ from app.schemas.hr.payroll import (
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.payroll import resolve_structure, compute_payslip, load_config, fy_for
 from app.utils.hr.payroll.service import write_audit, create_compensation_revision
+from app.utils.hr.lifecycle_guard import guard_employable
 
 router = APIRouter(prefix="/hr/payroll/compensation", tags=["HR — Payroll Compensation"])
 
@@ -126,6 +127,10 @@ def create_revision(employee_id: UUID, payload: CompensationCreate, db: Session 
     emp = db.query(Employee).filter(Employee.id == employee_id, Employee.is_deleted == False).first()  # noqa: E712
     if not emp:
         raise HTTPException(404, "Employee not found")
+    # Compensation is frozen once an employee is leaving / gone — no new revisions
+    # for ON_NOTICE / EXITED / SUSPENDED / ARCHIVED. Their existing comp drives the
+    # final payroll + F&F; to revise pay you must cancel notice (→ ACTIVE) first.
+    guard_employable(emp, "revise compensation for this employee")
     comp = create_compensation_revision(
         db, emp,
         annual_ctc=payload.annual_ctc, effective_from=payload.effective_from,
@@ -169,6 +174,9 @@ def activate_compensation(comp_id: UUID, db: Session = Depends(get_db),
         raise HTTPException(404, "Compensation not found")
     if c.status not in (CompensationStatus.DRAFT,):
         raise HTTPException(409, "Only DRAFT compensation can be activated")
+    # Don't activate a (possibly pre-existing) draft for someone now leaving / gone.
+    emp_guard = db.query(Employee).filter(Employee.id == c.employee_id, Employee.is_deleted == False).first()  # noqa: E712
+    guard_employable(emp_guard, "activate a compensation revision for this employee")
     prior = db.query(EmployeeCompensation).filter(
         EmployeeCompensation.employee_id == c.employee_id, EmployeeCompensation.id != c.id,
         EmployeeCompensation.is_deleted == False,  # noqa: E712

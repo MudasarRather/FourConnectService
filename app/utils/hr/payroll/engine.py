@@ -35,7 +35,7 @@ def days_in_month(year: int, month: int) -> int:
 
 def _statutory_amount(kind, *, pf_wage_paid: Decimal, gross_paid: Decimal,
                       annual_projection: Decimal, regime: str, declarations: Optional[Dict],
-                      cfg: Dict, remaining_months: int) -> Decimal:
+                      cfg: Dict, remaining_months: int, tds_paid_ytd: Decimal = Decimal("0")) -> Decimal:
     if kind in (StatutoryKind.PF_EMPLOYEE, StatutoryKind.PF_EMPLOYER):
         return stat.calc_pf(pf_wage_paid, cfg)
     if kind == StatutoryKind.ESI_EMPLOYEE:
@@ -45,14 +45,17 @@ def _statutory_amount(kind, *, pf_wage_paid: Decimal, gross_paid: Decimal,
     if kind == StatutoryKind.PROFESSIONAL_TAX:
         return stat.calc_professional_tax(gross_paid, cfg)
     if kind == StatutoryKind.TDS:
-        return stat.calc_monthly_tds(annual_projection, regime, declarations, cfg, remaining_months)
+        return stat.calc_monthly_tds(annual_projection, regime, declarations, cfg,
+                                     remaining_months, tds_paid_ytd)
     return Decimal("0.00")
 
 
 def _compute_once(components: List[dict], *, gross_target: Decimal, monthly_ctc: Decimal,
                   annual_ctc: Decimal, paid_ratio: Decimal, paid_days: Decimal,
                   working_days: Decimal, lop_days: Decimal, regime: str,
-                  declarations: Optional[Dict], cfg: Dict, remaining_months: int):
+                  declarations: Optional[Dict], cfg: Dict, remaining_months: int,
+                  tds_paid_ytd: Decimal = Decimal("0"),
+                  extra_annual_taxable: Decimal = Decimal("0")):
     ns: Dict[str, Decimal] = {
         "MONTHLY_CTC": monthly_ctc, "CTC": monthly_ctc, "ANNUAL_CTC": annual_ctc,
         "PAID_DAYS": paid_days, "WORKING_DAYS": working_days, "LOP_DAYS": lop_days,
@@ -91,12 +94,17 @@ def _compute_once(components: List[dict], *, gross_target: Decimal, monthly_ctc:
             full = _q(c.get("flat_amount") or 0)
             note = "attendance-prorated"
         elif ct == CalcType.STATUTORY:
-            annual_projection = running_gross_full * Decimal("12")
+            # Annual taxable income = regular salary annualised (full gross × 12) PLUS
+            # one-time taxable earnings (bonus/commission/incentive/arrear/night/holiday)
+            # added ONCE — never ×12. Mirrors CBDT's average-rate method so a bonus is
+            # taxed, but not as if it recurred every month.
+            annual_projection = running_gross_full * Decimal("12") + extra_annual_taxable
             full = _statutory_amount(
                 c.get("statutory_kind"),
                 pf_wage_paid=pf_wage_paid, gross_paid=gross_paid,
                 annual_projection=annual_projection, regime=regime,
                 declarations=declarations, cfg=cfg, remaining_months=remaining_months,
+                tds_paid_ytd=tds_paid_ytd,
             )
             note = str(c.get("statutory_kind"))
 
@@ -133,7 +141,9 @@ def compute_payslip(*, components: List[dict], monthly_ctc: Decimal, annual_ctc:
                     monthly_gross_hint: Optional[Decimal], regime: str,
                     declarations: Optional[Dict], working_days: Decimal, lop_days: Decimal,
                     cfg: Dict, encashment_amount: Decimal = Decimal("0"),
-                    remaining_months: int = 12, adjustments: Optional[List[Dict]] = None) -> Dict:
+                    remaining_months: int = 12, adjustments: Optional[List[Dict]] = None,
+                    tds_paid_ytd: Decimal = Decimal("0"),
+                    extra_annual_taxable: Decimal = Decimal("0")) -> Dict:
     """Compute one payslip. Returns {header fields..., 'lines': [...]}.
 
     ``monthly_gross_hint`` (from EmployeeCompensation.monthly_gross) is preferred
@@ -155,7 +165,8 @@ def compute_payslip(*, components: List[dict], monthly_ctc: Decimal, annual_ctc:
         lines, gross_paid, employer = _compute_once(
             components, gross_target=gross_target, monthly_ctc=monthly_ctc, annual_ctc=annual_ctc,
             paid_ratio=paid_ratio, paid_days=paid_days, working_days=working_days, lop_days=lop_days,
-            regime=regime, declarations=declarations, cfg=cfg, remaining_months=remaining_months)
+            regime=regime, declarations=declarations, cfg=cfg, remaining_months=remaining_months,
+            tds_paid_ytd=tds_paid_ytd, extra_annual_taxable=extra_annual_taxable)
     else:
         gt = monthly_ctc
         for _ in range(2):
@@ -169,7 +180,8 @@ def compute_payslip(*, components: List[dict], monthly_ctc: Decimal, annual_ctc:
         lines, gross_paid, employer = _compute_once(
             components, gross_target=gross_target, monthly_ctc=monthly_ctc, annual_ctc=annual_ctc,
             paid_ratio=paid_ratio, paid_days=paid_days, working_days=working_days, lop_days=lop_days,
-            regime=regime, declarations=declarations, cfg=cfg, remaining_months=remaining_months)
+            regime=regime, declarations=declarations, cfg=cfg, remaining_months=remaining_months,
+            tds_paid_ytd=tds_paid_ytd, extra_annual_taxable=extra_annual_taxable)
 
     # Optional leave-encashment payout as an extra earning line.
     if encashment_amount and encashment_amount > 0:
@@ -199,14 +211,46 @@ def compute_payslip(*, components: List[dict], monthly_ctc: Decimal, annual_ctc:
             "calc_note": adj.get("note") or (adj.get("adjustment_type") or "adjustment"),
         })
 
-    gross_earnings = _q(sum((l["amount"] for l in lines
-                             if l["component_type"] in _EARNING_TYPES and not l["is_employer_cost"]), Decimal("0")))
-    total_deductions = _q(sum((l["amount"] for l in lines
-                               if l["component_type"] in (ComponentType.DEDUCTION, ComponentType.STATUTORY_DEDUCTION)
-                               and not l["is_employer_cost"]), Decimal("0")))
+    def _earn(ls):
+        return _q(sum((l["amount"] for l in ls
+                       if l["component_type"] in _EARNING_TYPES and not l["is_employer_cost"]), Decimal("0")))
+
+    def _ded(ls):
+        return _q(sum((l["amount"] for l in ls
+                       if l["component_type"] in (ComponentType.DEDUCTION, ComponentType.STATUTORY_DEDUCTION)
+                       and not l["is_employer_cost"]), Decimal("0")))
+
+    gross_earnings = _earn(lines)
+    total_deductions = _ded(lines)
+    net_pay = _q(gross_earnings - total_deductions)
+
+    # ── Net-pay floor ────────────────────────────────────────────────────────
+    # Payroll must NEVER withhold more than it pays. When deductions exceed gross
+    # (e.g. a full-month TDS landing on a salary heavily prorated for LOP), reduce
+    # TDS to the collectable amount so net ≥ 0. The uncollected TDS is carried
+    # forward automatically: it lowers this month's deducted TDS → next month's
+    # cumulative averaging (annual − tds_paid_ytd)/remaining catches it up. We flag
+    # the slip so the run surfaces it instead of silently paying a floored amount.
+    net_floored = False
+    tds_deferred = Decimal("0")
+    if net_pay < 0:
+        net_floored = True
+        deficit = -net_pay
+        for l in lines:
+            if l.get("statutory_kind") == StatutoryKind.TDS and not l["is_employer_cost"] and deficit > 0:
+                cut = min(deficit, l["amount"])
+                if cut > 0:
+                    l["amount"] = _q(l["amount"] - cut)
+                    l["calc_note"] = f"{l.get('calc_note') or 'TDS'}; capped −{cut} (deferred — net floored ≥ 0)"
+                    tds_deferred += cut
+                    deficit -= cut
+        total_deductions = _ded(lines)
+        net_pay = _q(gross_earnings - total_deductions)
+        if net_pay < 0:   # non-TDS deductions alone exceed gross — floor at zero
+            net_pay = Decimal("0.00")
+
     employer = _q(sum((l["amount"] for l in lines if l["is_employer_cost"]
                        or l["component_type"] == ComponentType.EMPLOYER_CONTRIBUTION), Decimal("0")))
-    net_pay = _q(gross_earnings - total_deductions)
     ctc_value = _q(gross_earnings + employer)
 
     lines.sort(key=lambda x: (x["sequence"], x["component_code"]))
@@ -215,4 +259,5 @@ def compute_payslip(*, components: List[dict], monthly_ctc: Decimal, annual_ctc:
         "gross_earnings": gross_earnings, "total_deductions": total_deductions,
         "net_pay": net_pay, "employer_contributions": employer, "ctc_value": ctc_value,
         "encashment_amount": _q(encashment_amount or 0), "lines": lines,
+        "net_floored": net_floored, "tds_deferred": _q(tds_deferred),
     }

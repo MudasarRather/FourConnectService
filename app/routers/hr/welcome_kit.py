@@ -19,6 +19,7 @@ from app.schemas.hr.onboarding import (
     WelcomeKitCreate, WelcomeKitUpdate, WelcomeKitResponse,
 )
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.lifecycle_guard import guard_employable
 
 
 router = APIRouter(prefix="/hr/welcome-kit", tags=["HR — Welcome Kit"])
@@ -97,8 +98,8 @@ def create_kit(
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
-    if not db.query(Employee).filter(Employee.id == payload.employee_id).first():
-        raise HTTPException(404, "Employee not found")
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+    guard_employable(emp, "create a welcome kit for this employee")
     items = payload.items or []
     if not items and payload.template_id:
         tpl = db.query(WelcomeKitTemplate).filter(WelcomeKitTemplate.id == payload.template_id).first()

@@ -27,6 +27,7 @@ from app.schemas.hr.asset_lifecycle import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.assets.state import assert_transition
+from app.utils.hr.lifecycle_guard import guard_employable
 from app.utils.hr.assets.audit import write_asset_history
 from app.utils.hr.assets.responses import to_transfer_response
 
@@ -85,8 +86,13 @@ def request_transfer(
             raise HTTPException(409, "Asset must be AVAILABLE to issue from the store.")
     if payload.transfer_type in _TO_EMPLOYEE and not payload.to_employee_id:
         raise HTTPException(400, "to_employee_id is required for this transfer type.")
-    if payload.to_employee_id and not db.query(Employee).filter(Employee.id == payload.to_employee_id).first():
-        raise HTTPException(404, "Destination employee not found")
+    if payload.to_employee_id:
+        dest_emp = db.query(Employee).filter(Employee.id == payload.to_employee_id).first()
+        if not dest_emp:
+            raise HTTPException(404, "Destination employee not found")
+        # Don't transfer custody onto someone who is leaving / has left.
+        if payload.transfer_type in _TO_EMPLOYEE:
+            guard_employable(dest_emp, "transfer this asset to the destination employee")
 
     # Find the current open allocation (the 'from' side) if any.
     open_alloc = db.query(AssetAllocation).filter(
@@ -224,6 +230,9 @@ def complete_transfer(
 
     # Open the incoming allocation (employee destination) or settle store/location.
     if t.transfer_type in _TO_EMPLOYEE and t.to_employee_id:
+        # Re-check: the destination may have given notice / exited since the request.
+        dest_emp = db.query(Employee).filter(Employee.id == t.to_employee_id).first()
+        guard_employable(dest_emp, "complete the transfer to the destination employee")
         new_alloc = AssetAllocation(
             asset_id=asset.id, employee_id=t.to_employee_id,
             allocated_date=today, condition_on_issue=asset.condition,

@@ -54,11 +54,17 @@ def get_current_user(
         )
     
     if not user.is_active:
+        # Deactivated mid-session (e.g. HR revoked ERP access during exit
+        # clearance). Return 401 — NOT 400 — so the already-issued JWT is
+        # treated as an authentication failure: the frontend's global 401
+        # handler clears the token and redirects to login, logging the user
+        # out on their next request (or within the auth heartbeat interval).
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Inactive user"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account deactivated — please sign in again",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     return user
 
 

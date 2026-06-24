@@ -56,6 +56,7 @@ from app.schemas.hr.leave import (
     LeavePolicyCreate, LeavePolicyUsage, LeavePolicyDeleteBody,
     LeaveRequestCreate, LeaveRequestAdminCreate,
     LeaveDecisionBody, LeaveBulkDecideBody, LeaveWithdrawBody, LeaveDeleteBody,
+    LeaveLapseBody, LeaveGrantPolicyBody,
     LeaveProofRequestBody, LeaveProofAttachmentResponse, ProofDeleteBody,
     LeaveDayBreakdown, LeaveRequestResponse, LeaveRequestListResponse,
     LeaveStats, LeaveTypeCount,
@@ -76,6 +77,10 @@ from app.utils.hr import leave_reports
 from fastapi.responses import Response
 from app.utils.dependencies import get_current_user, get_current_superuser
 from app.utils.hr.attendance_logic import daily_rollup, log, resolve_shift
+from app.utils.hr.lifecycle_guard import (
+    guard_within_tenure, guard_employable, guard_settleable, SEPARATED, is_employable,
+)
+from app.models.hr.employee import LifecycleState
 
 
 router = APIRouter(prefix="/hr/leaves", tags=["HR — Leave & Absence"])
@@ -519,6 +524,9 @@ def _emit_notifications(
     elif event == "admin_override":
         _add(employee_user_id, "leave_approved",
              f"{ref} entered by HR · approved")
+    elif event == "lapsed":
+        _add(employee_user_id, "leave_rejected",
+             f"{ref} · {type_label} {range_label} closed as lapsed (dates passed, not approved in time)")
     elif event == "proof_requested":
         # HR has asked the employee for supporting documents.
         if employee_user_id:
@@ -549,20 +557,38 @@ def _emit_notifications(
 
 
 _VALID_TRANSITIONS = {
-    LeaveStatus.DRAFT: {LeaveStatus.PENDING_MANAGER, LeaveStatus.CANCELLED},
-    LeaveStatus.PENDING_MANAGER: {LeaveStatus.PENDING_HR, LeaveStatus.MANAGER_REJECTED, LeaveStatus.WITHDRAWN, LeaveStatus.CANCELLED},
-    LeaveStatus.PENDING_HR: {LeaveStatus.APPROVED, LeaveStatus.REJECTED, LeaveStatus.CANCELLED},
+    LeaveStatus.DRAFT: {LeaveStatus.PENDING_MANAGER, LeaveStatus.CANCELLED, LeaveStatus.LAPSED},
+    LeaveStatus.PENDING_MANAGER: {LeaveStatus.PENDING_HR, LeaveStatus.MANAGER_REJECTED, LeaveStatus.WITHDRAWN, LeaveStatus.CANCELLED, LeaveStatus.LAPSED},
+    LeaveStatus.PENDING_HR: {LeaveStatus.APPROVED, LeaveStatus.REJECTED, LeaveStatus.CANCELLED, LeaveStatus.LAPSED},
     LeaveStatus.APPROVED: {LeaveStatus.CANCELLED},
     LeaveStatus.REJECTED: set(),
     LeaveStatus.MANAGER_REJECTED: set(),
     LeaveStatus.CANCELLED: set(),
     LeaveStatus.WITHDRAWN: set(),
+    LeaveStatus.LAPSED: set(),
 }
 
 
 def _assert_transition(current: LeaveStatus, next_: LeaveStatus) -> None:
     if next_ not in _VALID_TRANSITIONS.get(current, set()):
         raise HTTPException(409, f"Cannot transition leave from {current.value} to {next_.value}")
+
+
+def _guard_not_past(leave: LeaveRequest, action: str = "approve this leave") -> None:
+    """Block APPROVING a leave whose dates have already elapsed. A leave that was
+    never actioned before its dates passed can't be approved (the days are gone);
+    the manager / HR must close it as LAPSED with a remark instead. Rejections are
+    never gated here — they must always be able to clear the queue."""
+    if leave.to_date and leave.to_date < date.today():
+        raise HTTPException(
+            409,
+            f"Cannot {action}: the leave ended on {leave.to_date.isoformat()} (already in the past). "
+            f"It can no longer be approved — close it as lapsed with a remark instead.",
+        )
+
+
+# Pending stages a leave can be closed-out (lapsed) from.
+_LAPSABLE_STATUSES = (LeaveStatus.DRAFT, LeaveStatus.PENDING_MANAGER, LeaveStatus.PENDING_HR)
 
 
 # ─── Phase 4 — configurable approval chain ───
@@ -735,6 +761,7 @@ def _employee_snapshot(db: Session, employee_id: UUID) -> dict:
             User.full_name.label("name"), User.email.label("email"),
             Department.name.label("dept"), Designation.name.label("desg"),
             Employee.work_location_id, Employee.reporting_manager_id, Employee.hr_manager_id,
+            Employee.lifecycle_state.label("lifecycle"),
         )
         .join(User, User.id == Employee.user_id)
         .outerjoin(Department, Department.id == Employee.department_id)
@@ -750,6 +777,7 @@ def _employee_snapshot(db: Session, employee_id: UUID) -> dict:
         "work_location_id": snap.work_location_id,
         "reporting_manager_id": snap.reporting_manager_id,
         "hr_manager_id": snap.hr_manager_id,
+        "lifecycle_state": snap.lifecycle.value if snap.lifecycle else None,
     }
 
 
@@ -875,7 +903,7 @@ def _balance_to_response(
     return LeaveBalanceResponse(
         id=b.id, employee_id=b.employee_id,
         employee_name=snap.get("name"), employee_code=snap.get("code"),
-        department_name=snap.get("dept"),
+        department_name=snap.get("dept"), lifecycle_state=snap.get("lifecycle_state"),
         leave_type=b.leave_type, fiscal_year=b.fiscal_year,
         opening_balance=Decimal(b.opening_balance or 0),
         accrued=Decimal(b.accrued or 0),
@@ -884,6 +912,7 @@ def _balance_to_response(
         adjustments=Decimal(b.adjustments or 0),
         closing_balance=available,
         available=available, quota=quota,
+        monthly_accrual=(Decimal(policy.monthly_accrual or 0) if policy else Decimal("0")),
         utilisation_pct=round(util, 1),
     )
 
@@ -1133,6 +1162,9 @@ def create_my_leave(
 ):
     emp = _resolve_self_employee(db, user)
     policy = _policy_or_404(db, payload.leave_type)
+
+    # A leaving / departed employee may not take leave dated past their LWD.
+    guard_within_tenure(emp, payload.to_date, "apply for leave")
 
     today = date.today()
     if payload.from_date < today:
@@ -1598,6 +1630,10 @@ def manager_decide(
     emp = db.query(Employee).filter(Employee.id == leave.employee_id).first()
     if not emp or emp.reporting_manager_id != user.id:
         raise HTTPException(403, "You are not the reporting manager for this employee")
+    # A leave whose dates have already passed can no longer be approved — close
+    # it as lapsed with a remark instead (POST /{id}/lapse).
+    if body.decision == LeaveDecision.APPROVED:
+        _guard_not_past(leave, "approve this leave")
 
     # Phase 4 — chain-aware path. Legacy in-flight rows (empty approval_steps)
     # fall through to the original two-tier transitions.
@@ -1793,6 +1829,8 @@ def chain_decide(
     cur = steps[idx]
     if not _can_act_on_step(user, cur):
         raise HTTPException(403, "You are not the configured approver for the current stage")
+    if body.decision == LeaveDecision.APPROVED:
+        _guard_not_past(leave, "approve this leave")
 
     now_iso = datetime.now(timezone.utc).isoformat()
     if body.decision == LeaveDecision.APPROVED:
@@ -2007,6 +2045,15 @@ def hr_decide(
         raise HTTPException(404, "Leave request not found")
     was_approved = leave.status == LeaveStatus.APPROVED
 
+    # An already-submitted leave that extends past the employee's LWD must not
+    # be approved (it may have been filed before notice was given). Only guard
+    # on approval — rejections must always be allowed to clear the queue.
+    if body.decision == LeaveDecision.APPROVED:
+        _emp = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+        guard_within_tenure(_emp, leave.to_date, "approve leave")
+        # Past-dated leaves can't be approved retroactively — lapse them instead.
+        _guard_not_past(leave, "approve this leave")
+
     # Phase 4 — chain-aware path: the HR decide endpoint advances whatever the
     # current stage is, provided it is an HR-type stage. (USER stages flow
     # through the generic /chain/{id}/decide endpoint.) Legacy in-flight rows
@@ -2102,6 +2149,76 @@ def hr_decide(
     return _to_response(db, leave)
 
 
+@router.post("/{leave_id}/lapse", response_model=LeaveRequestResponse)
+def lapse_leave(
+    leave_id: UUID,
+    body: LeaveLapseBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Close an un-actioned, past-dated leave as LAPSED with a mandatory remark.
+
+    Authorised for the employee's reporting MANAGER or any HR superuser — the two
+    parties who could have approved it. Only valid while the leave is still
+    pending (DRAFT / PENDING_MANAGER / PENDING_HR) AND its dates have already
+    passed; a future/ongoing leave must be approved or rejected normally.
+    """
+    leave = db.query(LeaveRequest).filter(
+        LeaveRequest.id == leave_id,
+        LeaveRequest.is_deleted == False,  # noqa: E712
+    ).with_for_update().first()
+    if not leave:
+        raise HTTPException(404, "Leave request not found")
+    if leave.status not in _LAPSABLE_STATUSES:
+        raise HTTPException(409, f"Only a pending leave can be closed as lapsed (currently {leave.status.value}).")
+    if not (leave.to_date and leave.to_date < date.today()):
+        raise HTTPException(409, "This leave hasn't lapsed — its dates are today or in the future. Approve or reject it instead.")
+
+    emp = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    is_mgr = bool(emp and emp.reporting_manager_id == user.id)
+    if not (user.is_superuser or is_mgr):
+        raise HTTPException(403, "Only the reporting manager or HR can close this leave.")
+
+    role = "HR" if user.is_superuser else "Manager"
+    note = f"[Lapsed by {role}] {body.reason.strip()}"
+    frm = leave.status.value
+    _assert_transition(leave.status, LeaveStatus.LAPSED)
+    leave.status = LeaveStatus.LAPSED
+    # Record the remark on the actor's column so the detail drawer shows who/why.
+    if user.is_superuser:
+        leave.hr_id = user.id
+        leave.hr_decided_at = datetime.now(timezone.utc)
+        leave.hr_notes = note
+    else:
+        leave.manager_id = user.id
+        leave.manager_decided_at = datetime.now(timezone.utc)
+        leave.manager_notes = note
+    # Mark the current chain stage closed so the queue stops surfacing it.
+    if not _has_legacy_steps(leave):
+        steps = list(leave.approval_steps or [])
+        idx = int(leave.current_step or 0)
+        if 0 <= idx < len(steps):
+            steps[idx]["decision"] = LeaveDecision.SKIPPED.value
+            steps[idx]["decided_by_id"] = str(user.id)
+            steps[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
+            steps[idx]["notes"] = note
+            leave.approval_steps = steps
+            flag_modified(leave, "approval_steps")
+    db.commit()
+    db.refresh(leave)
+
+    try:
+        log(db, actor_id=user.id, action=AttendanceLogAction.LEAVE_HR_REJECTED,
+            target_table="hr_leave_requests", target_id=leave.id, employee_id=leave.employee_id,
+            payload={"ref": leave.reference_no, "lapsed": True, "by": role, "from": frm, "reason": body.reason})
+        emp_user_id = db.query(Employee.user_id).filter(Employee.id == leave.employee_id).scalar()
+        _emit_notifications(db, leave, employee_user_id=emp_user_id, event="lapsed", actor=user)
+        db.commit()
+    except Exception:
+        db.rollback()
+    return _to_response(db, leave)
+
+
 @router.post("/bulk-decide", response_model=LeaveRequestListResponse)
 def hr_bulk_decide(
     body: LeaveBulkDecideBody,
@@ -2134,6 +2251,9 @@ def admin_create_leave(
     if not emp:
         raise HTTPException(404, "Employee not found")
     policy = _policy_or_404(db, payload.leave_type)
+
+    # A leaving / departed employee may not be given leave dated past their LWD.
+    guard_within_tenure(emp, payload.to_date, "apply for leave")
 
     if payload.is_half_day:
         if payload.from_date != payload.to_date:
@@ -2475,6 +2595,9 @@ def admin_balances(
     department_id: Optional[UUID] = None,
     leave_type: Optional[LeaveType] = None,
     fy: Optional[str] = None,
+    include_separated: bool = Query(
+        False, description="Include EXITED / ARCHIVED / INACTIVE employees (audit only). "
+                           "Default hides them — you can't manage reserves for people who have left."),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=300),
     db: Session = Depends(get_db),
@@ -2504,6 +2627,15 @@ def admin_balances(
         .join(User, User.id == Employee.user_id)
         .filter(Employee.is_deleted == False)  # noqa: E712
     )
+    # Separated employees (EXITED / ARCHIVED / INACTIVE) drop out of the active
+    # reserve roster by default — their leave ledger is frozen for F&F, not for
+    # day-to-day management. ON_NOTICE stays (still on payroll). A null state is
+    # treated as active. `include_separated=true` surfaces them for audit.
+    if not include_separated:
+        emp_q = emp_q.filter(or_(
+            Employee.lifecycle_state.is_(None),
+            Employee.lifecycle_state.notin_(SEPARATED),
+        ))
     if employee_id:
         emp_q = emp_q.filter(Employee.id == employee_id)
     if department_id:
@@ -2550,13 +2682,14 @@ def admin_balances(
                     id=_uuid_mod.uuid4(),  # synthetic — no persisted row yet
                     employee_id=eid,
                     employee_name=snap.get("name"), employee_code=snap.get("code"),
-                    department_name=snap.get("dept"),
+                    department_name=snap.get("dept"), lifecycle_state=snap.get("lifecycle_state"),
                     leave_type=lt, fiscal_year=fy,
                     opening_balance=Decimal("0"), accrued=Decimal("0"),
                     carry_forward_in=Decimal("0"), used=Decimal("0"),
                     encashed=Decimal("0"), adjustments=Decimal("0"),
                     closing_balance=Decimal("0"),
                     available=Decimal("0"), quota=quota,
+                    monthly_accrual=(Decimal(policy.monthly_accrual or 0) if policy else Decimal("0")),
                     utilisation_pct=0.0,
                 ))
     return LeaveBalanceListResponse(items=items, total=total, fiscal_year=fy)
@@ -2570,6 +2703,21 @@ def admin_adjust_balance(
     admin: User = Depends(get_current_superuser),
 ):
     fy = body.fiscal_year or _current_fy(db)
+
+    # Lifecycle gate: you cannot CREDIT new leave to someone who is leaving or has
+    # left (only ACTIVE / ON_PROBATION may receive new entitlement); DEBIT
+    # corrections are allowed while ON_NOTICE but blocked once fully separated.
+    emp = db.query(Employee).filter(
+        Employee.id == employee_id, Employee.is_deleted == False,  # noqa: E712
+    ).first()
+    _delta = Decimal(body.delta)
+    if _delta > 0:
+        guard_employable(emp, "credit leave balance to")
+    elif _delta < 0:
+        guard_settleable(emp, "adjust leave balance for")
+    elif emp is None:
+        raise HTTPException(404, "Employee not found")
+
     b = _get_or_create_balance(db, employee_id, body.leave_type, fy)
     policy = db.query(LeavePolicy).filter(LeavePolicy.leave_type == body.leave_type).first()
 
@@ -2612,6 +2760,98 @@ def admin_adjust_balance(
     except Exception:
         db.rollback()
     return _balance_to_response(db, b, policy)
+
+
+@router.post("/balances/grant-policy")
+def admin_grant_policy(
+    body: LeaveGrantPolicyBody,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Bulk top-up: lift every eligible employee's available balance UP TO the
+    policy annual quota for the chosen (capped) leave types. Idempotent — anyone
+    already at/above quota is skipped and nobody is ever reduced. Only ACTIVE /
+    ON_PROBATION employees are credited (leaving / separated employees are
+    skipped, mirroring the single-adjust lifecycle guard)."""
+    fy = body.fiscal_year or _current_fy(db)
+
+    # Grantable = annually-credited policies only: annual_quota > 0 AND
+    # monthly_accrual == 0. Accrual-based types (e.g. Earned) are credited
+    # automatically by cron/accrue-monthly — bulk-granting them here would
+    # double-credit on top of accrual, so they're excluded.
+    policies = [
+        p for p in db.query(LeavePolicy).filter(
+            LeavePolicy.is_active == True,   # noqa: E712
+            LeavePolicy.is_deleted == False,  # noqa: E712
+        ).all()
+        if Decimal(p.annual_quota or 0) > 0 and Decimal(p.monthly_accrual or 0) == 0
+        and p.leave_type != LeaveType.LWP   # LWP is unpaid — never a granted entitlement
+    ]
+    if body.leave_types:
+        wanted = set(body.leave_types)
+        policies = [p for p in policies if p.leave_type in wanted]
+    if not policies:
+        raise HTTPException(422, "No annually-credited leave policy matches the selection "
+                                 "(accrual-based types like Earned are credited monthly, not granted here).")
+
+    eq = db.query(Employee).filter(Employee.is_deleted == False)  # noqa: E712
+    if body.employee_ids:
+        eq = eq.filter(Employee.id.in_(body.employee_ids))
+    if body.department_id:
+        eq = eq.filter(Employee.department_id == body.department_id)
+    employees = eq.all()
+
+    note = body.reason or f"Bulk policy grant · FY {fy}"
+    granted_rows = 0
+    credited_days = Decimal("0")
+    touched: set = set()
+    skipped_ineligible = 0
+    skipped_satisfied = 0
+
+    for emp in employees:
+        if not is_employable(emp):
+            skipped_ineligible += 1
+            continue
+        for p in policies:
+            b = _get_or_create_balance(db, emp.id, p.leave_type, fy)
+            # Top up the ENTITLEMENT already credited this FY — NOT the available
+            # balance. `credited` excludes used/encashed, so an employee who has
+            # already received their annual quota gets nothing even after using
+            # some of it (this closes the "re-credit the used days" loophole).
+            credited = (Decimal(b.opening_balance or 0) + Decimal(b.accrued or 0)
+                        + Decimal(b.carry_forward_in or 0) + Decimal(b.adjustments or 0))
+            target = Decimal(p.annual_quota or 0) + Decimal(b.carry_forward_in or 0)
+            delta = target - credited
+            if delta <= 0:
+                skipped_satisfied += 1
+                continue
+            _apply_ledger(db, b, kind=LedgerKind.ADMIN_ADJUST, delta=delta, actor=admin, note=note)
+            granted_rows += 1
+            credited_days += delta
+            touched.add(emp.id)
+    db.commit()
+
+    try:
+        log(db, actor_id=admin.id, action=AttendanceLogAction.LEAVE_BALANCE_ADJUSTED,
+            target_table="hr_leave_balances", target_id=None,
+            payload={"bulk_policy_grant": True, "fy": fy,
+                     "types": [p.leave_type.value for p in policies],
+                     "employees": len(touched), "rows": granted_rows,
+                     "days": float(credited_days), "reason": body.reason})
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return {
+        "fiscal_year": fy,
+        "granted_rows": granted_rows,
+        "credited_days": float(credited_days),
+        "employees_credited": len(touched),
+        "employees_in_scope": len(employees),
+        "skipped_ineligible": skipped_ineligible,
+        "skipped_already_satisfied": skipped_satisfied,
+        "leave_types": [p.leave_type.value for p in policies],
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2791,9 +3031,20 @@ def cron_accrue_monthly(
                 skipped += 1
                 continue
             b = _get_or_create_balance(db, emp_id, p.leave_type, fy)
+            # Cap accrual at the annual quota (fresh side = opening + accrued +
+            # adjustments, carry-forward is separate). This makes accrual safe to
+            # coexist with manual grants/back-credits and guarantees the credited
+            # entitlement never exceeds the annual quota.
+            fresh = (Decimal(b.opening_balance or 0) + Decimal(b.accrued or 0)
+                     + Decimal(b.adjustments or 0))
+            room = Decimal(p.annual_quota or 0) - fresh
+            if room <= 0:
+                skipped += 1
+                continue
+            delta = min(Decimal(p.monthly_accrual), room)
             try:
                 _apply_ledger(db, b, kind=LedgerKind.ACCRUAL,
-                              delta=Decimal(p.monthly_accrual), actor=admin,
+                              delta=delta, actor=admin,
                               note=f"Monthly accrual {month_str}")
                 processed += 1
             except HTTPException:
@@ -2808,6 +3059,38 @@ def cron_accrue_monthly(
         db.rollback()
     return CronRunResult(processed=processed, skipped_existing=skipped,
                          fiscal_year=fy, month=month_str)
+
+
+@router.post("/cron/accrue-catchup", response_model=CronRunResult)
+def cron_accrue_catchup(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Catch-up accrual for the CURRENT fiscal year: runs monthly accrual for
+    every month from the FY start through the current month. Idempotent — each
+    month skips if already accrued, and the per-month cap keeps everyone at or
+    below their annual quota. This is the correct way to credit accrual-based
+    leaves (Casual, Earned) that were never accrued (e.g. before the scheduler
+    was wired) — NOT a lump-sum grant."""
+    fy_start = _get_setting(db, "fiscal_year_start", "04-01")
+    try:
+        sm, sd = (int(x) for x in fy_start.split("-"))
+    except Exception:
+        sm, sd = 4, 1
+    today = date.today()
+    start_year = today.year if (today.month, today.day) >= (sm, sd) else today.year - 1
+    cursor = date(start_year, sm, 1)
+    processed = total_skipped = 0
+    months = 0
+    while (cursor.year, cursor.month) <= (today.year, today.month):
+        res = cron_accrue_monthly(AccrueMonthlyBody(month=cursor.strftime("%Y-%m")), db=db, admin=admin)
+        processed += res.processed
+        total_skipped += res.skipped_existing
+        months += 1
+        cursor = date(cursor.year + (1 if cursor.month == 12 else 0), (cursor.month % 12) + 1, 1)
+    return CronRunResult(processed=processed, skipped_existing=total_skipped,
+                         fiscal_year=_current_fy(db),
+                         notes=f"Caught up {months} month(s) of accrual for the current FY")
 
 
 @router.post("/cron/carry-forward", response_model=CronRunResult)

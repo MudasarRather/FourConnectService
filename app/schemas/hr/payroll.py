@@ -347,6 +347,8 @@ class EligibilityRow(BaseModel):
     reason: Optional[str] = None         # machine key, e.g. "no_compensation"
     reason_label: Optional[str] = None   # human label for the UI
     final_settlement: bool = False
+    net_floored: bool = False            # net was capped to ≥ 0 (deductions > gross)
+    tds_deferred: Decimal = Decimal("0") # TDS carried forward to keep net ≥ 0
 
 
 class EligibilityResponse(BaseModel):
@@ -357,6 +359,7 @@ class EligibilityResponse(BaseModel):
     eligible_count: int
     blocked_count: int
     final_settlement_count: int
+    floored_count: int = 0               # payslips whose net was floored to ≥ 0
     estimated_monthly_ctc: Decimal = Decimal("0")
     estimated_gross: Decimal = Decimal("0")
     estimated_net: Decimal = Decimal("0")

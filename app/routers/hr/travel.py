@@ -54,6 +54,7 @@ from app.utils.hr.travel import (
 )
 from app.utils.hr.travel.service import trav_today
 from app.utils.hr.travel.scheduler import execute_travel, complete_travel
+from app.utils.hr.lifecycle_guard import guard_within_tenure, guard_on_payroll
 
 router = APIRouter(prefix="/hr/travel", tags=["HR — Travel Management"])
 
@@ -660,6 +661,9 @@ def _check_advance_amount(db: Session, req: TravelRequest, amount) -> None:
 def create_advance(payload: AdvanceCreate, db: Session = Depends(get_db),
                    current_user: User = Depends(get_current_superuser)):
     req = _get_req(db, payload.travel_request_id)
+    # No travel cash advance for a trip departing after the employee's LWD.
+    _adv_emp = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    guard_within_tenure(_adv_emp, req.departure_date, "issue a travel advance")
     _check_advance_amount(db, req, payload.advance_amount)
     a = TravelAdvance(
         advance_number=generate_advance_number(db), travel_request_id=req.id, employee_id=req.employee_id,
@@ -968,6 +972,12 @@ def admin_create_request(payload: TravelRequestAdminCreate, db: Session = Depend
         raise HTTPException(404, "Employee not found")
     category = get_category(db, payload.category_id)
     req = build_new_request(db, employee=emp, category=category, payload=payload, actor=current_user)
+    # Only an on-payroll employee (incl. notice) may have a request raised — a
+    # suspended or fully separated employee can't incur new travel.
+    guard_on_payroll(emp, "raise a travel request")
+    # A leaving / departed employee may not travel past their LWD. req.return_date
+    # is the derived envelope end (latest leg / return); fall back to departure.
+    guard_within_tenure(emp, req.return_date or req.departure_date, "raise a travel request")
     now_iso = datetime.now(timezone.utc).isoformat()
     req.approval_steps = [{
         "step": 0, "approver_type": "HR", "approver_user_id": None, "label": "HR (admin entry)",
@@ -1172,6 +1182,9 @@ def execute_request(request_id: UUID, body: TravelExecuteBody = TravelExecuteBod
     req = _get_req(db, request_id, lock=True)
     if req.status != TravelRequestStatus.APPROVED:
         raise HTTPException(409, f"Only an APPROVED request can be started (status {req.status.value})")
+    # A trip departing after the employee's LWD can't be started.
+    _exec_emp = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    guard_within_tenure(_exec_emp, req.departure_date, "start a trip")
     if req.departure_date and req.departure_date > trav_today():
         raise HTTPException(409, f"Travel can't start before its departure date "
                                  f"({req.departure_date.strftime('%d %b %Y')}). It starts automatically on the day.")

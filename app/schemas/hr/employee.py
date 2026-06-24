@@ -256,6 +256,9 @@ class EmployeeResponse(BaseModel):
 
     # Lifecycle
     lifecycle_state: str
+    last_working_date: Optional[date] = None
+    original_joining_date: Optional[date] = None
+    rehire_count: int = 0
     is_deleted: bool
 
     # Joined / cached display fields (filled by router using joinedload)
@@ -337,6 +340,8 @@ class EmployeeDetailResponse(BaseModel):
     notice_period_start_date: Optional[date] = None
     last_working_date: Optional[date] = None
     exit_date: Optional[date] = None
+    original_joining_date: Optional[date] = None
+    rehire_count: int = 0
     is_deleted: bool
     archived_at: Optional[datetime] = None
 

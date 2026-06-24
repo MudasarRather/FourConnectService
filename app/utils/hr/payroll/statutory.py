@@ -255,7 +255,19 @@ def calc_annual_tds(annual_gross: Decimal, regime: str, declarations: Optional[D
 
 
 def calc_monthly_tds(annual_gross: Decimal, regime: str, declarations: Optional[Dict], cfg: Dict,
-                     remaining_months: int = 12) -> Decimal:
+                     remaining_months: int = 12, tds_paid_ytd: Decimal = Decimal("0")) -> Decimal:
+    """Monthly TDS by CUMULATIVE AVERAGING (India income-tax u/s 192): spread the
+    REMAINING annual tax (annual liability − TDS already deducted this FY) over the
+    remaining months of the year. This:
+      • levels collection to ~annual/12 for a steady earner (the old
+        ``annual/remaining_months`` escalated every month — annual/12, /11, /10 …,
+        landing the whole year's tax in March), and
+      • AUTO-CARRIES a shortfall: a month that under-collected (e.g. TDS capped to
+        keep net ≥ 0 in a heavy-LOP month) lowers ``tds_paid_ytd``, so the next
+        months automatically collect the balance — no separate carry-forward ledger.
+    """
     annual = calc_annual_tds(annual_gross, regime, declarations, cfg)
     months = remaining_months if remaining_months and remaining_months > 0 else 12
-    return (annual / Decimal(months)).quantize(Decimal("0.01"))
+    paid = tds_paid_ytd if isinstance(tds_paid_ytd, Decimal) else Decimal(str(tds_paid_ytd or 0))
+    remaining_tax = max(Decimal("0"), annual - paid)
+    return (remaining_tax / Decimal(months)).quantize(Decimal("0.01"))

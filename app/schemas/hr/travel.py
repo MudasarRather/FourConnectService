@@ -482,6 +482,10 @@ class TravelRequestResponse(BaseModel):
     can_withdraw: bool = False
     can_execute: bool = False
     can_complete: bool = False
+    # Non-null while PENDING_APPROVAL when the traveller's lifecycle blocks an
+    # approve (exited / suspended / trip past last working day). The approver UI
+    # uses this to disable Approve up-front; flow.apply_decision still enforces it.
+    approval_block: Optional[str] = None
 
 
 class TravelRequestListResponse(BaseModel):

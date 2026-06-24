@@ -24,3 +24,6 @@ weasyprint>=68.0
 openpyxl>=3.1.5
 xlsxwriter>=3.2.0
 pypdf>=4.0.0
+# segno: pure-Python QR codes (no Pillow). Used for Exit Management letter
+# verification QR embedded into the WeasyPrint experience/relieving letter PDFs.
+segno>=1.6.0

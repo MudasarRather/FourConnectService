@@ -117,6 +117,10 @@ class EmployeeShiftAssignmentResponse(BaseModel):
     id: UUID
     employee_id: UUID
     employee_name: Optional[str] = None
+    # Lifecycle context so the board can flag leaving/exited crew and the
+    # frontend can mirror the backend's tenure guard.
+    lifecycle_state: Optional[str] = None
+    last_working_date: Optional[date] = None
     shift_id: UUID
     shift_code: Optional[str] = None
     shift_name: Optional[str] = None

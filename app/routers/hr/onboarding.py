@@ -39,9 +39,15 @@ from app.schemas.hr.onboarding import (
     OnboardingDocumentSlotResponse, EmployeeIdentityResponse, WelcomeKitResponse,
 )
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.lifecycle_guard import SEPARATED
 
 
 router = APIRouter(prefix="/hr/onboarding", tags=["HR — Onboarding"])
+
+# Onboarding only concerns the present workforce. A separated employee
+# (EXITED / ARCHIVED / INACTIVE) who once onboarded must not linger in any
+# onboarding list / count / dashboard. Apply this everywhere a process surfaces.
+_ACTIVE_EMP = Employee.lifecycle_state.notin_(SEPARATED)
 
 
 # ─────────────────────────────────── Helpers ───────────────────────────────────
@@ -260,7 +266,11 @@ def dashboard_stats(
     _admin: User = Depends(get_current_superuser),
 ):
     today = date.today()
-    base_proc = db.query(OnboardingProcess).filter(OnboardingProcess.is_deleted == False)  # noqa: E712
+    base_proc = (
+        db.query(OnboardingProcess)
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(OnboardingProcess.is_deleted == False, _ACTIVE_EMP)  # noqa: E712
+    )
 
     pending_offers = (
         db.query(Offer)
@@ -271,21 +281,24 @@ def dashboard_stats(
     pending_docs = (
         db.query(OnboardingProcess.id)
         .join(OnboardingDocument, OnboardingDocument.process_id == OnboardingProcess.id)
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
         .filter(
             OnboardingDocument.is_mandatory == True,  # noqa: E712
             OnboardingDocument.status.in_([DocumentSlotStatus.PENDING, DocumentSlotStatus.REJECTED]),
             OnboardingProcess.status == OnboardingStatus.IN_PROGRESS,
+            _ACTIVE_EMP,
         )
         .distinct()
         .count()
     )
     pending_asset_alloc = (
         db.query(OnboardingProcess.id)
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
         .outerjoin(AssetAllocation, and_(
             AssetAllocation.process_id == OnboardingProcess.id,
             AssetAllocation.status == AllocationStatus.ALLOCATED,
         ))
-        .filter(OnboardingProcess.status == OnboardingStatus.IN_PROGRESS)
+        .filter(OnboardingProcess.status == OnboardingStatus.IN_PROGRESS, _ACTIVE_EMP)
         .group_by(OnboardingProcess.id)
         .having(func.count(AssetAllocation.id) == 0)
         .count()
@@ -312,7 +325,7 @@ def dashboard_stats(
         .join(OnboardingProcess, OnboardingProcess.employee_id == Employee.id)
         .filter(OnboardingProcess.status.in_([
             OnboardingStatus.IN_PROGRESS, OnboardingStatus.ON_HOLD,
-        ]))
+        ]), _ACTIVE_EMP)
         .group_by(Department.name)
         .all()
     )
@@ -340,7 +353,10 @@ def dashboard_hot_tasks(
     today = date.today()
     tasks = (
         db.query(OnboardingTask)
-        .filter(OnboardingTask.status.in_([OnbTaskStatus.TODO, OnbTaskStatus.IN_PROGRESS, OnbTaskStatus.BLOCKED]))
+        .join(OnboardingProcess, OnboardingProcess.id == OnboardingTask.process_id)
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(OnboardingTask.status.in_([OnbTaskStatus.TODO, OnbTaskStatus.IN_PROGRESS, OnbTaskStatus.BLOCKED]),
+                _ACTIVE_EMP)
         .order_by(OnboardingTask.priority.desc(), OnboardingTask.due_date.asc().nullslast())
         .limit(limit)
         .all()
@@ -392,9 +408,14 @@ def pending_joining_tray(
             .all()
         )
     }
+    # A separated employee (rare here, but an offer can outlive a short stint) is no
+    # longer a pending joiner — drop their accepted offer from the tray.
+    separated_emp_ids = {
+        row[0] for row in db.query(Employee.id).filter(Employee.lifecycle_state.in_(SEPARATED)).all()
+    }
     result: List[PendingJoiningResponse] = []
     for o in offers:
-        if o.employee_id is not None and o.employee_id in completed_emp_ids:
+        if o.employee_id is not None and (o.employee_id in completed_emp_ids or o.employee_id in separated_emp_ids):
             continue
         cand = o.candidate
         result.append(PendingJoiningResponse(
@@ -432,6 +453,7 @@ def backfill_processes(
         db.query(Employee)
         .outerjoin(OnboardingProcess, OnboardingProcess.employee_id == Employee.id)
         .filter(Employee.is_deleted == False)  # noqa: E712
+        .filter(Employee.lifecycle_state.in_([LifecycleState.ACTIVE, LifecycleState.ON_PROBATION]))
         .filter(OnboardingProcess.id.is_(None))
         .all()
     )
@@ -467,7 +489,8 @@ def list_processes(
 ):
     q = (
         db.query(OnboardingProcess)
-        .filter(OnboardingProcess.is_deleted == False)  # noqa: E712
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(OnboardingProcess.is_deleted == False, _ACTIVE_EMP)  # noqa: E712
     )
     if onboarding_status:
         q = q.filter(OnboardingProcess.status == onboarding_status)
@@ -476,8 +499,7 @@ def list_processes(
     if search:
         like = f"%{search.lower()}%"
         q = (
-            q.join(Employee, Employee.id == OnboardingProcess.employee_id)
-             .join(User, User.id == Employee.user_id)
+            q.join(User, User.id == Employee.user_id)
              .filter(or_(
                  func.lower(User.full_name).like(like),
                  func.lower(Employee.employee_id).like(like),
@@ -564,7 +586,9 @@ def get_process_by_employee(
 ):
     proc = (
         db.query(OnboardingProcess)
-        .filter(OnboardingProcess.employee_id == employee_id, OnboardingProcess.is_deleted == False)  # noqa: E712
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(OnboardingProcess.employee_id == employee_id,
+                OnboardingProcess.is_deleted == False, _ACTIVE_EMP)  # noqa: E712
         .first()
     )
     if not proc:
@@ -631,7 +655,8 @@ def journey_state(
     # Aggregate across all in-progress processes
     counts = (
         db.query(OnboardingProcess.current_stage, func.count(OnboardingProcess.id))
-        .filter(OnboardingProcess.is_deleted == False)  # noqa: E712
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(OnboardingProcess.is_deleted == False, _ACTIVE_EMP)  # noqa: E712
         .filter(OnboardingProcess.status.in_([OnboardingStatus.IN_PROGRESS, OnboardingStatus.ON_HOLD]))
         .group_by(OnboardingProcess.current_stage)
         .all()
@@ -859,7 +884,12 @@ def list_all_tasks(
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
-    q = db.query(OnboardingTask)
+    q = (
+        db.query(OnboardingTask)
+        .join(OnboardingProcess, OnboardingProcess.id == OnboardingTask.process_id)
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(_ACTIVE_EMP)
+    )
     if status_filter:
         q = q.filter(OnboardingTask.status == status_filter)
     if process_id:
@@ -1002,7 +1032,8 @@ def report_pending_onboarding(
 ):
     rows = (
         db.query(OnboardingProcess)
-        .filter(OnboardingProcess.status == OnboardingStatus.IN_PROGRESS)
+        .join(Employee, Employee.id == OnboardingProcess.employee_id)
+        .filter(OnboardingProcess.status == OnboardingStatus.IN_PROGRESS, _ACTIVE_EMP)
         .order_by(OnboardingProcess.target_joining_date.asc().nullslast())
         .all()
     )

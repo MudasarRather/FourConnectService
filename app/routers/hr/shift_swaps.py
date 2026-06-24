@@ -27,6 +27,7 @@ _WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 from app.schemas.hr.shift_ops import ShiftSwapCreate, SwapDecisionBody, ShiftSwapResponse
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.attendance_logic import log
+from app.utils.hr.lifecycle_guard import guard_schedulable
 
 router = APIRouter(prefix="/hr/shift-swaps", tags=["HR — Shift Swaps"])
 
@@ -127,8 +128,13 @@ def create_swap(
     if payload.requester_employee_id == payload.counterparty_employee_id:
         raise HTTPException(400, "Requester and counterparty must differ")
     for eid in (payload.requester_employee_id, payload.counterparty_employee_id):
-        if not db.query(Employee).filter(Employee.id == eid, Employee.is_deleted == False).first():  # noqa: E712
+        emp = db.query(Employee).filter(Employee.id == eid, Employee.is_deleted == False).first()  # noqa: E712
+        if not emp:
             raise HTTPException(404, "Employee not found")
+        # A separated employee can't swap; a leaving one not past their last day.
+        # (An exited employee may still carry a stale active assignment window, so
+        # _active_shift_on alone wouldn't stop the swap — this guard does.)
+        guard_schedulable(emp, payload.swap_date, "swap shifts")
 
     # ── Integrity: you can only swap shifts the employees are ACTUALLY assigned
     # on swap_date. Derive both authoritatively from live assignments (ignore any

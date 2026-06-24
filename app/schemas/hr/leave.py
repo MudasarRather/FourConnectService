@@ -230,6 +230,25 @@ class LeaveBulkDecideBody(BaseModel):
     notes: Optional[str] = Field(None, max_length=1000)
 
 
+class LeaveLapseBody(BaseModel):
+    """Close an un-actioned, past-dated leave as LAPSED. The remark is mandatory
+    (audit trail) — it records WHY the manager / HR did not approve it in time."""
+    model_config = ConfigDict(extra="ignore")
+    reason: str = Field(..., min_length=4, max_length=600)
+
+
+class LeaveGrantPolicyBody(BaseModel):
+    """Bulk-grant the policy annual quota to a roster of employees. Idempotent
+    top-up: each eligible employee's available balance is lifted UP TO the
+    policy quota for the chosen leave types; nobody is reduced."""
+    model_config = ConfigDict(extra="ignore")
+    leave_types: Optional[List[LeaveType]] = None       # None → every capped active policy
+    department_id: Optional[UUID] = None                # scope to a department
+    employee_ids: Optional[List[UUID]] = Field(None, max_length=2000)  # explicit roster
+    fiscal_year: Optional[str] = None                   # None → current FY
+    reason: Optional[str] = Field(None, max_length=400)
+
+
 class LeaveWithdrawBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
     note: Optional[str] = Field(None, max_length=400)
@@ -395,6 +414,7 @@ class LeaveBalanceResponse(BaseModel):
     employee_name: Optional[str] = None
     employee_code: Optional[str] = None
     department_name: Optional[str] = None
+    lifecycle_state: Optional[str] = None   # ACTIVE / ON_PROBATION / ON_NOTICE / …
     leave_type: LeaveType
     fiscal_year: str
     opening_balance: Decimal
@@ -407,6 +427,7 @@ class LeaveBalanceResponse(BaseModel):
     # Convenience computed fields (router fills them)
     available: Decimal = Decimal("0")
     quota: Decimal = Decimal("0")
+    monthly_accrual: Decimal = Decimal("0")   # > 0 ⇒ accrual-based (auto-credited, not bulk-grantable)
     utilisation_pct: float = 0.0
     model_config = ConfigDict(from_attributes=True)
 

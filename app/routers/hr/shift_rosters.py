@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta, datetime
 from math import ceil
-from typing import Optional
+from typing import Dict, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status as http_status
@@ -28,6 +28,7 @@ from app.schemas.hr.shift_planning import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.attendance_logic import log
+from app.utils.hr.lifecycle_guard import LEAVING_OR_GONE
 
 router = APIRouter(prefix="/hr/shift-rosters", tags=["HR — Shift Rosters"])
 
@@ -218,7 +219,29 @@ def publish_roster(
     entries = db.query(ShiftRosterEntry).filter(
         ShiftRosterEntry.roster_id == r.id, ShiftRosterEntry.shift_id.isnot(None)).all()
     written, skipped = 0, 0
+    # Per-employee lifecycle cache so a leaving/departed member never gets a
+    # rostered shift dated after their last working day. Bulk publish must not
+    # abort wholesale on one bad entry, so we SKIP (count into `skipped`) rather
+    # than raise — matching the idempotency/no-op skip accounting just below.
+    _lwd_cache: Dict[UUID, tuple] = {}
+
+    def _past_lwd(employee_id: UUID, day) -> bool:
+        cached = _lwd_cache.get(employee_id)
+        if cached is None:
+            emp = db.query(Employee).filter(Employee.id == employee_id).first()
+            cached = (
+                (emp.lifecycle_state in LEAVING_OR_GONE) if emp else False,
+                getattr(emp, "last_working_date", None) if emp else None,
+            )
+            _lwd_cache[employee_id] = cached
+        is_leaving, lwd = cached
+        return bool(is_leaving and lwd and day > lwd)
+
     for e in entries:
+        # Leaving/departed employee — never roster a shift past their LWD.
+        if _past_lwd(e.employee_id, e.day):
+            skipped += 1
+            continue
         # idempotency — skip an identical one-day window
         if db.query(EmployeeShiftAssignment).filter(
             EmployeeShiftAssignment.employee_id == e.employee_id,

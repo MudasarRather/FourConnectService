@@ -29,7 +29,7 @@ from app.schemas.hr.payroll import (
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.payroll.service import (
     next_batch_no, write_audit, generate_batch, can_transition, month_bounds,
-    post_adjustments_paid, post_overtime_processed, resolve_eligibility,
+    post_adjustments_paid, post_overtime_processed, resolve_eligibility, stale_payslips,
 )
 
 router = APIRouter(prefix="/hr/payroll/batches", tags=["HR — Payroll Batches"])
@@ -137,6 +137,25 @@ def _transition(db, b: PayrollBatch, action: str, actor: User, body: Optional[Ba
     target = _ACTION_TO_STATUS[action]
     if not can_transition(b.status, target):
         raise HTTPException(409, f"Cannot {action} a batch in status {b.status.value}")
+    # Freshness gate — never sign off or pay figures that no longer match attendance.
+    # A run generated before its period's attendance was finalized (or before later
+    # corrections / exit-related absences) carries stale Loss-of-Pay; releasing it
+    # would overpay (e.g. a full month to someone who never clocked in). Force a
+    # re-generate first. (Re-generate sends the batch back to GENERATED, dropping
+    # non-released payslips and rebuilding them from current attendance.)
+    if action in ("approve", "release"):
+        stale = stale_payslips(db, b)
+        if stale:
+            sample = ", ".join(
+                f"{s['employee_code'] or s['employee_id'][:8]} (LOP {s['stored_lop']:g}→{s['current_lop']:g})"
+                for s in stale[:5]
+            )
+            more = f" +{len(stale) - 5} more" if len(stale) > 5 else ""
+            raise HTTPException(
+                409,
+                f"Cannot {action}: {len(stale)} payslip(s) have Loss-of-Pay that no longer "
+                f"matches attendance — re-generate the run first. e.g. {sample}{more}",
+            )
     prev = b.status.value
     now = datetime.now(timezone.utc)
     b.status = target
@@ -519,7 +538,7 @@ def _bank_pdf(b, rows) -> bytes:
         f'<tr class="{"miss" if not r["valid"] else ""}">'
         f'<td class="c">{i}</td><td class="mono">{r["code"]}</td><td>{r["name"]}</td>'
         f'<td>{r["department"] or "—"}</td><td>{r["bank"] or "—"}</td>'
-        f'<td class="mono">{("•••• " + r["account"][-4:]) if r["account"] else "—"}</td>'
+        f'<td class="mono">{r["account"] or "—"}</td>'
         f'<td class="mono">{r["ifsc"] or "—"}</td>'
         f'<td class="amt">₹ {_bf_inr(r["net"])}</td>'
         f'<td class="c"><span class="pill {"ok" if r["valid"] else "no"}">{"READY" if r["valid"] else "MISSING"}</span></td></tr>'

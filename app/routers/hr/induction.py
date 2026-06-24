@@ -21,6 +21,7 @@ from app.schemas.hr.induction import (
     InductionBulkInviteBody,
 )
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.lifecycle_guard import guard_employable
 
 
 router = APIRouter(prefix="/hr/induction", tags=["HR — Induction"])
@@ -155,6 +156,8 @@ def bulk_invite(
         raise HTTPException(404, "Session not found")
     created: List[InductionAttendance] = []
     for emp_id in payload.employee_ids:
+        emp = db.query(Employee).filter(Employee.id == emp_id).first()
+        guard_employable(emp, "invite this employee to induction")
         existing = db.query(InductionAttendance).filter(
             InductionAttendance.session_id == session_id,
             InductionAttendance.employee_id == emp_id,

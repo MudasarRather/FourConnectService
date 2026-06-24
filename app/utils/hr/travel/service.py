@@ -182,6 +182,7 @@ def employee_snapshot(db: Session, employee_id: UUID) -> dict:
             User.full_name.label("name"), User.email.label("email"),
             Department.name.label("dept"), Designation.name.label("desg"),
             Grade.name.label("grade"), Employee.grade_id, Employee.reporting_manager_id,
+            Employee.lifecycle_state, Employee.last_working_date,
         )
         .join(User, User.id == Employee.user_id)
         .outerjoin(Department, Department.id == Employee.department_id)
@@ -196,6 +197,7 @@ def employee_snapshot(db: Session, employee_id: UUID) -> dict:
         "name": snap.name, "code": snap.code, "email": snap.email,
         "dept": snap.dept, "desg": snap.desg, "grade": snap.grade,
         "grade_id": snap.grade_id, "reporting_manager_id": snap.reporting_manager_id,
+        "lifecycle_state": snap.lifecycle_state, "last_working_date": snap.last_working_date,
     }
 
 
@@ -243,6 +245,20 @@ def to_response(db: Session, req: TravelRequest, *, deep: bool = True) -> dict:
     """Build the TravelRequestResponse dict (Pydantic validates on the way out)."""
     _today = trav_today()
     snap = employee_snapshot(db, req.employee_id)
+
+    # Why an approval would be refused, surfaced ONLY while the request is awaiting a
+    # decision so the approver UI can disable the Approve action (and say why) before
+    # the click instead of failing it with a 409 toast. Mirrors the raising guards in
+    # flow.apply_decision exactly — see lifecycle_guard.travel_approval_block_reason.
+    approval_block = None
+    if req.status == TravelRequestStatus.PENDING_APPROVAL and snap.get("lifecycle_state") is not None:
+        from types import SimpleNamespace
+        from app.utils.hr.lifecycle_guard import travel_approval_block_reason
+        approval_block = travel_approval_block_reason(
+            SimpleNamespace(lifecycle_state=snap["lifecycle_state"],
+                            last_working_date=snap.get("last_working_date")),
+            req.return_date or req.departure_date,
+        )
     cat = req.category
     project_name = None
     if req.project_id:
@@ -370,4 +386,5 @@ def to_response(db: Session, req: TravelRequest, *, deep: bool = True) -> dict:
         and (req.departure_date is None or req.departure_date <= _today),
         "can_complete": req.status == TravelRequestStatus.IN_PROGRESS
         and (req.return_date is None or req.return_date <= _today),
+        "approval_block": approval_block,
     }

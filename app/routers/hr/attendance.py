@@ -46,6 +46,7 @@ from app.utils.hr.attendance_logic import (
     daily_rollup, mark_absentees, lock_day, resolve_shift, verify_geofence, log,
     finalize_orphan_open_punches, GeoVerifyResult, _day_bounds_utc,
 )
+from app.utils.hr.lifecycle_guard import guard_within_tenure
 
 
 router = APIRouter(prefix="/hr/attendance", tags=["HR — Attendance"])
@@ -420,6 +421,12 @@ def create_attendance(
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_superuser),
 ):
+    emp = db.query(Employee).filter(
+        Employee.id == payload.employee_id,
+        Employee.is_deleted == False,  # noqa: E712
+    ).first()
+    # A leaving / departed employee may not have attendance recorded past LWD.
+    guard_within_tenure(emp, payload.date, "record attendance")
     existing = (
         db.query(Attendance)
         .filter(Attendance.employee_id == payload.employee_id, Attendance.date == payload.date)
@@ -477,6 +484,8 @@ def admin_punch_on_behalf(
         raise HTTPException(404, "Employee not found")
     today = date.today()
     target_date = on_date or today
+    # A leaving / departed employee may not have punches recorded past LWD.
+    guard_within_tenure(emp, target_date, "punch attendance")
     requested = payload.punch_type
 
     # ── Past-date OUT punch: route through the finalizer ──────────────────

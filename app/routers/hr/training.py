@@ -22,6 +22,7 @@ from app.schemas.hr.training import (
 )
 from app.models.hr.training_audit_log import TrainingAuditAction
 from app.utils.hr.training.audit import write_training_audit
+from app.utils.hr.lifecycle_guard import guard_employable
 from app.utils.dependencies import get_current_superuser
 
 
@@ -231,8 +232,8 @@ def create_assignment(
 ):
     if not db.query(TrainingProgram).filter(TrainingProgram.id == payload.program_id).first():
         raise HTTPException(404, "Program not found")
-    if not db.query(Employee).filter(Employee.id == payload.employee_id).first():
-        raise HTTPException(404, "Employee not found")
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+    guard_employable(emp, "assign training to this employee")
     a = TrainingAssignment(**payload.model_dump())
     db.add(a)
     db.commit()

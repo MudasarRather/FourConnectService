@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
+from app.utils.crypto import EncryptedString
 
 
 class EmploymentType(str, enum.Enum):
@@ -108,7 +109,7 @@ class Employee(Base):
 
     # ──────────── Bank & Salary ────────────
     bank_name = Column(String(120), nullable=True)
-    account_number = Column(String(40), nullable=True)  # TODO Phase 1.2: encrypt at rest with pgcrypto
+    account_number = Column(EncryptedString, nullable=True)  # encrypted at rest (Fernet) — see app/utils/crypto.py
     ifsc = Column(String(20), nullable=True)
     salary_structure_id = Column(UUID(as_uuid=True), ForeignKey("hr_salary_structures.id", ondelete="SET NULL"), nullable=True, index=True)  # default structure (Payroll)
     monthly_ctc = Column(Numeric(12, 2), nullable=True)
@@ -126,6 +127,11 @@ class Employee(Base):
     notice_period_start_date = Column(Date, nullable=True)
     last_working_date = Column(Date, nullable=True)
     exit_date = Column(Date, nullable=True)
+    # Rehire / boomerang tracking — original_joining_date preserves the first-ever
+    # join (service history) across rehires; rehire_count is how many times brought
+    # back. Both added by add_rehire_support.py (create_all can't alter columns).
+    original_joining_date = Column(Date, nullable=True)
+    rehire_count = Column(Integer, nullable=False, default=0, server_default="0")
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)
     archived_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)

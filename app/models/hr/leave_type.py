@@ -37,6 +37,7 @@ class LeaveStatus(str, enum.Enum):
         PENDING_MANAGER → MANAGER_REJECTED  (terminal)
         PENDING_HR     → REJECTED           (terminal)
         APPROVED       → CANCELLED          (admin only; reverses ledger)
+        any PENDING_*  → LAPSED             (mgr/HR close-out; dates already passed)
     Admin manual override skips both pending states and lands APPROVED with
     `is_admin_override=True`.
     """
@@ -48,6 +49,10 @@ class LeaveStatus(str, enum.Enum):
     MANAGER_REJECTED = "MANAGER_REJECTED"
     CANCELLED = "CANCELLED"
     WITHDRAWN = "WITHDRAWN"
+    # A pending request whose dates have already passed without being actioned.
+    # It can no longer be approved (the days are gone); the reporting manager or
+    # HR closes it as LAPSED with a mandatory remark for the audit trail.
+    LAPSED = "LAPSED"
 
 
 class LeaveSession(str, enum.Enum):

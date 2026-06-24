@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-secret-key-here-change-this-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
+
+    # Passphrase for application-level field encryption (PII at rest — e.g. bank
+    # account numbers via app.utils.crypto.EncryptedString). Falls back to
+    # SECRET_KEY when unset. Changing it makes previously-encrypted values
+    # unreadable, so treat it like a database password.
+    FIELD_ENCRYPTION_KEY: Optional[str] = None
     
     # Application
     PROJECT_NAME: str = "Fourreck"

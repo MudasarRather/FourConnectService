@@ -30,6 +30,7 @@ from app.schemas.hr.shift_planning import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.attendance_logic import log
+from app.utils.hr.lifecycle_guard import LEAVING_OR_GONE, SEPARATED
 
 router = APIRouter(prefix="/hr/shift-rotations", tags=["HR — Shift Rotations"])
 
@@ -144,6 +145,14 @@ def _materialize_cycle(db: Session, r: ShiftRotation, actor_id, cycle_no: int) -
     period = r.frequency_days or 7
     anchor = r.anchor_date or date.today()
     today = date.today()
+    # Lifecycle map for every member — fully separated members get no future
+    # rotation slots at all, and a leaving member's windows are capped at (or
+    # dropped past) their last working day so a rotation never commits a shift
+    # to someone after they've left.
+    member_ids = [m.employee_id for m in members]
+    emp_rows = (db.query(Employee.id, Employee.lifecycle_state, Employee.last_working_date)
+                .filter(Employee.id.in_(member_ids)).all()) if member_ids else []
+    _lifecycle = {row.id: (row.lifecycle_state, row.last_working_date) for row in emp_rows}
     written = 0
     for k in range(n):
         gweek = cycle_no * n + k
@@ -152,6 +161,17 @@ def _materialize_cycle(db: Session, r: ShiftRotation, actor_id, cycle_no: int) -
         if wt < today:
             continue  # don't materialise windows entirely in the past
         for mem in members:
+            state, lwd = _lifecycle.get(mem.employee_id, (None, None))
+            # Fully separated (EXITED / ARCHIVED / INACTIVE) — never schedule.
+            if state in SEPARATED:
+                continue
+            # Leaving (ON_NOTICE etc.) with a known LWD — cap at the LWD.
+            eff_until = wt
+            if state in LEAVING_OR_GONE and lwd:
+                if wf > lwd:
+                    continue  # entire window is past their last working day
+                if wt > lwd:
+                    eff_until = lwd  # cap the tail at the last working day
             step = steps[(gweek + (mem.phase_offset or 0)) % n]
             if step.shift_id is None:
                 continue  # OFF — rest block
@@ -179,7 +199,7 @@ def _materialize_cycle(db: Session, r: ShiftRotation, actor_id, cycle_no: int) -
                     p.effective_from = wt + timedelta(days=1)  # starts inside, extends past
             db.add(EmployeeShiftAssignment(
                 employee_id=mem.employee_id, shift_id=step.shift_id,
-                effective_from=wf, effective_until=wt,
+                effective_from=wf, effective_until=eff_until,
                 notes=_rotation_note(r), created_by_id=actor_id))
             written += 1
     return written

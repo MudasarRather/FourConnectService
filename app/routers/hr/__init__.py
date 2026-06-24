@@ -109,6 +109,13 @@ from app.routers.hr.travel_da_rates import router as _travel_da_rates_router
 from app.routers.hr.travel_reports import router as _travel_reports_router
 from app.routers.hr.travel_self import router as _travel_self_router
 from app.routers.hr.travel import router as _travel_router
+# Exit Management module — Phase 5 (Ceremonial Gateway). The self router
+# (/hr/me/exit) is distinct; the broad /hr/exit router declares its literal roots
+# (/dashboard, /cases, /policies, /audit-logs, /notice-board, /verify/{code},
+# /clearance-items/...) and a /{case_id:uuid} converter, so order vs. self is safe.
+from app.routers.hr.exit_reports import router as _exit_reports_router
+from app.routers.hr.exit_self import router as _exit_self_router
+from app.routers.hr.exit_management import router as _exit_management_router
 
 router = APIRouter()
 router.include_router(_dashboard_router)
@@ -230,3 +237,8 @@ router.include_router(_travel_da_rates_router)
 router.include_router(_travel_reports_router)
 router.include_router(_travel_self_router)
 router.include_router(_travel_router)
+
+# Exit Management — reports (/hr/exit/reports) + self (/hr/me/exit) before the broad /hr/exit router.
+router.include_router(_exit_reports_router)
+router.include_router(_exit_self_router)
+router.include_router(_exit_management_router)

@@ -18,6 +18,7 @@ class EmployeeChangeType(str, enum.Enum):
     NOTICE_SERVED = "NOTICE_SERVED"
     EXITED = "EXITED"
     ARCHIVED = "ARCHIVED"
+    REHIRED = "REHIRED"
 
 
 class EmployeeHistory(Base):

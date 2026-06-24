@@ -31,6 +31,7 @@ from app.schemas.hr.shift_planning import (
 )
 from app.utils.dependencies import get_current_user, get_current_superuser
 from app.utils.hr.attendance_logic import log
+from app.utils.hr.lifecycle_guard import guard_within_tenure, guard_schedulable, SEPARATED
 
 router = APIRouter(prefix="/hr/shifts", tags=["HR — Shifts"])
 
@@ -51,15 +52,26 @@ def _to_shift_response(s: Shift) -> ShiftResponse:
 
 def _to_assignment_response(db: Session, a: EmployeeShiftAssignment) -> EmployeeShiftAssignmentResponse:
     shift = db.query(Shift).filter(Shift.id == a.shift_id).first()
-    name_row = (
-        db.query(User.full_name)
-        .join(Employee, Employee.user_id == User.id)
+    # outerjoin User so employees without a linked login still resolve lifecycle.
+    emp_row = (
+        db.query(Employee.lifecycle_state, Employee.last_working_date, User.full_name)
+        .outerjoin(User, User.id == Employee.user_id)
         .filter(Employee.id == a.employee_id)
         .first()
     )
+    lifecycle = None
+    lwd = None
+    full_name = None
+    if emp_row:
+        ls = emp_row[0]
+        lifecycle = ls.value if hasattr(ls, "value") else (str(ls) if ls is not None else None)
+        lwd = emp_row[1]
+        full_name = emp_row[2]
     return EmployeeShiftAssignmentResponse(
         id=a.id, employee_id=a.employee_id,
-        employee_name=name_row[0] if name_row else None,
+        employee_name=full_name,
+        lifecycle_state=lifecycle,
+        last_working_date=lwd,
         shift_id=a.shift_id,
         shift_code=shift.code if shift else None,
         shift_name=shift.name if shift else None,
@@ -153,13 +165,21 @@ def shifts_dashboard(
     active_shifts = db.query(func.count(Shift.id)).filter(
         Shift.is_deleted == False, Shift.is_active == True).scalar() or 0  # noqa: E712
 
-    employees_assigned = db.query(
-        func.count(distinct(EmployeeShiftAssignment.employee_id))).filter(act).scalar() or 0
+    # Deployment counts only the present workforce — separated employees
+    # (EXITED / ARCHIVED / INACTIVE) are no longer deployed even if a stale
+    # assignment window still spans today.
+    employees_assigned = (
+        db.query(func.count(distinct(EmployeeShiftAssignment.employee_id)))
+        .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
+        .filter(act, Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED)).scalar() or 0)
 
     night_shift_employees = (
         db.query(func.count(distinct(EmployeeShiftAssignment.employee_id)))
         .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
-        .filter(Shift.shift_type == ShiftType.NIGHT, act).scalar() or 0)
+        .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
+        .filter(Shift.shift_type == ShiftType.NIGHT, act, Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED)).scalar() or 0)
 
     upcoming_rotations = db.query(func.count(ShiftRotation.id)).filter(
         ShiftRotation.is_deleted == False, ShiftRotation.is_active == True).scalar() or 0  # noqa: E712
@@ -213,10 +233,16 @@ def shifts_dashboard(
     )
 
     # ── Shift distribution (assignments per active shift, today) ──
+    # Count distinct present-workforce employees per shift (separated crew excluded
+    # via the Employee outerjoin's ON clause, so empty shifts still report 0).
     dist_rows = (
-        db.query(Shift, func.count(EmployeeShiftAssignment.id))
+        db.query(Shift, func.count(distinct(Employee.id)))
         .outerjoin(EmployeeShiftAssignment,
                    and_(EmployeeShiftAssignment.shift_id == Shift.id, _active_on(today)))
+        .outerjoin(Employee,
+                   and_(Employee.id == EmployeeShiftAssignment.employee_id,
+                        Employee.is_deleted == False,  # noqa: E712
+                        Employee.lifecycle_state.notin_(SEPARATED)))
         .filter(Shift.is_deleted == False, Shift.is_active == True)  # noqa: E712
         .group_by(Shift.id).order_by(Shift.created_at.asc()).all())
     shift_distribution = [
@@ -228,13 +254,15 @@ def shifts_dashboard(
     dept_total = dict(
         db.query(Employee.department_id, func.count(distinct(EmployeeShiftAssignment.employee_id)))
         .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
-        .filter(act, Employee.is_deleted == False)  # noqa: E712
+        .filter(act, Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED))
         .group_by(Employee.department_id).all())
     dept_night = dict(
         db.query(Employee.department_id, func.count(distinct(EmployeeShiftAssignment.employee_id)))
         .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
         .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
-        .filter(act, Shift.shift_type == ShiftType.NIGHT, Employee.is_deleted == False)  # noqa: E712
+        .filter(act, Shift.shift_type == ShiftType.NIGHT, Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED))
         .group_by(Employee.department_id).all())
     dept_names = dict(db.query(Department.id, Department.name).all())
     dept_allocation = [
@@ -273,7 +301,10 @@ def shifts_dashboard(
     night_assigns = (
         db.query(EmployeeShiftAssignment.effective_from, EmployeeShiftAssignment.effective_until)
         .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
+        .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
         .filter(Shift.shift_type == ShiftType.NIGHT,
+                Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED),
                 EmployeeShiftAssignment.effective_from <= today,
                 or_(EmployeeShiftAssignment.effective_until.is_(None),
                     EmployeeShiftAssignment.effective_until >= window_start)).all())
@@ -290,11 +321,13 @@ def shifts_dashboard(
              .order_by(ShiftCoverageRule.created_at.asc()).limit(12).all())
     weekly_coverage = []
     for r in rules:
-        cq = db.query(func.count(distinct(EmployeeShiftAssignment.employee_id))).filter(
-            EmployeeShiftAssignment.shift_id == r.shift_id, _active_on(today))
+        cq = (db.query(func.count(distinct(EmployeeShiftAssignment.employee_id)))
+              .join(Employee, Employee.id == EmployeeShiftAssignment.employee_id)
+              .filter(EmployeeShiftAssignment.shift_id == r.shift_id, _active_on(today),
+                      Employee.is_deleted == False,  # noqa: E712
+                      Employee.lifecycle_state.notin_(SEPARATED)))
         if r.department_id:
-            cq = cq.join(Employee, Employee.id == EmployeeShiftAssignment.employee_id).filter(
-                Employee.department_id == r.department_id)
+            cq = cq.filter(Employee.department_id == r.department_id)
         assigned = cq.scalar() or 0
         sh = db.query(Shift.name).filter(Shift.id == r.shift_id).first()
         weekly_coverage.append(CoverageSnapshot(
@@ -423,10 +456,21 @@ def list_assignments(
     shift_id: Optional[UUID] = None,
     active_on: Optional[date] = None,
     upcoming: bool = False,
+    include_separated: bool = False,
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_superuser),
 ):
-    q = db.query(EmployeeShiftAssignment)
+    # The "Active deployments" board shows who is actually on the roster. A
+    # separated employee (EXITED / ARCHIVED / INACTIVE) is no longer active crew
+    # regardless of an assignment window that may still be open or future-dated,
+    # so they are excluded by default. ON_NOTICE crew are still working until
+    # their last day and DO appear (flagged via lifecycle_state in the response).
+    # `include_separated=true` is the escape hatch for an audit/all view.
+    q = db.query(EmployeeShiftAssignment).join(
+        Employee, Employee.id == EmployeeShiftAssignment.employee_id
+    ).filter(Employee.is_deleted == False)  # noqa: E712
+    if not include_separated:
+        q = q.filter(Employee.lifecycle_state.notin_(SEPARATED))
     if employee_id:
         q = q.filter(EmployeeShiftAssignment.employee_id == employee_id)
     if shift_id:
@@ -449,10 +493,15 @@ def create_assignment(
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_superuser),
 ):
-    if not db.query(Employee).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first():  # noqa: E712
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first()  # noqa: E712
+    if not emp:
         raise HTTPException(404, "Employee not found")
     if not db.query(Shift).filter(Shift.id == payload.shift_id, Shift.is_deleted == False).first():  # noqa: E712
         raise HTTPException(404, "Shift not found")
+    # A separated employee can't be assigned at all; a leaving one not past their LWD.
+    guard_schedulable(emp, payload.effective_from, "assign a shift")
+    if payload.effective_until:
+        guard_schedulable(emp, payload.effective_until, "assign a shift")
     # Close any prior active assignment for this employee
     prior = (
         db.query(EmployeeShiftAssignment)
@@ -569,6 +618,16 @@ def delete_shift(
     )
     if active:
         raise HTTPException(409, f"Cannot delete; {active} active assignment(s). Reassign first.")
+    # Also block when employees still have this as their DEFAULT shift — deleting
+    # it would leave a dangling Employee.shift_id, and resolve_shift() then returns
+    # None → those employees get marked ABSENT every day (breaks attendance + pay).
+    default_of = (
+        db.query(Employee)
+        .filter(Employee.shift_id == shift_id, Employee.is_deleted == False)  # noqa: E712
+        .count()
+    )
+    if default_of:
+        raise HTTPException(409, f"Cannot delete; it is the default shift of {default_of} employee(s). Reassign their shift first.")
     s.is_deleted = True
     db.commit()
 
@@ -601,6 +660,44 @@ def bulk_assign_shift(
 
     new_from = body.effective_from
     new_until = body.effective_until  # may be None for indefinite
+
+    # Pre-flight 0: lifecycle / tenure. A leaving or departed employee may not be
+    # deployed past their last working day (and the fully-separated not at all).
+    # Mirrors create_assignment's guard; collected so we can name everyone at once.
+    blocked = []
+    for emp_id in body.employee_ids:
+        emp = db.query(Employee).filter(Employee.id == emp_id, Employee.is_deleted == False).first()  # noqa: E712
+        if not emp:
+            continue
+        try:
+            guard_schedulable(emp, new_from, "deploy to a shift")
+            if new_until is not None:
+                guard_schedulable(emp, new_until, "deploy to a shift")
+        except HTTPException as exc:
+            name_row = (
+                db.query(User.full_name)
+                .join(Employee, Employee.user_id == User.id)
+                .filter(Employee.id == emp_id).first()
+            )
+            blocked.append({
+                "employee_id": str(emp_id),
+                "employee_name": (name_row[0] if name_row else None) or emp.employee_id,
+                "lifecycle_state": emp.lifecycle_state.value if hasattr(emp.lifecycle_state, "value") else str(emp.lifecycle_state),
+                "last_working_date": emp.last_working_date.isoformat() if emp.last_working_date else None,
+                "reason": exc.detail,
+            })
+    if blocked:
+        names = ", ".join(sorted({b["employee_name"] for b in blocked}))
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Cannot deploy {names}: they have left or are serving notice and the "
+                    "shift window runs past their last working day. Shorten the window or remove them."
+                ),
+                "blocked": blocked,
+            },
+        )
 
     # Pre-flight: collect every conflict so we can return a single helpful 409.
     conflicts = []

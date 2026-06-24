@@ -21,6 +21,7 @@ from sqlalchemy.sql import func
 from app.database import Base
 from app.models.hr.employee import TaxRegime
 from app.models.hr.salary_component import ComponentType, StatutoryKind
+from app.utils.crypto import EncryptedString
 
 
 class PayslipStatus(str, enum.Enum):
@@ -62,7 +63,7 @@ class Payslip(Base):
 
     # Snapshots (faithful re-print)
     bank_name = Column(String(120), nullable=True)
-    account_number = Column(String(40), nullable=True)
+    account_number = Column(EncryptedString, nullable=True)  # encrypted at rest (Fernet) — see app/utils/crypto.py
     ifsc = Column(String(20), nullable=True)
     pf_number = Column(String(30), nullable=True)
     esic_number = Column(String(30), nullable=True)

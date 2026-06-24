@@ -19,6 +19,7 @@ from app.schemas.hr.payroll import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.payroll.service import write_audit
+from app.utils.hr.lifecycle_guard import guard_settleable
 
 router = APIRouter(prefix="/hr/payroll/adjustments", tags=["HR — Payroll Adjustments"])
 
@@ -70,8 +71,8 @@ def list_adjustments(adjustment_type: Optional[AdjustmentType] = None, status: O
 @router.post("/", response_model=AdjustmentResponse, status_code=201)
 def create_adjustment(payload: AdjustmentCreate, db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_superuser)):
-    if not db.query(Employee.id).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first():  # noqa: E712
-        raise HTTPException(404, "Employee not found")
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id, Employee.is_deleted == False).first()  # noqa: E712
+    guard_settleable(emp, "create a payroll adjustment for this employee")
     a = PayrollAdjustment(**payload.model_dump(), status=AdjustmentStatus.DRAFT, created_by_id=current_user.id)
     db.add(a)
     db.flush()

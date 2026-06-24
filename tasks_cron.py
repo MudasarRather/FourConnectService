@@ -1,6 +1,18 @@
 import os
 import sys
 
+# Prime platform cache BEFORE importing app/* — SQLAlchemy's import path can hit
+# platform.uname() → WMI, which intermittently hangs on this box. Mirrors
+# C:/tmp/run_server.py so the scheduled run never wedges on a stuck Winmgmt.
+import platform
+try:
+    _ur = platform.uname_result("Windows", "localhost", "11", "10.0.26200", "AMD64")
+    _ur.__dict__["processor"] = "Intel"
+    platform._uname_cache = _ur
+    platform._Processor.get = staticmethod(lambda: "Intel")
+except Exception:
+    pass
+
 # Add current directory to path so we can import app
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,6 +54,12 @@ def run_cron():
         from app.utils.hr.travel.scheduler import run_travel_auto_transitions
         tv = run_travel_auto_transitions(db)
         print(f"- Travel auto-transitions: {tv}")
+
+        # 7. Leave upkeep: monthly accrual (idempotent, quota-capped) + FY-rollover
+        #    carry-forward on 01-Apr. Safe to run daily.
+        from app.utils.hr.leave_maintenance import run_leave_maintenance
+        lv = run_leave_maintenance(db)
+        print(f"- Leave maintenance: {lv}")
 
         print("Success: All transitions processed.")
     except Exception as e:

@@ -118,6 +118,144 @@ def month_lop_days(db: Session, employee_id, year: int, month: int) -> Decimal:
     return Decimal(str(total or 0))
 
 
+def tds_paid_ytd(db: Session, employee_id, year: int, month: int) -> Decimal:
+    """TDS already deducted for this employee in the CURRENT fiscal year (Apr–Mar),
+    on payslips for months BEFORE `month`. Feeds cumulative TDS averaging in the
+    engine so the monthly deduction levels out and auto-catches-up after a capped
+    (net-floored) month. Excludes cancelled payslips."""
+    sy = year if month >= 4 else year - 1     # fiscal year starts in April
+    fy_start_idx = sy * 12 + 4                 # April of the FY-start year
+    cur_idx = year * 12 + month
+    idx = Payslip.period_year * 12 + Payslip.period_month
+    total = (
+        db.query(sa_func.coalesce(sa_func.sum(PayslipLine.amount), 0))
+        .join(Payslip, Payslip.id == PayslipLine.payslip_id)
+        .filter(
+            Payslip.employee_id == employee_id,
+            Payslip.is_deleted == False,  # noqa: E712
+            Payslip.status != PayslipStatus.CANCELLED,
+            PayslipLine.component_code == "TDS",
+            idx >= fy_start_idx, idx < cur_idx,
+        )
+        .scalar()
+    )
+    return Decimal(str(total or 0))
+
+
+def taxable_oneoff_paid_ytd(db: Session, employee_id, year: int, month: int) -> Decimal:
+    """One-time TAXABLE earnings already paid this FY on prior months' payslips —
+    bonus / incentive / commission / arrear / night / holiday / overtime. These are
+    NOT structure salary components (``component_id`` is null) and must be in the
+    annual taxable base so their TDS is withheld. Leave encashment is excluded (its
+    exemption u/s 10(10AA) is settled in the F&F, not auto-taxed here)."""
+    sy = year if month >= 4 else year - 1
+    fy_start_idx = sy * 12 + 4
+    cur_idx = year * 12 + month
+    idx = Payslip.period_year * 12 + Payslip.period_month
+    total = (
+        db.query(sa_func.coalesce(sa_func.sum(PayslipLine.amount), 0))
+        .join(Payslip, Payslip.id == PayslipLine.payslip_id)
+        .filter(
+            Payslip.employee_id == employee_id,
+            Payslip.is_deleted == False,  # noqa: E712
+            Payslip.status != PayslipStatus.CANCELLED,
+            PayslipLine.component_id.is_(None),          # one-time, not a salary component
+            PayslipLine.component_code != "LEAVE_ENCASH",
+            PayslipLine.is_taxable == True,              # noqa: E712
+            PayslipLine.component_type == ComponentType.EARNING,
+            idx >= fy_start_idx, idx < cur_idx,
+        )
+        .scalar()
+    )
+    return Decimal(str(total or 0))
+
+
+def stale_payslips(db: Session, batch, *, tolerance: Decimal = Decimal("0.5")) -> List[Dict[str, Any]]:
+    """Non-released payslips whose frozen Loss-of-Pay no longer matches attendance.
+
+    A run generated BEFORE its period's attendance was finalized (or before later
+    corrections / exit-related absences were recorded) carries stale LOP — releasing
+    it would pay outdated figures (e.g. paying a full month to someone who never
+    clocked in). We first complete the period's attendance (the same idempotent
+    ``finalize_period_for_payroll`` step generation runs), then compare each payslip's
+    stored ``lop_days`` against the live attendance total. Read-only on the payslips —
+    callers gate APPROVE / RELEASE on an empty result and tell the admin to
+    re-generate. Returns one dict per stale payslip."""
+    finalize_period_for_payroll(db, batch.period_year, batch.period_month, batch.department_id)
+    out: List[Dict[str, Any]] = []
+    slips = (
+        db.query(Payslip)
+        .filter(Payslip.batch_id == batch.id, Payslip.is_deleted == False,  # noqa: E712
+                Payslip.status.notin_([PayslipStatus.RELEASED, PayslipStatus.CANCELLED]))
+        .all()
+    )
+    for s in slips:
+        current = month_lop_days(db, s.employee_id, batch.period_year, batch.period_month)
+        stored = Decimal(str(s.lop_days or 0))
+        if abs(current - stored) > tolerance:
+            out.append({
+                "payslip_id": str(s.id),
+                "employee_id": str(s.employee_id),
+                "employee_code": getattr(s.employee, "employee_id", None),
+                "stored_lop": float(stored),
+                "current_lop": float(current),
+            })
+    return out
+
+
+def finalize_period_for_payroll(db: Session, year: int, month: int, department_id=None) -> int:
+    """Make attendance complete for a payroll period BEFORE pay is computed.
+
+    Loss-of-Pay is summed from attendance rows (``month_lop_days``). A day with no
+    row contributes 0 LOP — i.e. "no clock-in, no record" was silently being PAID.
+    This gap-fills a definitive status (via the canonical ``daily_rollup``: WEEK_OFF /
+    HOLIDAY / approved-LEAVE = paid, everything else unworked = ABSENT → LOP 1.0) for
+    every fully-elapsed day of the period, for the *same candidate set payroll pays*
+    (ACTIVE / ON_PROBATION / ON_NOTICE, plus EXITED owed a final settlement — not just
+    ACTIVE like the daily finalizer). After this, an employee who never clocked in and
+    has no APPROVED leave is correctly unpaid for those days.
+
+    Safety: only CREATES missing rows (never recomputes an existing one — respects the
+    recompute caution), only for days that have fully elapsed (skips today + future),
+    and only within each employee's tenure window [joining_date, last_working_date].
+    Idempotent. Returns the number of rows materialised.
+    """
+    from app.models.hr.attendance import AttendanceSource
+    from app.utils.hr.attendance_logic import daily_rollup
+
+    start, end = month_bounds(year, month)
+    cutoff = min(end, date.today() - timedelta(days=1))   # only fully-elapsed days
+    if cutoff < start:
+        return 0
+    emps = candidate_employees(db, year, month, department_id)
+    created = 0
+    for emp in emps:
+        d_start = start
+        if emp.joining_date and emp.joining_date > d_start:
+            d_start = emp.joining_date
+        d_end = cutoff
+        lwd = emp.last_working_date or emp.exit_date
+        if lwd and lwd < d_end:        # don't fabricate absence after they left
+            d_end = lwd
+        d = d_start
+        touched = False
+        while d <= d_end:
+            has_row = (
+                db.query(Attendance.id)
+                .filter(Attendance.employee_id == emp.id, Attendance.date == d,
+                        Attendance.is_deleted == False)  # noqa: E712
+                .first()
+            )
+            if not has_row:
+                daily_rollup(db, emp.id, d, source=AttendanceSource.SYSTEM)
+                created += 1
+                touched = True
+            d += timedelta(days=1)
+        if touched:
+            db.commit()
+    return created
+
+
 def resolve_compensation(db: Session, employee: Employee, year: int, month: int) -> Optional[EmployeeCompensation]:
     """The compensation row whose [effective_from, effective_to] window COVERS the
     period — not merely the latest ACTIVE row.
@@ -329,6 +467,9 @@ def resolve_eligibility(db: Session, year: int, month: int, department_id=None) 
     shows estimated NET pay, paid vs working days, and LOP — not just gross CTC.
     Pure read: safe before a batch exists (wizard) or after generate (exceptions).
     """
+    # Finalize attendance first so "no clock-in / no approved leave" days count as
+    # LOP instead of silently reading as paid (otherwise the preview overstates pay).
+    finalize_period_for_payroll(db, year, month, department_id)
     emps = candidate_employees(db, year, month, department_id)
     cfg = load_config(db, fy_for_period(year, month), None)
     rows: List[Dict] = []
@@ -356,6 +497,7 @@ def resolve_eligibility(db: Session, year: int, month: int, department_id=None) 
             "eligible": blocker is None, "reason": blocker,
             "reason_label": ELIGIBILITY_REASONS.get(blocker) if blocker else None,
             "final_settlement": is_exit and blocker is None,
+            "net_floored": False, "tds_deferred": Decimal("0"),
         }
         if blocker is None:
             built = build_payslip_for_employee(db, emp, year, month, cfg)
@@ -365,6 +507,10 @@ def resolve_eligibility(db: Session, year: int, month: int, department_id=None) 
                 row["working_days"] = built["working_days"]
                 row["est_gross"] = built["gross_earnings"]
                 row["est_net"] = built["net_pay"]
+                # Net was floored to ≥ 0 (deductions exceeded gross) — surface as a
+                # warning so HR sees it instead of a silently-floored payout.
+                row["net_floored"] = bool(built.get("net_floored"))
+                row["tds_deferred"] = built.get("tds_deferred") or Decimal("0")
                 eligible += 1
                 est_monthly += monthly_ctc
                 est_net += built["net_pay"]
@@ -382,10 +528,12 @@ def resolve_eligibility(db: Session, year: int, month: int, department_id=None) 
     # eligible first, then by code; blocked sink to the bottom of the roster
     rows.sort(key=lambda r: (not r["eligible"], r["employee_code"] or ""))
     eligible = sum(1 for r in rows if r["eligible"])
+    floored_count = sum(1 for r in rows if r.get("net_floored"))
     return {
         "period_month": month, "period_year": year, "department_id": department_id,
         "total_candidates": len(emps), "eligible_count": eligible,
         "blocked_count": len(emps) - eligible, "final_settlement_count": final_settlement,
+        "floored_count": floored_count,
         "estimated_monthly_ctc": est_monthly.quantize(Q2),
         "estimated_gross": est_gross.quantize(Q2), "estimated_net": est_net.quantize(Q2),
         "estimated_employer_cost": est_employer.quantize(Q2), "rows": rows,
@@ -757,20 +905,33 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     if not components:
         return None
 
-    working = Decimal(str(days_in_month(year, month)))
+    working = Decimal(str(days_in_month(year, month)))   # proration denominator = full month
     lop = month_lop_days(db, employee.id, year, month)
     start, end = month_bounds(year, month)
-    # Mid-period JOINER: days before the joining date are unpaid (added to LOP so
-    # earnings prorate down). Joining on the 1st ⇒ no effect.
-    if employee.joining_date and start < employee.joining_date <= end:
-        lop = lop + Decimal(str((employee.joining_date - start).days))
-    # Mid-period LEAVER (final settlement): every calendar day after the last
-    # working day is unpaid. The 2-pass gross derivation in compute_payslip still
-    # runs on the full month, so the proration stays clean.
-    if employee.lifecycle_state == LifecycleState.EXITED:
-        lwd = employee.last_working_date or employee.exit_date
-        if lwd and start <= lwd <= end:
-            lop = lop + Decimal(str((end - lwd).days))
+    # ── Payable window ───────────────────────────────────────────────────────
+    # An employee is only paid for days that are actually ACCOUNTABLE within the
+    # period. `lop` above already captures absences on finalized (elapsed) days;
+    # every day OUTSIDE the accountable window is unpaid and added to LOP:
+    #   • before the joining date (mid-period joiner),
+    #   • after the last working day (mid-period leaver / final settlement),
+    #   • NOT YET ELAPSED — a still-running month must not pay for days that
+    #     haven't happened. Those days carry no attendance, so paying them is how
+    #     a no-show was being paid for the rest of the month. They become payable
+    #     as they elapse (and are finalized), so a month-end run pays in full.
+    win_start = max(start, employee.joining_date) if employee.joining_date else start
+    win_end = end
+    today = date.today()
+    if today <= end:                                     # in-progress / future month
+        win_end = min(win_end, today - timedelta(days=1))   # only fully-elapsed days
+    lwd = employee.last_working_date or employee.exit_date
+    if employee.lifecycle_state == LifecycleState.EXITED and lwd:
+        win_end = min(win_end, lwd)
+    if win_start > start:
+        lop = lop + Decimal(str((win_start - start).days))     # pre-joining days
+    if win_end < end:
+        lop = lop + Decimal(str((end - win_end).days))         # post-LWD / not-yet-elapsed days
+    if lop > working:
+        lop = working
     encash = _approved_encashment(db, employee.id)
     adjustments = _pending_adjustments(db, employee.id, year, month)
 
@@ -802,12 +963,22 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     # Apply this employee's structure PF policy (cap at ceiling vs full Basic) for
     # this computation. cfg is shared across the batch, so set it per employee.
     cfg["PF_RESTRICT_TO_CEILING"] = pf_restrict_for(db, structure_id)
+    # One-time TAXABLE earnings this period (bonus/incentive/commission/arrear +
+    # night/holiday — all carry is_taxable) feed the TDS annual base ONCE, plus the
+    # taxable one-offs already paid earlier this FY, so a bonus is actually withheld.
+    this_month_taxable_extra = sum(
+        (Decimal(str(a.get("amount") or 0)) for a in adjustments
+         if a.get("is_taxable", True) and not a.get("is_deduction")),
+        Decimal("0"),
+    )
+    extra_annual_taxable = this_month_taxable_extra + taxable_oneoff_paid_ytd(db, employee.id, year, month)
     result = compute_payslip(
         components=components, monthly_ctc=Decimal(str(monthly_ctc)),
         annual_ctc=Decimal(str(annual_ctc)), monthly_gross_hint=monthly_gross_hint,
         regime=regime, declarations=declarations, working_days=working, lop_days=lop,
         cfg=cfg, encashment_amount=encash, remaining_months=remaining_months_in_fy(month),
-        adjustments=adjustments,
+        adjustments=adjustments, tds_paid_ytd=tds_paid_ytd(db, employee.id, year, month),
+        extra_annual_taxable=extra_annual_taxable,
     )
     # Overtime — APPROVED, not-yet-processed OT dated in this period. Appended
     # after the slip is computed so the hourly rate can use the actual computed
@@ -847,6 +1018,11 @@ def generate_batch(db: Session, batch: PayrollBatch, actor_id) -> PayrollBatch:
     payslips are deleted and re-inserted."""
     if batch.status in GENERATE_BLOCKED:
         raise ValueError(f"Cannot generate a batch in status {batch.status.value}")
+
+    # Finalize attendance for the period first (gap-fill no-clock-in days as LOP, in
+    # its own committed step) so generation can't pay for days with no attendance and
+    # no approved leave — mirrors what the eligibility preview showed.
+    finalize_period_for_payroll(db, batch.period_year, batch.period_month, batch.department_id)
 
     fy = fy_for_period(batch.period_year, batch.period_month)
     cfg = load_config(db, fy, None)

@@ -194,6 +194,20 @@ from app.models.hr.travel_advance import TravelAdvance
 from app.models.hr.travel_settlement import TravelSettlement
 from app.models.hr.travel_audit_log import TravelAuditLog
 
+# Exit Management module — Phase 5 (Ceremonial Gateway)
+from app.models.hr.exit_type import (
+    ResignationType, ExitReasonCategory, ExitCaseStatus, OPEN_CASE_STATUSES,
+    ClearanceDepartment, ClearanceItemStatus, SettlementStatus as ExitSettlementStatus,
+    InterviewStatus as ExitInterviewStatus, ExitDocStatus, ExitAuditAction,
+)
+from app.models.hr.exit_policy import ExitPolicy
+from app.models.hr.exit_case import ExitCase
+from app.models.hr.exit_clearance import ExitClearanceItem
+from app.models.hr.exit_interview import ExitInterview
+from app.models.hr.exit_settlement import ExitSettlement
+from app.models.hr.exit_document import ExitDocument
+from app.models.hr.exit_audit_log import ExitAuditLog
+
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
 
@@ -418,4 +432,22 @@ __all__ = [
     "TravelAdvance",
     "TravelSettlement",
     "TravelAuditLog",
+    # Exit Management
+    "ResignationType",
+    "ExitReasonCategory",
+    "ExitCaseStatus",
+    "OPEN_CASE_STATUSES",
+    "ClearanceDepartment",
+    "ClearanceItemStatus",
+    "ExitSettlementStatus",
+    "ExitInterviewStatus",
+    "ExitDocStatus",
+    "ExitAuditAction",
+    "ExitPolicy",
+    "ExitCase",
+    "ExitClearanceItem",
+    "ExitInterview",
+    "ExitSettlement",
+    "ExitDocument",
+    "ExitAuditLog",
 ]

@@ -34,11 +34,13 @@ from app.schemas.hr.employee_lifecycle import (
     LifecycleConfirmBody, LifecyclePromoteBody, LifecycleTransferBody,
     LifecycleSuspendBody, LifecycleReinstateBody,
     LifecycleGiveNoticeBody, LifecycleExitBody, LifecycleArchiveBody,
-    LifecyclePutOnProbationBody,
+    LifecyclePutOnProbationBody, LifecycleRehireBody,
 )
+from app.models.hr.exit_case import ExitCase
 from app.utils.auth import get_password_hash
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.onboarding_bootstrap import bootstrap_onboarding
+from app.utils.hr.lifecycle_guard import SEPARATED
 
 router = APIRouter(prefix="/hr/employees", tags=["HR — Employees"])
 
@@ -113,6 +115,9 @@ def _to_list_row(emp: Employee) -> dict:
         "work_location_id": emp.work_location_id,
         "reporting_manager_id": emp.reporting_manager_id,
         "lifecycle_state": emp.lifecycle_state.value if hasattr(emp.lifecycle_state, "value") else emp.lifecycle_state,
+        "last_working_date": emp.last_working_date,
+        "original_joining_date": getattr(emp, "original_joining_date", None),
+        "rehire_count": getattr(emp, "rehire_count", 0) or 0,
         "is_deleted": emp.is_deleted,
         "full_name": getattr(emp.user, "full_name", None) if emp.user else None,
         "email": getattr(emp.user, "email", None) if emp.user else None,
@@ -200,6 +205,7 @@ def list_employees(
     reporting_manager_id: Optional[UUID] = None,
     employment_type: Optional[str] = None,
     lifecycle_state: Optional[str] = None,
+    exclude_separated: bool = False,
     include_deleted: bool = False,
     sort_by: str = Query("created_at"),
     sort_dir: str = Query("desc"),
@@ -230,6 +236,14 @@ def list_employees(
         q = q.filter(Employee.employment_type == employment_type)
     if lifecycle_state:
         q = q.filter(Employee.lifecycle_state == lifecycle_state)
+    if exclude_separated:
+        # Drop the fully-separated (EXITED / ARCHIVED / INACTIVE) — used by
+        # forward-commitment pickers (shift swap/rotation/holiday/roster, etc.).
+        # ON_NOTICE stays (still employed until their last day).
+        q = q.filter(or_(
+            Employee.lifecycle_state.is_(None),
+            Employee.lifecycle_state.notin_(SEPARATED),
+        ))
     if search:
         like = f"%{search.strip()}%"
         q = q.join(User, Employee.user_id == User.id, isouter=True).filter(
@@ -253,6 +267,68 @@ def list_employees(
         "page": page,
         "limit": limit,
     }
+
+
+# NOTE: declared BEFORE the dynamic "/{employee_pk}" detail route so FastAPI
+# doesn't try to parse "rehire-eligible" as a UUID.
+@router.get("/rehire-eligible")
+def list_rehire_eligible(
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Former employees who can be brought back: separated (EXITED / ARCHIVED /
+    INACTIVE) AND whose most-recent exit case is flagged ``eligible_for_rehire``.
+    Powers the Recruitment → Rehire roster."""
+    rows = (
+        db.query(Employee, ExitCase)
+        .join(ExitCase, ExitCase.employee_id == Employee.id)
+        .options(
+            joinedload(Employee.user),
+            joinedload(Employee.department),
+            joinedload(Employee.designation),
+        )
+        .filter(
+            Employee.is_deleted == False,  # noqa: E712
+            Employee.lifecycle_state.in_(SEPARATED),
+            ExitCase.eligible_for_rehire == True,  # noqa: E712
+        )
+        .order_by(Employee.id, ExitCase.created_at.desc())
+        .all()
+    )
+    # Dedupe to the latest case per employee (rows are ordered newest-first per id).
+    seen: dict = {}
+    for emp, case in rows:
+        if emp.id in seen:
+            continue
+        seen[emp.id] = (emp, case)
+
+    items = []
+    for emp, case in seen.values():
+        name = getattr(emp.user, "full_name", None) if emp.user else None
+        if search:
+            s = search.lower()
+            if s not in (name or "").lower() and s not in (emp.employee_id or "").lower():
+                continue
+        items.append({
+            "id": str(emp.id),
+            "employee_id": emp.employee_id,
+            "full_name": name,
+            "email": getattr(emp.user, "email", None) if emp.user else None,
+            "avatar_url": getattr(emp.user, "avatar_url", None) if emp.user else None,
+            "lifecycle_state": emp.lifecycle_state.value if hasattr(emp.lifecycle_state, "value") else emp.lifecycle_state,
+            "department_id": str(emp.department_id) if emp.department_id else None,
+            "department_name": getattr(emp.department, "name", None) if emp.department else None,
+            "designation_id": str(emp.designation_id) if emp.designation_id else None,
+            "designation_name": getattr(emp.designation, "name", None) if emp.designation else None,
+            "original_joining_date": emp.original_joining_date.isoformat() if emp.original_joining_date else (emp.joining_date.isoformat() if emp.joining_date else None),
+            "joining_date": emp.joining_date.isoformat() if emp.joining_date else None,
+            "exit_date": emp.exit_date.isoformat() if emp.exit_date else None,
+            "rehire_count": emp.rehire_count or 0,
+            "exit_case_number": case.case_number,
+            "exit_reason_category": case.reason_category.value if (case.reason_category and hasattr(case.reason_category, "value")) else None,
+        })
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/{employee_pk}", response_model=EmployeeDetailResponse)
@@ -434,6 +510,16 @@ def update_employee(
                         raise HTTPException(409, "Employee code is already in use by another employee")
                 user.employee_code = new_code
                 emp.employee_code = new_code  # keep the mirror in sync
+
+    # Guard: a masked account number echoed back from a detail read must never
+    # overwrite the stored (now encrypted) value. Real account numbers are
+    # digits only, so any masking artefact ('X'/'•'/'*') — or an exact match of
+    # the current masked form — means "unchanged; skip" rather than corrupt it.
+    acct = update.get("account_number")
+    if acct is not None and (
+        any(c in acct for c in "Xx•*") or acct == _mask_account(emp.account_number)
+    ):
+        update.pop("account_number", None)
 
     for k, v in update.items():
         setattr(emp, k, v)
@@ -740,6 +826,38 @@ def lifecycle_reinstate(
     return _to_detail(emp, reveal_bank=False)
 
 
+@router.post("/{employee_pk}/lifecycle/cancel-notice", response_model=EmployeeDetailResponse)
+def lifecycle_cancel_notice(
+    employee_pk: UUID,
+    body: LifecycleReinstateBody,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Revert an ON_NOTICE employee back to ACTIVE (e.g. a withdrawn/cancelled exit
+    case). Clears the notice markers and writes a REINSTATED history row. Additive —
+    the existing `reinstate` only allows SUSPENDED, so the exit module uses this."""
+    _track_actor(db, admin.id)
+    emp = _load_with_relations(db, employee_pk)
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    _require_state(emp, [LifecycleState.ON_NOTICE])
+    before = _serialise_employee_snapshot(emp)
+    emp.lifecycle_state = LifecycleState.ACTIVE
+    emp.notice_period_start_date = None
+    emp.last_working_date = None
+    emp.last_updated_by_id = admin.id
+    db.flush()
+    _write_history(
+        db, emp, EmployeeChangeType.REINSTATED,
+        before=before, after=_serialise_employee_snapshot(emp),
+        actor_id=admin.id, reason=body.reason,
+        effective_date=body.effective_date or datetime.utcnow().date(),
+    )
+    db.commit()
+    db.refresh(emp)
+    return _to_detail(emp, reveal_bank=False)
+
+
 @router.post("/{employee_pk}/lifecycle/give-notice", response_model=EmployeeDetailResponse)
 def lifecycle_give_notice(
     employee_pk: UUID,
@@ -766,6 +884,14 @@ def lifecycle_give_notice(
         actor_id=admin.id, reason=body.reason,
         effective_date=body.notice_period_start_date,
     )
+    # Shift offboarding: cap/remove any shift assignment that runs past the new
+    # last working day. Fully guarded — never blocks the notice flow.
+    try:
+        from app.utils.hr.shift_offboarding import close_shift_assignments_on_separation
+        close_shift_assignments_on_separation(db, emp, admin.id)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     db.commit()
     db.refresh(emp)
     return _to_detail(emp, reveal_bank=False)
@@ -803,6 +929,24 @@ def lifecycle_exit(
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Travel offboarding: void the exiting employee's still-open (uncommitted)
+    # travel requests (DRAFT / PENDING_APPROVAL / RETURNED) so they don't linger
+    # un-approvable in the approval queues. Booked/executing trips are left to the
+    # travel settlement flow. Guarded — never blocks the exit.
+    try:
+        from app.utils.hr.travel.offboarding import cancel_open_travel_on_separation
+        cancel_open_travel_on_separation(db, emp, admin.id)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Shift offboarding: cap/remove any shift assignment running past the exit
+    # date so the exited employee drops off the deployment board. Guarded.
+    try:
+        from app.utils.hr.shift_offboarding import close_shift_assignments_on_separation
+        close_shift_assignments_on_separation(db, emp, admin.id)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     db.commit()
     db.refresh(emp)
     return _to_detail(emp, reveal_bank=False)
@@ -819,6 +963,8 @@ def lifecycle_archive(
     emp = _load_with_relations(db, employee_pk)
     if not emp:
         raise HTTPException(404, "Employee not found")
+    # Archive is post-separation cleanup only — never archive a still-employed record.
+    _require_state(emp, [LifecycleState.EXITED, LifecycleState.INACTIVE])
     before = _serialise_employee_snapshot(emp)
     emp.lifecycle_state = LifecycleState.ARCHIVED
     emp.archived_at = datetime.utcnow()
@@ -875,6 +1021,113 @@ def lifecycle_unarchive(
         actor_id=admin.id, reason=body.reason or "Restored from archive",
         effective_date=body.effective_date or datetime.utcnow().date(),
     )
+    db.commit()
+    db.refresh(emp)
+    return _to_detail(emp, reveal_bank=False)
+
+
+def _reopen_onboarding_on_rehire(db: Session, emp: Employee, joining_date, actor_id):
+    """Re-open (or bootstrap) the onboarding process so a re-joiner runs the
+    joining formalities again and re-appears in the onboarding module. Guarded by
+    the caller — never blocks the rehire."""
+    from app.models.hr.onboarding import OnboardingProcess, OnboardingStatus, OnboardingStage
+    proc = (
+        db.query(OnboardingProcess)
+        .filter(OnboardingProcess.employee_id == emp.id)
+        .first()
+    )
+    if proc:
+        proc.status = OnboardingStatus.IN_PROGRESS
+        proc.current_stage = OnboardingStage.PRE_JOIN
+        proc.progress_pct = 0
+        proc.completed_at = None
+        proc.is_deleted = False
+        proc.target_joining_date = joining_date
+        proc.last_updated_by_id = actor_id
+    else:
+        from app.utils.hr.onboarding_bootstrap import bootstrap_onboarding
+        bootstrap_onboarding(db, employee=emp, offer=None, actor_id=actor_id)
+
+
+@router.post("/{employee_pk}/lifecycle/rehire", response_model=EmployeeDetailResponse)
+def lifecycle_rehire(
+    employee_pk: UUID,
+    body: LifecycleRehireBody,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Bring a former employee back. Gated on the employee being separated AND
+    their most-recent exit case flagged ``eligible_for_rehire``. Starts a fresh
+    tenure (new joining_date), preserves the original join date + bumps rehire_count,
+    clears all separation markers, and re-opens onboarding. Writes a REHIRED row."""
+    _track_actor(db, admin.id)
+    emp = _load_with_relations(db, employee_pk)
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    _require_state(emp, [LifecycleState.EXITED, LifecycleState.ARCHIVED, LifecycleState.INACTIVE])
+    # Eligibility gate — the latest exit case must explicitly allow rehire.
+    latest_case = (
+        db.query(ExitCase)
+        .filter(ExitCase.employee_id == emp.id)
+        .order_by(ExitCase.created_at.desc())
+        .first()
+    )
+    if not latest_case or latest_case.eligible_for_rehire is not True:
+        raise HTTPException(
+            409,
+            "This former employee is not marked eligible for rehire. Update their "
+            "exit case ('eligible for rehire') before rehiring.",
+        )
+
+    before = _serialise_employee_snapshot(emp)
+    # Preserve the first-ever join on the FIRST rehire; bump the boomerang counter.
+    if emp.original_joining_date is None:
+        emp.original_joining_date = emp.joining_date
+    emp.rehire_count = (emp.rehire_count or 0) + 1
+
+    on_probation = bool(body.on_probation)
+    emp.lifecycle_state = LifecycleState.ON_PROBATION if on_probation else LifecycleState.ACTIVE
+    emp.employee_category = EmployeeCategory.PROBATIONARY if on_probation else EmployeeCategory.PERMANENT
+    emp.joining_date = body.joining_date
+    emp.confirmation_date = None
+    if on_probation and body.probation_months:
+        emp.probation_months = body.probation_months
+
+    # Clear every separation marker — this is a brand-new tenure.
+    emp.exit_date = None
+    emp.last_working_date = None
+    emp.notice_period_start_date = None
+    emp.suspension_reason = None
+    emp.suspension_date = None
+    emp.archived_at = None
+    emp.archived_by_id = None
+    emp.is_deleted = False
+
+    # Optional org (re)placement — keep prior values when not supplied.
+    if body.department_id is not None:
+        emp.department_id = body.department_id
+    if body.designation_id is not None:
+        emp.designation_id = body.designation_id
+    if body.grade_id is not None:
+        emp.grade_id = body.grade_id
+    if body.work_location_id is not None:
+        emp.work_location_id = body.work_location_id
+    if body.reporting_manager_id is not None:
+        emp.reporting_manager_id = body.reporting_manager_id
+
+    emp.last_updated_by_id = admin.id
+    db.flush()
+    _write_history(
+        db, emp, EmployeeChangeType.REHIRED,
+        before=before, after=_serialise_employee_snapshot(emp),
+        actor_id=admin.id, reason=body.reason, effective_date=body.joining_date,
+    )
+    # Re-open onboarding so the re-joiner runs the formalities again. Guarded.
+    try:
+        _reopen_onboarding_on_rehire(db, emp, body.joining_date, admin.id)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     db.commit()
     db.refresh(emp)
     return _to_detail(emp, reveal_bank=False)

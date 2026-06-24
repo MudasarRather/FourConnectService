@@ -37,6 +37,7 @@ from app.schemas.hr.asset_lifecycle import (
 )
 from app.models.hr.asset_lifecycle import AssetEventType as _EventType
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.lifecycle_guard import guard_employable
 from app.utils.hr.assets.state import assert_transition, next_status_on_return
 from app.utils.hr.assets.audit import write_asset_history
 from app.utils.hr.assets.responses import (
@@ -413,8 +414,8 @@ def allocate_asset(
         raise HTTPException(409, "Asset condition is RETIRED; cannot allocate.")
     if _has_open_disposal(db, asset_id):
         raise HTTPException(409, "Asset has a pending disposal; cannot allocate.")
-    if not db.query(Employee).filter(Employee.id == payload.employee_id).first():
-        raise HTTPException(404, "Employee not found")
+    emp = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+    guard_employable(emp, "allocate an asset to this employee")
 
     prior = asset.status
     alloc = AssetAllocation(

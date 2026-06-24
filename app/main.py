@@ -129,6 +129,18 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Seed exit-management defaults (one wildcard separation policy). Idempotent.
+    try:
+        from app.database import SessionLocal
+        from app.utils.hr.exit_management.seed import seed_exit_defaults
+        _db = SessionLocal()
+        try:
+            seed_exit_defaults(_db)
+        finally:
+            _db.close()
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
 
 # Configure CORS — local dev origins + production frontend domains.
 # Keep this list in sync with the global exception handler below.

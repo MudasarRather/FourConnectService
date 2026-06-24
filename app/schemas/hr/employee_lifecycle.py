@@ -55,3 +55,17 @@ class LifecycleExitBody(_BaseLifecycle):
 
 class LifecycleArchiveBody(_BaseLifecycle):
     pass
+
+
+class LifecycleRehireBody(_BaseLifecycle):
+    """Rehire a former employee (EXITED / ARCHIVED / INACTIVE) who was marked
+    eligible for rehire on their exit case. Starts a fresh tenure from
+    ``joining_date``; org placement is optional (defaults to the prior values)."""
+    joining_date: date
+    on_probation: bool = True
+    probation_months: Optional[int] = Field(default=6, ge=1, le=24)
+    department_id: Optional[UUID] = None
+    designation_id: Optional[UUID] = None
+    grade_id: Optional[UUID] = None
+    work_location_id: Optional[UUID] = None
+    reporting_manager_id: Optional[UUID] = None

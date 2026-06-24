@@ -42,6 +42,7 @@ from app.utils.hr.reimbursements import (
 from app.utils.hr.reimbursements.flow import (
     get_category, build_new_claim, submit_claim, apply_decision,
 )
+from app.utils.hr.lifecycle_guard import guard_settleable
 
 router = APIRouter(prefix="/hr/reimbursements", tags=["HR — Reimbursements"])
 
@@ -294,6 +295,7 @@ def admin_create_claim(payload: ClaimAdminCreate, db: Session = Depends(get_db),
                                     Employee.is_deleted == False).first()  # noqa: E712
     if not emp:
         raise HTTPException(404, "Employee not found")
+    guard_settleable(emp, "create a reimbursement claim for this employee")
     category = get_category(db, payload.category_id)
     claim = build_new_claim(db, employee=emp, category=category, payload=payload, actor=current_user)
     # Synthesize a single auto-approved stage

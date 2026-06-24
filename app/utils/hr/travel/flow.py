@@ -20,6 +20,7 @@ from app.models.hr.travel_request import TravelRequest
 from app.models.hr.travel_category import TravelCategory
 from app.models.hr.travel_policy import TravelPolicy
 from app.models.hr.travel_type import TravelRequestStatus, TravelDecision, TravelAuditAction
+from app.utils.hr.lifecycle_guard import guard_on_payroll, guard_within_tenure
 from app.utils.hr.travel.chain import (
     normalize_chain_config, build_request_steps, step_status,
     auto_skip_unresolvable, mirror_final_columns, assert_transition,
@@ -297,6 +298,17 @@ def apply_decision(db: Session, req: TravelRequest, *, decision: TravelDecision,
     next_approver: Optional[UUID] = None
 
     if decision == TravelDecision.APPROVED:
+        # Lifecycle leak guard: a request raised while the employee was active must
+        # NOT stay approvable once they've left payroll. Re-check at decision time
+        # (state can change between submit and approval) — require the traveller to
+        # still be ON PAYROLL (ACTIVE / ON_PROBATION / ON_NOTICE), which blocks the
+        # SUSPENDED and the fully separated (EXITED / ARCHIVED / INACTIVE); and for
+        # anyone leaving, block a trip scheduled past their last working day. Covers
+        # BOTH the admin queue and the manager self-service queue (shared fn).
+        # REJECT / RETURN stay allowed so a stale request can still be closed out.
+        emp = db.query(Employee).filter(Employee.id == req.employee_id).first()
+        guard_on_payroll(emp, "approve this travel request")
+        guard_within_tenure(emp, req.return_date or req.departure_date, "approve travel")
         cur["decision"] = TravelDecision.APPROVED.value
         cur["decided_by_id"] = str(actor.id)
         cur["decided_at"] = now_iso

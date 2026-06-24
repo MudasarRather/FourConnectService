@@ -45,6 +45,7 @@ from app.utils.hr.travel import (
     recompute_request_derived, submit_request, apply_decision, reconcile,
     generate_advance_number, generate_settlement_number, generate_booking_number, get_policy_for,
 )
+from app.utils.hr.lifecycle_guard import guard_within_tenure, guard_on_payroll
 
 router = APIRouter(prefix="/hr/me/travel", tags=["HR — My Travel"])
 
@@ -185,6 +186,12 @@ def create_and_submit(payload: TravelRequestCreate, db: Session = Depends(get_db
     emp = resolve_self_employee(db, user)
     category = get_category(db, payload.category_id)
     req = build_new_request(db, employee=emp, category=category, payload=payload, actor=user)
+    # Only an on-payroll employee (incl. notice) may raise a request — a suspended
+    # or fully separated employee can't incur new travel.
+    guard_on_payroll(emp, "raise a travel request")
+    # A leaving / departed employee may not travel past their LWD. req.return_date
+    # is the derived envelope end (latest leg / return); fall back to departure.
+    guard_within_tenure(emp, req.return_date or req.departure_date, "raise a travel request")
     next_approver = submit_request(db, req, emp, user)
     db.commit()
     db.refresh(req)
@@ -302,6 +309,8 @@ def request_advance(request_id: UUID, payload: AdvanceCreate, db: Session = Depe
     req = _own(db, request_id, emp)
     if req.status not in (TravelRequestStatus.APPROVED, TravelRequestStatus.IN_PROGRESS):
         raise HTTPException(409, "Advance can only be requested for an approved travel request")
+    # No travel cash advance for a trip departing after the employee's LWD.
+    guard_within_tenure(emp, req.departure_date, "issue a travel advance")
     existing = db.query(TravelAdvance).filter(
         TravelAdvance.travel_request_id == req.id, TravelAdvance.is_deleted == False,  # noqa: E712
         TravelAdvance.status.in_([AdvanceStatus.REQUESTED, AdvanceStatus.APPROVED, AdvanceStatus.RELEASED]),

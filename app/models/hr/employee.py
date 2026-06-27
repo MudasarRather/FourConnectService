@@ -97,6 +97,9 @@ class Employee(Base):
     employee_category = Column(Enum(EmployeeCategory, name="hr_employee_category"), nullable=True)
     joining_date = Column(Date, nullable=True, index=True)
     confirmation_date = Column(Date, nullable=True)
+    # Fixed-term / contract staff end date — drives the CONTRACT_EXPIRY notification
+    # scan. Added by add_contract_end_date.py (create_all can't alter columns).
+    contract_end_date = Column(Date, nullable=True)
     probation_months = Column(Integer, nullable=True, default=6)
     reporting_manager_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     hr_manager_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)

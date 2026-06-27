@@ -1,7 +1,7 @@
 import enum
 import uuid
 from sqlalchemy import Column, String, Boolean, DateTime, Enum
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.database import Base
@@ -24,6 +24,10 @@ class WorkLocation(Base):
     state = Column(String(80), nullable=True)
     country = Column(String(80), nullable=True)
     type = Column(Enum(WorkLocationType, name="hr_work_location_type"), nullable=False, default=WorkLocationType.HQ)
+    code = Column(String(20), nullable=True)
+    timezone = Column(String(40), nullable=True)
+    # e.g. {"days": ["SAT", "SUN"], "alternate_saturdays": true}
+    weekly_off_pattern = Column(JSONB, nullable=True)
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

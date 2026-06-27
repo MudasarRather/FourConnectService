@@ -145,5 +145,16 @@ def release_payslip(payslip_id: UUID, db: Session = Depends(get_db),
     write_audit(db, entity_type="PAYSLIP", entity_id=s.id, action=PayrollAuditAction.RELEASE,
                 batch_id=s.batch_id, actor_id=current_user.id, to_status="RELEASED")
     db.commit()
+    try:
+        from app.utils.hr.notify import dispatch
+        uid = s.employee.user_id if s.employee else None
+        dispatch(db, "PAYSLIP_RELEASED", uid, context={
+            "title": "Payslip released",
+            "message": f"Your payslip for {int(s.period_month):02d}/{s.period_year} is now available.",
+            "action_url": "/user/self-service/payslips",
+        })
+        db.commit()
+    except Exception:
+        db.rollback()
     db.refresh(s)
     return enrich_payslip_detail(s, db)

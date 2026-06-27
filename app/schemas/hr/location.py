@@ -13,6 +13,9 @@ class WorkLocationBase(BaseModel):
     state: Optional[str] = None
     country: Optional[str] = None
     type: WorkLocationType = WorkLocationType.HQ
+    code: Optional[str] = Field(None, max_length=20)
+    timezone: Optional[str] = Field(None, max_length=40)
+    weekly_off_pattern: Optional[dict] = None
 
 
 class WorkLocationCreate(WorkLocationBase):
@@ -27,6 +30,9 @@ class WorkLocationUpdate(BaseModel):
     state: Optional[str] = None
     country: Optional[str] = None
     type: Optional[WorkLocationType] = None
+    code: Optional[str] = None
+    timezone: Optional[str] = None
+    weekly_off_pattern: Optional[dict] = None
 
 
 class WorkLocationResponse(WorkLocationBase):

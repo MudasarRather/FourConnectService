@@ -9,6 +9,7 @@ class DepartmentBase(BaseModel):
     code: str = Field(..., min_length=1, max_length=20)
     parent_department_id: Optional[UUID] = None
     head_employee_id: Optional[UUID] = None
+    cost_center: Optional[str] = Field(None, max_length=40)
 
 
 class DepartmentCreate(DepartmentBase):
@@ -21,6 +22,7 @@ class DepartmentUpdate(BaseModel):
     code: Optional[str] = None
     parent_department_id: Optional[UUID] = None
     head_employee_id: Optional[UUID] = None
+    cost_center: Optional[str] = None
 
 
 class DepartmentResponse(DepartmentBase):

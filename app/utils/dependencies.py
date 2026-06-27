@@ -65,6 +65,26 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Session invalidation on credential change. When an admin changes the user's
+    # email or resets their ERP password we bump User.token_version; an issued JWT
+    # carries the `tv` it was minted with, so a stale token now mismatches and 401s
+    # here — the same path is_active uses, so the frontend boots the live session
+    # within the auth-heartbeat window. A token with NO `tv` claim (issued before
+    # this feature shipped) is treated as version 1 — the column default — so it is
+    # still rejected once the user's version has been bumped, WITHOUT mass-logging-
+    # out everyone: accounts whose credentials were never changed stay at version 1
+    # and keep matching. (Earlier this skipped no-`tv` tokens entirely, which left a
+    # pre-feature session alive even after the user's email/password was changed.)
+    token_tv = payload.get("tv")
+    if token_tv is None:
+        token_tv = 1
+    if token_tv != (user.token_version or 1):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your sign-in details were changed — please sign in again",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return user
 
 

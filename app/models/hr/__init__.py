@@ -208,6 +208,38 @@ from app.models.hr.exit_settlement import ExitSettlement
 from app.models.hr.exit_document import ExitDocument
 from app.models.hr.exit_audit_log import ExitAuditLog
 
+# HR Settings — Phase B (configurable masters, notification rules)
+from app.models.hr.settings_master import (
+    EmploymentTypeMaster, EmployeeCategoryMaster, SeparationReasonMaster,
+)
+from app.models.hr.notification_rule import (
+    NotificationRule, EVENT_CATALOG, CHANNELS as NOTIFICATION_CHANNELS, AUDIENCES as NOTIFICATION_AUDIENCES,
+)
+# HR Settings — Phase C (numbering, payroll rules, appraisal templates, settings audit)
+from app.models.hr.numbering_series import NumberingSeries, NUMBERING_MODULES
+from app.models.hr.payroll_rule_config import PayrollRuleConfig
+from app.models.hr.appraisal_template import AppraisalTemplate, AppraisalTemplateSection
+from app.models.hr.merit_policy import MeritPolicy, DEFAULT_BANDS, band_for_score
+from app.models.hr.settings_audit_log import SettingsAuditLog
+# Performance Management module — Phase 5 (review instances scored vs. appraisal templates)
+from app.models.hr.performance_review import (
+    PerformanceReview, PerformanceReviewStatus, HikeStatus, OPEN_REVIEW_STATUSES,
+)
+# Performance Management — Phase 6 (OKRs/Goals, 360 feedback, calibration/9-box, PIP)
+from app.models.hr.performance_goal import (
+    PerformanceGoal, GoalType, GoalStatus, GoalMetric, OPEN_GOAL_STATUSES,
+)
+from app.models.hr.performance_feedback import (
+    PerfFeedbackRequest, PerfFeedbackResponse,
+    FeedbackRequestStatus, FeedbackRelationship, FeedbackResponseStatus,
+)
+from app.models.hr.performance_calibration import (
+    PerformanceCalibration, CalibrationStatus, BOX_LABELS, compute_box, band_from_score,
+)
+from app.models.hr.performance_pip import (
+    PerformancePip, PipStatus, OPEN_PIP_STATUSES,
+)
+
 # Register audit listeners on import.
 from app.utils.hr.audit import register_hr_audit_listeners  # noqa: E402
 
@@ -450,4 +482,45 @@ __all__ = [
     "ExitSettlement",
     "ExitDocument",
     "ExitAuditLog",
+    # HR Settings — Phase B
+    "EmploymentTypeMaster",
+    "EmployeeCategoryMaster",
+    "SeparationReasonMaster",
+    "NotificationRule",
+    "EVENT_CATALOG",
+    "NOTIFICATION_CHANNELS",
+    "NOTIFICATION_AUDIENCES",
+    "NumberingSeries",
+    "NUMBERING_MODULES",
+    "PayrollRuleConfig",
+    "AppraisalTemplate",
+    "AppraisalTemplateSection",
+    "MeritPolicy",
+    "DEFAULT_BANDS",
+    "band_for_score",
+    "SettingsAuditLog",
+    # Performance Management
+    "PerformanceReview",
+    "PerformanceReviewStatus",
+    "HikeStatus",
+    "OPEN_REVIEW_STATUSES",
+    # Performance Management — Phase 6 (Goals/OKRs, 360, calibration, PIP)
+    "PerformanceGoal",
+    "GoalType",
+    "GoalStatus",
+    "GoalMetric",
+    "OPEN_GOAL_STATUSES",
+    "PerfFeedbackRequest",
+    "PerfFeedbackResponse",
+    "FeedbackRequestStatus",
+    "FeedbackRelationship",
+    "FeedbackResponseStatus",
+    "PerformanceCalibration",
+    "CalibrationStatus",
+    "BOX_LABELS",
+    "compute_box",
+    "band_from_score",
+    "PerformancePip",
+    "PipStatus",
+    "OPEN_PIP_STATUSES",
 ]

@@ -129,6 +129,24 @@ def update_statutory(config_id: UUID, payload: StatutoryConfigUpdate, db: Sessio
     return row
 
 
+@router.delete("/config/statutory/{config_id}", status_code=204)
+def delete_statutory(config_id: UUID, reason: Optional[str] = Query(None, description="Optional removal reason, recorded in the payroll audit ledger."),
+                     db: Session = Depends(get_db), current_user: User = Depends(get_current_superuser)):
+    """Remove a statutory config row. Config rows are not transactional (the
+    payroll batch freezes its own `config_snapshot`), so this is a hard delete —
+    the deletion + reason are preserved in the payroll audit ledger. Prefer
+    deactivating (is_active=false) to retire a rate non-destructively."""
+    row = db.query(StatutoryConfig).filter(StatutoryConfig.id == config_id).first()
+    if not row:
+        raise HTTPException(404, "Config row not found")
+    key = row.key
+    note = f"Deleted {key}" + (f" — {reason.strip()}" if reason and reason.strip() else "")
+    write_audit(db, entity_type="CONFIG", entity_id=row.id, action=PayrollAuditAction.CONFIG_CHANGE,
+                actor_id=current_user.id, note=note)
+    db.delete(row)
+    db.commit()
+
+
 @router.get("/audit", response_model=PayrollAuditListResponse)
 def global_audit(entity_type: Optional[str] = None, skip: int = 0, limit: int = Query(50, ge=1, le=200),
                  db: Session = Depends(get_db), current_user: User = Depends(get_current_superuser)):

@@ -63,7 +63,11 @@ class Asset(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     asset_code = Column(String(60), unique=True, nullable=False, index=True)  # e.g. LAP-001
-    asset_type = Column(Enum(AssetType, name="hr_asset_type"), nullable=False, index=True)
+    # Type is a free string backed by the AssetTypeDef catalog (built-ins seeded +
+    # user-defined). Was a PG enum; widened to varchar so custom types can be stored.
+    # AssetType (str enum) is kept for built-in code branching/icons — string values
+    # still compare equal to its members.
+    asset_type = Column(String(40), nullable=False, index=True)
     brand = Column(String(120), nullable=True)
     model = Column(String(160), nullable=True)
     serial_number = Column(String(120), nullable=True, index=True)

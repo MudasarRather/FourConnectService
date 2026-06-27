@@ -11,6 +11,11 @@ python-dotenv>=1.0.1
 pydantic[email]>=2.7.0
 pydantic-settings>=2.2.1
 huggingface_hub>=0.20.0
+# tzdata: IANA timezone database for zoneinfo. Windows (and slim Linux images)
+# ship no system zone db, so attendance_logic's per-work-location timezone
+# resolution (ZoneInfo) needs this — without it ZoneInfo('America/New_York')
+# raises ZoneInfoNotFoundError. Falls back to a fixed IST offset if absent.
+tzdata>=2024.1
 
 # ── Reporting stack ────────────────────────────────────────────────────────
 # WeasyPrint renders the unique branded PDFs for HR Attendance Reports.

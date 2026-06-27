@@ -50,6 +50,33 @@ class CoverageSnapshot(BaseModel):
     assigned: int = 0
 
 
+class LocationShiftWindow(BaseModel):
+    """One shift running at a location, with its (location-local) wall-clock window."""
+    shift_id: UUID
+    code: str
+    name: str
+    shift_type: str
+    start_time: Optional[time] = None       # serialises as "HH:MM:SS"
+    end_time: Optional[time] = None
+    count: int = 0
+
+
+class LocationCoverageItem(BaseModel):
+    """Per-office coverage so the dashboard can show each site in its own timezone.
+
+    Shift times are treated as LOCAL to ``timezone``; the frontend computes
+    "who's on shift now" live against these windows in each office's tz.
+    """
+    location_id: Optional[UUID] = None      # None = the "Unmapped" bucket
+    name: str
+    city: Optional[str] = None
+    country: Optional[str] = None
+    timezone: Optional[str] = None          # IANA id, e.g. "Asia/Kolkata"
+    weekly_off_pattern: Optional[dict] = None
+    total_assigned: int = 0
+    shifts: List[LocationShiftWindow] = Field(default_factory=list)
+
+
 class ShiftDashboardResponse(BaseModel):
     kpis: ShiftKpis
     shift_distribution: List[ShiftDistributionItem] = Field(default_factory=list)
@@ -57,6 +84,7 @@ class ShiftDashboardResponse(BaseModel):
     overtime_trend: List[TrendPoint] = Field(default_factory=list)
     night_utilization: List[TrendPoint] = Field(default_factory=list)
     weekly_coverage: List[CoverageSnapshot] = Field(default_factory=list)
+    location_coverage: List[LocationCoverageItem] = Field(default_factory=list)
     generated_at: datetime
 
 

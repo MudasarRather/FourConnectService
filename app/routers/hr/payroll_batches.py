@@ -186,6 +186,23 @@ def _transition(db, b: PayrollBatch, action: str, actor: User, body: Optional[Ba
                 batch_id=b.id, actor_id=actor.id, from_status=prev, to_status=target.value,
                 note=body.note if body else None)
     db.commit()
+    if action == "release":
+        try:
+            from app.utils.hr.notify import dispatch
+            period = f"{int(b.period_month):02d}/{b.period_year}"
+            rows = (db.query(Employee.user_id)
+                    .join(Payslip, Payslip.employee_id == Employee.id)
+                    .filter(Payslip.batch_id == b.id, Payslip.status == PayslipStatus.RELEASED)
+                    .all())
+            for (uid,) in rows:
+                dispatch(db, "PAYROLL_PROCESSED", uid, context={
+                    "title": "Payroll processed",
+                    "message": f"Payroll for {period} has been processed — your payslip is ready.",
+                    "action_url": "/user/self-service/payslips",
+                })
+            db.commit()
+        except Exception:
+            db.rollback()
     db.refresh(b)
     return _enrich(b, db)
 

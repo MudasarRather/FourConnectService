@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models.user import User
 from app.models.hr.employee import Employee, LifecycleState
 from app.models.hr.department import Department
+from app.models.hr.location import WorkLocation
 from app.models.hr.shift import Shift, EmployeeShiftAssignment, ShiftType
 from app.models.hr.holiday import Holiday, HolidayType
 from app.models.hr.holiday_shift import HolidayShiftAssignment
@@ -28,6 +29,7 @@ from app.schemas.hr.attendance import (
 from app.schemas.hr.shift_planning import (
     ShiftDashboardResponse, ShiftKpis, ShiftDistributionItem, DeptAllocationItem,
     TrendPoint, CoverageSnapshot, ShiftCalendarResponse, CalendarDay, CalendarAssignment,
+    LocationCoverageItem, LocationShiftWindow,
 )
 from app.utils.dependencies import get_current_user, get_current_superuser
 from app.utils.hr.attendance_logic import log
@@ -334,10 +336,61 @@ def shifts_dashboard(
             label=r.label or (sh[0] if sh else "Shift"),
             required=r.min_staff or 0, assigned=assigned))
 
+    # ── Location coverage (per-office, for timezone-aware dashboard panel) ──
+    # Shift times are local to each office's timezone; the frontend renders a
+    # live clock + "who's on shift now" per location against these windows.
+    cov_rows = (
+        db.query(
+            Employee.work_location_id,
+            Shift.id, Shift.code, Shift.name, Shift.shift_type,
+            Shift.start_time, Shift.end_time,
+            func.count(distinct(Employee.id)),
+        )
+        .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
+        .join(Shift, Shift.id == EmployeeShiftAssignment.shift_id)
+        .filter(act, Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED),
+                Shift.is_deleted == False)  # noqa: E712
+        .group_by(Employee.work_location_id, Shift.id, Shift.code, Shift.name,
+                  Shift.shift_type, Shift.start_time, Shift.end_time)
+        .all())
+    # Distinct employees per location (a conflicted employee counts once).
+    loc_totals = dict(
+        db.query(Employee.work_location_id, func.count(distinct(Employee.id)))
+        .join(EmployeeShiftAssignment, EmployeeShiftAssignment.employee_id == Employee.id)
+        .filter(act, Employee.is_deleted == False,  # noqa: E712
+                Employee.lifecycle_state.notin_(SEPARATED))
+        .group_by(Employee.work_location_id).all())
+    loc_ids = {r[0] for r in cov_rows if r[0] is not None}
+    loc_meta = ({l.id: l for l in
+                 db.query(WorkLocation).filter(WorkLocation.id.in_(loc_ids)).all()}
+                if loc_ids else {})
+    cov_map = {}
+    for wl_id, sid, scode, sname, stype, sfrom, sto, cnt in cov_rows:
+        cov_map.setdefault(wl_id, []).append(LocationShiftWindow(
+            shift_id=sid, code=scode, name=sname, shift_type=_type_str(stype),
+            start_time=sfrom, end_time=sto, count=cnt or 0))
+    location_coverage = []
+    for wl_id, windows in cov_map.items():
+        wl = loc_meta.get(wl_id) if wl_id is not None else None
+        location_coverage.append(LocationCoverageItem(
+            location_id=wl_id,
+            name=(wl.name if wl else ("Unmapped location" if wl_id is None else "Unknown location")),
+            city=(wl.city if wl else None),
+            country=(wl.country if wl else None),
+            timezone=(wl.timezone if wl else None),
+            weekly_off_pattern=(wl.weekly_off_pattern if wl else None),
+            total_assigned=loc_totals.get(wl_id, 0),
+            shifts=sorted(windows, key=lambda s: (s.start_time is None, s.start_time)),
+        ))
+    # Most-staffed offices first; the "Unmapped" bucket always last.
+    location_coverage.sort(key=lambda c: (c.location_id is None, -c.total_assigned))
+
     return ShiftDashboardResponse(
         kpis=kpis, shift_distribution=shift_distribution, dept_allocation=dept_allocation,
         overtime_trend=overtime_trend, night_utilization=night_utilization,
-        weekly_coverage=weekly_coverage, generated_at=datetime.utcnow(),
+        weekly_coverage=weekly_coverage, location_coverage=location_coverage,
+        generated_at=datetime.utcnow(),
     )
 
 

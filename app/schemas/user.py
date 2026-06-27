@@ -129,7 +129,13 @@ class UserResponse(UserBase):
     is_activated: bool = False
     created_at: datetime
     updated_at: datetime
-    
+    # Employee work-location timezone (IANA, e.g. "Asia/Kolkata") + label, resolved
+    # from the linked Employee → WorkLocation. Lets the self-service UI anchor
+    # time-of-day (greetings etc.) to the employee's OFFICIAL work location rather
+    # than the viewer's device clock. Null when there's no linked employee/location.
+    work_location_timezone: Optional[str] = None
+    work_location_name: Optional[str] = None
+
     class Config:
         from_attributes = True
 

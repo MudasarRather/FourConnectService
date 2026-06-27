@@ -83,6 +83,13 @@ def _write_audit(session: Session, entity_type: str, action: str, entity_id, det
             except Exception:
                 user_id = None
 
+        # Optional free-text reason a handler stashed on the session (e.g. a
+        # delete reason). Folded into the snapshot/changes blob so the ledger
+        # carries *why*, not just *what*. Cleared by the handler per-request.
+        note = info.get("audit_note")
+        if note:
+            details = {**details, "note": str(note)[:600]}
+
         log = AuditLog(
             user_id=user_id,
             action=f"hr.{entity_type}.{action}",

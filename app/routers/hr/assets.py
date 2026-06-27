@@ -67,7 +67,7 @@ def _has_open_disposal(db: Session, asset_id: UUID) -> bool:
 def list_assets(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
-    asset_type: Optional[AssetType] = None,
+    asset_type: Optional[str] = None,
     asset_status: Optional[AssetStatus] = None,
     condition: Optional[AssetCondition] = None,
     category_id: Optional[UUID] = None,
@@ -444,6 +444,17 @@ def allocate_asset(
         if proc:
             _recalculate_progress(db, proc)
     db.commit()
+    try:
+        from app.utils.hr.notify import dispatch
+        uid = db.query(Employee.user_id).filter(Employee.id == payload.employee_id).scalar()
+        dispatch(db, "ASSET_ALLOCATED", uid, context={
+            "title": "Asset allocated to you",
+            "message": f"{asset.asset_code} has been allocated to you.",
+            "action_url": "/user/self-service/assets",
+        })
+        db.commit()
+    except Exception:
+        db.rollback()
     db.refresh(alloc)
     return to_alloc_response(db, alloc, asset)
 

@@ -14,6 +14,7 @@ class Department(Base):
     code = Column(String(20), nullable=False, unique=True, index=True)
     parent_department_id = Column(UUID(as_uuid=True), ForeignKey("hr_departments.id"), nullable=True)
     head_employee_id = Column(UUID(as_uuid=True), ForeignKey("hr_employees.id"), nullable=True)
+    cost_center = Column(String(40), nullable=True)
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

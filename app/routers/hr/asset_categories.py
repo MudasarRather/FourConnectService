@@ -18,6 +18,7 @@ from app.schemas.hr.asset_lifecycle import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.assets.responses import to_category_response
+from app.utils.hr.settings_audit import log_settings_change
 
 router = APIRouter(prefix="/hr/asset-categories", tags=["HR — Asset Categories"])
 
@@ -65,6 +66,8 @@ def create_category(
         raise HTTPException(400, "Category code already exists")
     c = AssetCategory(**payload.model_dump(), created_by_id=admin.id)
     db.add(c)
+    db.flush()
+    log_settings_change(db, "ASSET_CATEGORY", c.id, "CREATE", admin.id, after={"code": c.code}, note=c.name)
     db.commit()
     db.refresh(c)
     return to_category_response(c, 0)
@@ -87,7 +90,7 @@ def update_category(
     category_id: UUID,
     payload: AssetCategoryUpdate,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     c = db.query(AssetCategory).filter(AssetCategory.id == category_id, AssetCategory.is_deleted == False).first()  # noqa: E712
     if not c:
@@ -98,6 +101,7 @@ def update_category(
             raise HTTPException(400, "Category code already exists")
     for k, v in data.items():
         setattr(c, k, v)
+    log_settings_change(db, "ASSET_CATEGORY", c.id, "UPDATE", admin.id, note=c.name)
     db.commit()
     db.refresh(c)
     return to_category_response(c, _asset_count(db, c.id))
@@ -107,7 +111,7 @@ def update_category(
 def delete_category(
     category_id: UUID,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     c = db.query(AssetCategory).filter(AssetCategory.id == category_id, AssetCategory.is_deleted == False).first()  # noqa: E712
     if not c:
@@ -115,4 +119,5 @@ def delete_category(
     if _asset_count(db, category_id) > 0:
         raise HTTPException(409, "Category is referenced by assets; reassign them first.")
     c.is_deleted = True
+    log_settings_change(db, "ASSET_CATEGORY", c.id, "DELETE", admin.id, note=c.name)
     db.commit()

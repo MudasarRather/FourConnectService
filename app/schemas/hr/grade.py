@@ -10,8 +10,10 @@ class GradeBase(BaseModel):
     code: str = Field(..., min_length=1, max_length=20)
     band: Optional[str] = None
     level: Optional[int] = None
+    default_pay_level: Optional[str] = Field(None, max_length=20)
     min_ctc: Optional[Decimal] = None
     max_ctc: Optional[Decimal] = None
+    eligibility: Optional[dict] = None
 
 
 class GradeCreate(GradeBase):
@@ -24,8 +26,10 @@ class GradeUpdate(BaseModel):
     code: Optional[str] = None
     band: Optional[str] = None
     level: Optional[int] = None
+    default_pay_level: Optional[str] = Field(None, max_length=20)
     min_ctc: Optional[Decimal] = None
     max_ctc: Optional[Decimal] = None
+    eligibility: Optional[dict] = None
 
 
 class GradeResponse(GradeBase):

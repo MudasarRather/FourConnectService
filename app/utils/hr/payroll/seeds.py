@@ -67,6 +67,12 @@ _TDS_OLD = [
     {"upto": 250000, "rate": 0.0}, {"upto": 500000, "rate": 0.05},
     {"upto": 1000000, "rate": 0.20}, {"upto": None, "rate": 0.30},
 ]
+# Professional Tax is a STATE levy. The NATIONAL fallback is "no PT" so employees
+# in a state with no configured slab row (or a non-PT state like Delhi / Haryana /
+# UP) deduct nothing — never another state's amount. Add one PT_SLABS row per
+# state you operate in (e.g. _PT_KA below); the engine resolves them per employee
+# from the work-location state.
+_PT_NATIONAL = [{"upto": None, "amount": 0}]
 _PT_KA = [{"upto": 24999, "amount": 0}, {"upto": None, "amount": 200}]
 
 
@@ -87,6 +93,8 @@ def _seed_config(db: Session, fy: str) -> None:
                            effective_from=eff, description="New-regime slabs (seeded)"))
     db.add(StatutoryConfig(fiscal_year=fy, state_code=None, key="TDS_SLABS_OLD", value_json=_TDS_OLD,
                            effective_from=eff, description="Old-regime slabs (seeded)"))
+    db.add(StatutoryConfig(fiscal_year=fy, state_code=None, key="PT_SLABS", value_json=_PT_NATIONAL,
+                           effective_from=eff, description="National fallback — no PT (state rows override)"))
     db.add(StatutoryConfig(fiscal_year=fy, state_code="KA", key="PT_SLABS", value_json=_PT_KA,
                            effective_from=eff, description="Karnataka PT slabs (seeded)"))
 

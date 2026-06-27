@@ -45,6 +45,7 @@ from app.schemas.hr.recruitment import (
     PipelineCard, PipelineStage,
 )
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.settings_audit import log_settings_change
 
 router = APIRouter(prefix="/hr/recruitment", tags=["HR — Recruitment"])
 
@@ -53,11 +54,30 @@ router = APIRouter(prefix="/hr/recruitment", tags=["HR — Recruitment"])
 # Sequence helpers (auto-codes)
 # ──────────────────────────────────────────────────────────────────────────────
 
+_NUMBERING_BY_PREFIX = {
+    "REQ": "RECRUITMENT_REQUISITION", "POS": "RECRUITMENT_POSITION",
+    "CAN": "RECRUITMENT_CANDIDATE", "APP": "RECRUITMENT_APPLICATION",
+    "INT": "RECRUITMENT_INTERVIEW", "OFR": "RECRUITMENT_OFFER",
+}
+
+
 def _next_code(db: Session, prefix: str, model, code_col: str, width: int = 4) -> str:
     """Generate the next code like REQ0001 / POS0001 / CAN0001 ...
     Falls back to counting rows if no row exists yet. Race-tolerant for low
     write volume — the unique constraint at the DB will reject duplicates.
+
+    If an admin configured an active NumberingSeries for this entity in HR
+    Settings, that format wins (opt-in); otherwise the legacy MAX+1 is used.
     """
+    try:
+        from app.utils.hr.numbering import next_number
+        mod = _NUMBERING_BY_PREFIX.get(prefix)
+        if mod:
+            n = next_number(db, mod)
+            if n:
+                return n
+    except Exception:
+        pass  # any numbering issue → fall through to legacy generation
     last = db.query(model).order_by(desc(getattr(model, code_col))).first()
     n = 1
     if last:
@@ -855,6 +875,8 @@ def create_panel(
         data["members"] = [m.model_dump() if hasattr(m, "model_dump") else m for m in members]
     p = InterviewPanel(**data)
     db.add(p)
+    db.flush()
+    log_settings_change(db, "RECRUITMENT_PANEL", p.id, "CREATE", admin.id, note=getattr(p, "name", None))
     db.commit()
     db.refresh(p)
     return _panel_to_response(p)
@@ -875,6 +897,7 @@ def update_panel(
         data["members"] = [m.model_dump() if hasattr(m, "model_dump") else m for m in data["members"]]
     for k, v in data.items():
         setattr(p, k, v)
+    log_settings_change(db, "RECRUITMENT_PANEL", p.id, "UPDATE", admin.id, note=getattr(p, "name", None))
     db.commit()
     db.refresh(p)
     return _panel_to_response(p)
@@ -890,6 +913,7 @@ def delete_panel(
     if not p:
         raise HTTPException(404, "Panel not found")
     p.is_deleted = True
+    log_settings_change(db, "RECRUITMENT_PANEL", p.id, "DELETE", admin.id, note=getattr(p, "name", None))
     db.commit()
 
 
@@ -1345,6 +1369,23 @@ def release_offer(
         if o.application.candidate:
             o.application.candidate.status = CandidateStatus.OFFERED
     db.commit()
+    try:
+        from app.utils.hr.notify import dispatch
+        mgr_id = None
+        try:
+            pos = o.application.position if o.application else None
+            mgr_id = getattr(pos, "hiring_manager_id", None)
+        except Exception:
+            mgr_id = None
+        cand = o.application.candidate.full_name if (o.application and o.application.candidate) else "the candidate"
+        dispatch(db, "OFFER_RELEASED", mgr_id or admin.id, audience="HR", context={
+            "title": "Offer released",
+            "message": f"Offer {o.offer_code} has been released to {cand}.",
+            "action_url": "/admin/hr/recruitment/offers",
+        })
+        db.commit()
+    except Exception:
+        db.rollback()
     db.refresh(o)
     return _offer_to_response(o)
 

@@ -29,6 +29,7 @@ from app.utils.hr.training.audit import write_training_audit
 from app.utils.hr.training.flow import recompute_skill_gap
 from app.utils.hr.training.service import emp_display
 from app.utils.dependencies import get_current_superuser
+from app.utils.hr.settings_audit import log_settings_change
 
 router = APIRouter(prefix="/hr/training", tags=["HR — Training Skills"])
 
@@ -107,6 +108,7 @@ def create_skill(
     db.flush()
     write_training_audit(db, entity_type="SKILL", entity_id=s.id,
                          action=TrainingAuditAction.CREATE, actor_id=admin.id, note=s.name)
+    log_settings_change(db, "TRAINING_SKILL", s.id, "CREATE", admin.id, after={"name": s.name}, note=s.name)
     db.commit()
     db.refresh(s)
     return _skill_resp(db, s)
@@ -126,6 +128,7 @@ def update_skill(
         setattr(s, k, v)
     write_training_audit(db, entity_type="SKILL", entity_id=s.id,
                          action=TrainingAuditAction.UPDATE, actor_id=admin.id)
+    log_settings_change(db, "TRAINING_SKILL", s.id, "UPDATE", admin.id, note=s.name)
     db.commit()
     db.refresh(s)
     return _skill_resp(db, s)
@@ -146,6 +149,7 @@ def delete_skill(
     s.is_deleted = True
     write_training_audit(db, entity_type="SKILL", entity_id=s.id,
                          action=TrainingAuditAction.DELETE, actor_id=admin.id)
+    log_settings_change(db, "TRAINING_SKILL", s.id, "DELETE", admin.id, note=s.name)
     db.commit()
 
 

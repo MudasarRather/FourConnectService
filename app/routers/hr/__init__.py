@@ -23,6 +23,7 @@ from app.routers.hr.assets import router as _assets_router
 # /allocations and /{asset_id}/history routes BEFORE its /{asset_id} catch-all,
 # so registration order vs. _assets_router doesn't matter here.
 from app.routers.hr.asset_categories import router as _asset_categories_router
+from app.routers.hr.asset_types import router as _asset_types_router
 from app.routers.hr.asset_vendors import router as _asset_vendors_router
 from app.routers.hr.asset_transfers import router as _asset_transfers_router
 from app.routers.hr.asset_maintenance import router as _asset_maintenance_router
@@ -117,6 +118,31 @@ from app.routers.hr.exit_reports import router as _exit_reports_router
 from app.routers.hr.exit_self import router as _exit_self_router
 from app.routers.hr.exit_management import router as _exit_management_router
 
+# Performance Management module — Phase 5 (review instances vs. appraisal templates).
+# Distinct prefixes /hr/performance + /hr/me/performance; self registered first.
+from app.routers.hr.performance_self import router as _performance_self_router
+from app.routers.hr.performance import router as _performance_router
+# Performance Management — Phase 6 (Goals/OKRs, 360 feedback, calibration/9-box,
+# PIP, analytics). Distinct hyphenated prefixes (/hr/performance-goals, etc.) so
+# they never collide with the /hr/performance/{review_id} catch-all.
+from app.routers.hr.performance_goals import router as _performance_goals_router
+from app.routers.hr.performance_feedback import router as _performance_feedback_router
+from app.routers.hr.performance_calibration import router as _performance_calibration_router
+from app.routers.hr.performance_pip import router as _performance_pip_router
+from app.routers.hr.performance_analytics import router as _performance_analytics_router
+
+# HR Settings module — Phase B (Governance Board). Distinct /hr/settings/* literal
+# roots → no collision with broad /{id} routers, so registration order is free.
+from app.routers.hr.settings_masters import router as _settings_masters_router
+from app.routers.hr.notification_rules import router as _notification_rules_router
+from app.routers.hr.approval_workflows import router as _approval_workflows_router
+# HR Settings — Phase C
+from app.routers.hr.numbering import router as _numbering_router
+from app.routers.hr.payroll_rules import router as _payroll_rules_router
+from app.routers.hr.appraisal_templates import router as _appraisal_templates_router
+from app.routers.hr.merit_policy import router as _merit_policy_router
+from app.routers.hr.settings_audit import router as _settings_audit_router
+
 router = APIRouter()
 router.include_router(_dashboard_router)
 router.include_router(_employees_router)
@@ -136,6 +162,7 @@ router.include_router(_assets_router)
 # /hr/asset-transfers, /hr/asset-maintenance, /hr/asset-damages, /hr/asset-audits,
 # /hr/asset-disposals, /hr/me/assets).
 router.include_router(_asset_categories_router)
+router.include_router(_asset_types_router)
 router.include_router(_asset_vendors_router)
 router.include_router(_asset_transfers_router)
 router.include_router(_asset_maintenance_router)
@@ -242,3 +269,24 @@ router.include_router(_travel_router)
 router.include_router(_exit_reports_router)
 router.include_router(_exit_self_router)
 router.include_router(_exit_management_router)
+
+# Performance Management — self (/hr/me/performance) before broad (/hr/performance).
+router.include_router(_performance_self_router)
+router.include_router(_performance_router)
+# Performance Management — Phase 6 (distinct hyphenated prefixes; order-free)
+router.include_router(_performance_goals_router)
+router.include_router(_performance_feedback_router)
+router.include_router(_performance_calibration_router)
+router.include_router(_performance_pip_router)
+router.include_router(_performance_analytics_router)
+
+# HR Settings — Phase B
+router.include_router(_settings_masters_router)
+router.include_router(_notification_rules_router)
+router.include_router(_approval_workflows_router)
+# HR Settings — Phase C
+router.include_router(_numbering_router)
+router.include_router(_payroll_rules_router)
+router.include_router(_appraisal_templates_router)
+router.include_router(_merit_policy_router)
+router.include_router(_settings_audit_router)

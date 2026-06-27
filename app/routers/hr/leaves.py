@@ -3456,18 +3456,62 @@ def my_compoff(
 # Phase 2 — Leave Encashment
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _encashment_base(db: Session, emp: Optional[Employee]) -> Decimal:
+    """Per-month pool leave encashment is computed against, from the single source
+    of truth — HR Settings → Payroll Rules ``ENCASHMENT_BASIS`` (BASIC|GROSS|CTC).
+
+    Mirrors the exit settlement engine's ``_settlement_base`` exactly so in-service
+    encashment and final-settlement encashment use the *same* basis and produce the
+    same numbers. Default BASIC. Falls back through comp → employee heuristics.
+    """
+    if emp is None:
+        return Decimal("0")
+    from app.utils.hr.payroll.rule_config import get_rule
+    from app.models.hr.employee_compensation import EmployeeCompensation
+    basis = str(get_rule(db, "ENCASHMENT_BASIS") or "BASIC").upper()
+    comp = (db.query(EmployeeCompensation)
+            .filter(EmployeeCompensation.employee_id == emp.id,
+                    EmployeeCompensation.is_deleted == False,   # noqa: E712
+                    EmployeeCompensation.is_active == True)      # noqa: E712
+            .order_by(EmployeeCompensation.effective_from.desc())
+            .first())
+    if basis == "GROSS":
+        if comp and comp.monthly_gross:
+            return Decimal(str(comp.monthly_gross))
+        if comp and comp.monthly_ctc:
+            return Decimal(str(comp.monthly_ctc))
+        return Decimal(str(emp.monthly_ctc or 0))
+    if basis == "CTC":
+        if comp and comp.monthly_ctc:
+            return Decimal(str(comp.monthly_ctc))
+        return Decimal(str(emp.monthly_ctc or 0))
+    # BASIC (default) — explicit basic, else heuristic 50% of gross/CTC.
+    if comp and comp.basic_amount:
+        return Decimal(str(comp.basic_amount))
+    if comp and comp.monthly_gross:
+        return (Decimal(str(comp.monthly_gross)) * Decimal("0.5"))
+    if emp.monthly_ctc:
+        return (Decimal(str(emp.monthly_ctc)) * Decimal("0.5"))
+    return Decimal("0")
+
+
 def _compute_encashment(
     db: Session, employee_id: UUID, leave_type: LeaveType,
     days_requested: Decimal, basic_override: Optional[Decimal] = None,
 ) -> dict:
     """Apply system_settings.leave_encashment_formula. The default formula is
     `basic_salary * days_encashed / 30`. Admin can edit it via the settings.
+
+    The ``basic_salary`` fed to the formula is resolved from the single source of
+    truth — Payroll Rules ``ENCASHMENT_BASIS`` (shared with exit settlement) — so
+    changing the basis applies consistently to in-service AND final-settlement
+    encashment. An explicit ``basic_override`` (admin) still wins.
     Returns dict with amount, formula_used, basic_salary, available_balance.
     """
     formula = _get_setting(db, "leave_encashment_formula", "basic_salary * days_encashed / 30")
     fy = _current_fy(db)
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
-    basic = Decimal(basic_override) if basic_override else Decimal(emp.monthly_ctc or 0) if emp else Decimal("0")
+    basic = Decimal(basic_override) if basic_override else _encashment_base(db, emp)
     bal = _get_or_create_balance(db, employee_id, leave_type, fy)
     available = Decimal(bal.closing_balance or 0)
     # Safe formula eval — only allows the two named variables and basic arithmetic.

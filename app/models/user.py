@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Boolean, DateTime
+from sqlalchemy import Column, String, Boolean, DateTime, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -33,6 +33,12 @@ class User(Base):
     is_superuser = Column(Boolean, default=False, nullable=False)
     is_activated = Column(Boolean, default=False, nullable=False)  # Account activation status
     activation_code = Column(String, nullable=True)  # 8-digit activation code
+    # Session-invalidation counter. Issued JWTs carry a `tv` claim equal to this
+    # value at mint time; get_current_user rejects a token whose `tv` no longer
+    # matches. Bumping it (on email change / ERP password reset by an admin)
+    # force-logs-out the user's live sessions WITHOUT deactivating the account —
+    # they sign back in with the new credentials and get a fresh, matching token.
+    token_version = Column(Integer, default=1, server_default="1", nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     

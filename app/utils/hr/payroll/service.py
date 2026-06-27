@@ -34,6 +34,7 @@ from app.models.hr.payroll_config import PayrollAuditLog, PayrollAuditAction
 from app.models.hr.salary_structure import SalaryStructure
 from app.utils.hr.payroll import (
     load_config, resolve_structure, compute_payslip, days_in_month, fy_for,
+    resolve_pt_slabs,
 )
 
 Q2 = Decimal("0.01")
@@ -300,9 +301,17 @@ def create_compensation_revision(
     annual_ctc = Decimal(str(annual_ctc))
     monthly_ctc = Decimal(str(monthly_ctc)) if monthly_ctc is not None else (annual_ctc / 12)
 
+    # Enforce the assigned grade's CTC band on every compensation revision
+    # (Compensation drawer + lifecycle promotion both flow through here).
+    from app.utils.hr.grade_band import assert_ctc_in_grade_band
+    assert_ctc_in_grade_band(db, employee.grade_id, annual_ctc)
+
     sid = structure_id or _structure_id_for(db, employee, None)
     regime_enum = tax_regime if tax_regime is not None else employee.tax_regime
-    regime_str = regime_enum.value if (regime_enum is not None and hasattr(regime_enum, "value")) else (regime_enum or "NEW")
+    # Fall back to the org default tax regime (Payroll Rules) when neither the
+    # revision nor the employee specifies one. Default "NEW" → unchanged.
+    from app.utils.hr.payroll.rule_config import get_rule as _get_rule
+    regime_str = regime_enum.value if (regime_enum is not None and hasattr(regime_enum, "value")) else (regime_enum or _get_rule(db, "DEFAULT_TAX_REGIME"))
 
     gross = basic = breakdown = None
     if sid:
@@ -636,7 +645,7 @@ def _night_allowance(db: Session, employee_id, year: int, month: int):
     return total.quantize(Q2), nights
 
 
-def _holiday_premium(db: Session, employee: Employee, year: int, month: int, day_salary_base) -> tuple:
+def _holiday_premium(db: Session, employee: Employee, year: int, month: int, day_salary_base, denom=None) -> tuple:
     """Premium pay for working holidays this period (HolidayShiftAssignment).
 
     Corporate rule: working a holiday pays DOUBLE the day's salary. A holiday is
@@ -666,7 +675,9 @@ def _holiday_premium(db: Session, employee: Employee, year: int, month: int, day
     )
     if not rows:
         return Decimal("0"), Decimal("0")
-    days = Decimal(str(days_in_month(year, month)))
+    # Per-day salary uses the same working-days denominator as the main run
+    # (defaults to days_in_month when not supplied).
+    days = Decimal(str(denom)) if denom else Decimal(str(days_in_month(year, month)))
     base = Decimal(str(day_salary_base or 0))
     if base <= 0 or days <= 0:
         return Decimal("0"), Decimal("0")
@@ -694,16 +705,19 @@ def _holiday_premium(db: Session, employee: Employee, year: int, month: int, day
 
 
 def _overtime_pay(db: Session, employee: Employee, year: int, month: int,
-                  slip_result: Dict, working_days: Decimal, fallback_base) -> tuple:
+                  slip_result: Dict, working_days: Decimal, fallback_base,
+                  default_ot_mult: Decimal = Decimal("1")) -> tuple:
     """Payable overtime for the period from APPROVED, not-yet-processed requests.
 
     Per OvertimeRequest dated in the period:
       payable_hours × hourly_rate × multiplier
       • hourly_rate = full monthly Basic(+DA) / (days_in_month × OT_HOURS_PER_DAY),
         falling back to monthly gross/CTC when the structure has no BASIC line.
-      • multiplier = the NIGHT-shift differential (NightShiftPolicy.overtime_rate)
-        when that date's attendance shift is a NIGHT shift with a policy; otherwise
-        the highest-priority active OvertimeRule for the ot_type (with its hour cap).
+      • multiplier resolves most-specific-first: the NIGHT-shift differential
+        (NightShiftPolicy.overtime_rate) when that date's attendance shift is a
+        NIGHT shift with a policy; else the highest-priority active OvertimeRule
+        for the ot_type (with its hour cap); else the org-wide Payroll Rules
+        OVERTIME_MULTIPLIER (``default_ot_mult``, 1.0 = straight time).
 
     Re-derived every run from APPROVED+PENDING requests, so re-generating a batch
     can't double-pay; release marks them PROCESSED (see post_overtime_processed).
@@ -781,7 +795,9 @@ def _overtime_pay(db: Session, employee: Employee, year: int, month: int,
             mult, cap = Decimal(str(nrate)), None
         else:
             rule = rule_by_type.get(req.ot_type)
-            mult = Decimal(str(rule.multiplier)) if rule else Decimal("1")
+            # Per-type Overtime Rule wins; otherwise the org-wide Payroll Rules
+            # default (1.0 = straight time → unchanged until an admin raises it).
+            mult = Decimal(str(rule.multiplier)) if rule else default_ot_mult
             cap = Decimal(str(rule.max_ot_hours)) if (rule and rule.max_ot_hours is not None) else None
         payable = min(hrs, cap) if cap is not None else hrs
         hours_paid += payable
@@ -875,24 +891,49 @@ def _serialize_cfg(cfg: Dict) -> Dict:
 
 # ─────────────────────────────── compute one payslip dict ───────────────────────────────
 
+def _working_days_denominator(rules: Dict, year: int, month: int) -> Decimal:
+    """Proration / per-day denominator from HR Settings → Payroll Rules.
+
+    Default ACTUAL == days_in_month (the engine's historical behaviour, so an
+    unconfigured org sees no change). CALENDAR_30 forces a fixed 30-day basis;
+    FIXED uses WORKING_DAYS_FIXED (1..31). Anything unexpected falls back to the
+    actual month length — never to a value that could overpay.
+    """
+    basis = str((rules or {}).get("WORKING_DAYS_BASIS") or "ACTUAL").upper()
+    if basis == "CALENDAR_30":
+        return Decimal("30")
+    if basis == "FIXED":
+        try:
+            n = int((rules or {}).get("WORKING_DAYS_FIXED") or 30)
+            return Decimal(str(max(1, min(31, n))))
+        except (TypeError, ValueError):
+            return Decimal("30")
+    return Decimal(str(days_in_month(year, month)))   # ACTUAL (default)
+
+
 def build_payslip_for_employee(db: Session, employee: Employee, year: int, month: int,
                                cfg: Dict) -> Optional[Dict]:
     comp = resolve_compensation(db, employee, year, month)
+    # Org default tax regime (HR Settings → Payroll Rules) used only when neither
+    # the compensation row nor the employee carries an explicit regime. Default
+    # "NEW" matches the historical hard-coded fallback → no-op until configured.
+    _rules = cfg.get("RULES") or {}
+    _default_regime = str(_rules.get("DEFAULT_TAX_REGIME") or "NEW").upper()
     monthly_ctc = None
     annual_ctc = None
-    regime = "NEW"
+    regime = _default_regime
     declarations = None
     monthly_gross_hint = None
     if comp:
         monthly_ctc = comp.monthly_ctc
         annual_ctc = comp.annual_ctc
-        regime = (comp.tax_regime.value if comp.tax_regime else (employee.tax_regime.value if employee.tax_regime else "NEW"))
+        regime = (comp.tax_regime.value if comp.tax_regime else (employee.tax_regime.value if employee.tax_regime else _default_regime))
         declarations = comp.tds_declarations
         monthly_gross_hint = comp.monthly_gross
     else:
         monthly_ctc = employee.monthly_ctc
         annual_ctc = employee.annual_ctc
-        regime = employee.tax_regime.value if employee.tax_regime else "NEW"
+        regime = employee.tax_regime.value if employee.tax_regime else _default_regime
     if not monthly_ctc or Decimal(str(monthly_ctc)) <= 0:
         return None  # can't pay an employee with no compensation
     if not annual_ctc:
@@ -905,7 +946,9 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     if not components:
         return None
 
-    working = Decimal(str(days_in_month(year, month)))   # proration denominator = full month
+    # Proration denominator from Payroll Rules (WORKING_DAYS_BASIS). Default
+    # ACTUAL == days_in_month — identical to the previous hard-coded behaviour.
+    working = _working_days_denominator(_rules, year, month)
     lop = month_lop_days(db, employee.id, year, month)
     start, end = month_bounds(year, month)
     # ── Payable window ───────────────────────────────────────────────────────
@@ -951,7 +994,7 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     # Holiday pay — premium for working a holiday (HolidayShiftAssignment). Double-pay
     # rule: the day is already paid in monthly salary, so we add (multiplier-1)× a
     # day's salary (2.0× ⇒ +1 day ⇒ double pay). Re-derived each run → no double-pay.
-    hol_total, hol_worked = _holiday_premium(db, employee, year, month, monthly_gross_hint or monthly_ctc)
+    hol_total, hol_worked = _holiday_premium(db, employee, year, month, monthly_gross_hint or monthly_ctc, working)
     if hol_total > 0:
         adjustments = list(adjustments) + [{
             "code": "HOLIDAY_PAY", "adjustment_type": "HOLIDAY_PAY",
@@ -963,6 +1006,13 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     # Apply this employee's structure PF policy (cap at ceiling vs full Basic) for
     # this computation. cfg is shared across the batch, so set it per employee.
     cfg["PF_RESTRICT_TO_CEILING"] = pf_restrict_for(db, structure_id)
+    # Professional Tax is a STATE levy — resolve this employee's slabs from their
+    # work-location state (free-text name → code). cfg is shared across the batch,
+    # so overwrite PT_SLABS per employee (resolver reads the stable national / by-
+    # state keys load_config set, not this overwritten value). Unconfigured / non-
+    # PT states (and employees with no location) fall back to the national no-PT.
+    _emp_state = employee.work_location.state if employee.work_location else None
+    cfg["PT_SLABS"] = resolve_pt_slabs(cfg, _emp_state)
     # One-time TAXABLE earnings this period (bonus/incentive/commission/arrear +
     # night/holiday — all carry is_taxable) feed the TDS annual base ONCE, plus the
     # taxable one-offs already paid earlier this FY, so a bonus is actually withheld.
@@ -985,8 +1035,16 @@ def build_payslip_for_employee(db: Session, employee: Employee, year: int, month
     # Basic(+DA); ×OT-rule multiplier, or the night-shift differential when the OT
     # was worked on a night shift. Idempotent: re-derived each run, marked
     # PROCESSED only on release (post_overtime_processed) → no double-pay.
+    # Org-wide OT multiplier fallback (HR Settings → Payroll Rules). Per-type
+    # Overtime Rules / night differential still override inside _overtime_pay.
+    try:
+        _default_ot_mult = Decimal(str(_rules.get("OVERTIME_MULTIPLIER") or 1))
+    except (TypeError, ValueError):
+        _default_ot_mult = Decimal("1")
+    if _default_ot_mult <= 0:
+        _default_ot_mult = Decimal("1")
     ot_total, ot_hours = _overtime_pay(db, employee, year, month, result, working,
-                                       monthly_gross_hint or monthly_ctc)
+                                       monthly_gross_hint or monthly_ctc, _default_ot_mult)
     if ot_total > 0:
         result["lines"].append({
             "component_id": None, "component_code": "OVERTIME",

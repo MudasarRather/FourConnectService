@@ -23,7 +23,8 @@ class AssetCategoryCreate(BaseModel):
     name: str
     code: str
     parent_category_id: Optional[UUID] = None
-    default_asset_type: Optional[AssetType] = None
+    default_asset_type: Optional[str] = None
+    allowed_asset_types: Optional[List[str]] = None
     depreciation_method: Optional[str] = None
     useful_life_months: Optional[int] = None
     description: Optional[str] = None
@@ -34,7 +35,8 @@ class AssetCategoryUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     parent_category_id: Optional[UUID] = None
-    default_asset_type: Optional[AssetType] = None
+    default_asset_type: Optional[str] = None
+    allowed_asset_types: Optional[List[str]] = None
     depreciation_method: Optional[str] = None
     useful_life_months: Optional[int] = None
     description: Optional[str] = None
@@ -47,7 +49,8 @@ class AssetCategoryResponse(BaseModel):
     name: str
     code: str
     parent_category_id: Optional[UUID] = None
-    default_asset_type: Optional[AssetType] = None
+    default_asset_type: Optional[str] = None
+    allowed_asset_types: Optional[List[str]] = None
     depreciation_method: Optional[str] = None
     useful_life_months: Optional[int] = None
     description: Optional[str] = None
@@ -62,6 +65,42 @@ class AssetCategoryListResponse(BaseModel):
     page: int
     limit: int
     total_pages: int
+
+
+# ─────────────────────── Asset Types (manageable catalog) ───────────────────────
+
+class AssetTypeDefCreate(BaseModel):
+    code: str
+    label: str
+    icon: Optional[str] = None
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class AssetTypeDefUpdate(BaseModel):
+    code: Optional[str] = None
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class AssetTypeDefResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    code: str
+    label: str
+    icon: Optional[str] = None
+    sort_order: int
+    is_system: bool
+    is_active: bool
+    asset_count: Optional[int] = None
+    created_at: datetime
+
+
+class AssetTypeDefListResponse(BaseModel):
+    items: List[AssetTypeDefResponse]
+    total: int
 
 
 # ───────────────────────────── Vendors ─────────────────────────────

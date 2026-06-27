@@ -2,11 +2,14 @@ from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
 from app.models.hr.grade import Grade
+from app.models.hr.employee import Employee
+from app.models.hr.designation import Designation
 from app.schemas.hr.grade import GradeCreate, GradeUpdate, GradeResponse
 from app.utils.dependencies import get_current_superuser
 
@@ -89,6 +92,32 @@ def delete_grade(
     g = db.query(Grade).filter(Grade.id == grade_id).first()
     if not g:
         raise HTTPException(404, "Grade not found")
+
+    # Pre-flight guard: a soft-delete is an UPDATE, so the FK never fires — we
+    # must refuse here or live employees / designations would be left pointing at
+    # a tombstone (orphaning their pay band + travel/DA eligibility). Mirrors the
+    # delete guard on departments and designations.
+    emp_holders = (
+        db.query(func.count(Employee.id))
+        .filter(Employee.grade_id == grade_id, Employee.is_deleted == False)  # noqa: E712
+        .scalar()
+    ) or 0
+    desig_holders = (
+        db.query(func.count(Designation.id))
+        .filter(Designation.grade_id == grade_id, Designation.is_deleted == False)  # noqa: E712
+        .scalar()
+    ) or 0
+    if emp_holders or desig_holders:
+        parts = []
+        if emp_holders:
+            parts.append(f"{emp_holders} employee{'s' if emp_holders != 1 else ''}")
+        if desig_holders:
+            parts.append(f"{desig_holders} designation{'s' if desig_holders != 1 else ''}")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{' and '.join(parts)} still reference this grade — reassign them before it can be removed.",
+        )
+
     g.is_deleted = True
     db.commit()
     return None

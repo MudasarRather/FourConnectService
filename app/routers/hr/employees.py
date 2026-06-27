@@ -25,6 +25,7 @@ from app.models.hr.designation import Designation
 from app.models.hr.grade import Grade
 from app.models.hr.location import WorkLocation
 from app.utils.hr.payroll.service import create_compensation_revision
+from app.utils.hr.grade_band import assert_ctc_in_grade_band
 from app.schemas.hr.employee import (
     EmployeeCreate, EmployeeUpdate,
     EmployeeResponse, EmployeeDetailResponse, EmployeeListResponse,
@@ -62,7 +63,17 @@ def _mask_account(num: Optional[str]) -> Optional[str]:
 
 def _next_employee_id(db: Session) -> str:
     """Allocate the next EMP#### id using a PG sequence; fall back to MAX+1 if the
-    sequence isn't present (e.g. tests with sqlite)."""
+    sequence isn't present (e.g. tests with sqlite).
+
+    If an admin has configured an active NumberingSeries for EMPLOYEE in HR
+    Settings, that format wins (opt-in); otherwise the existing sequence is used."""
+    try:
+        from app.utils.hr.numbering import next_number
+        n = next_number(db, "EMPLOYEE")
+        if n:
+            return n
+    except Exception:
+        pass  # any numbering issue → fall through to the legacy sequence
     try:
         nv = db.execute(text("SELECT nextval('hr_employee_id_seq')")).scalar()
         return f"EMP{int(nv):04d}"
@@ -331,6 +342,66 @@ def list_rehire_eligible(
     return {"items": items, "total": len(items)}
 
 
+@router.get("/next-code")
+def peek_next_employee_id(
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
+    """Preview the next employee id WITHOUT advancing any counter.
+
+    Mirrors ``_next_employee_id`` so the Add-Employee wizard can show the code
+    that will actually be assigned: an active EMPLOYEE ``NumberingSeries`` (from
+    HR Settings -> Numbering Series) wins; otherwise the PG sequence is peeked
+    (read-only); otherwise MAX(existing)+1. Returns ``{employee_id, source}``.
+
+    Read-only and indicative — the binding allocation still happens atomically at
+    create time, so a concurrent create could claim this value first.
+    """
+    from datetime import date
+    from app.models.hr.numbering_series import NumberingSeries
+    from app.utils.hr.numbering import preview, _fy_string
+
+    # 1) Active numbering series (opt-in via HR Settings) takes precedence.
+    series = (
+        db.query(NumberingSeries)
+        .filter(
+            NumberingSeries.module == "EMPLOYEE",
+            NumberingSeries.is_active == True,    # noqa: E712
+            NumberingSeries.is_deleted == False,  # noqa: E712
+        )
+        .first()
+    )
+    if series:
+        today = date.today()
+        n = int(series.current_number or 0)
+        # Account for the FY-reset the real allocator would apply this cycle.
+        if series.financial_year_reset and series.last_reset_fy != _fy_string(today):
+            n = 0
+        return {"employee_id": preview(series, n + 1, today), "source": "series"}
+
+    # 2) Peek the PG sequence without consuming a value.
+    try:
+        row = db.execute(text("SELECT last_value, is_called FROM hr_employee_id_seq")).first()
+        if row is not None:
+            last_value, is_called = int(row[0]), bool(row[1])
+            nxt = last_value + 1 if is_called else last_value
+            return {"employee_id": f"EMP{nxt:04d}", "source": "sequence"}
+    except Exception:
+        db.rollback()
+
+    # 3) Fallback: highest EMP#### already in use + 1.
+    last = (
+        db.query(Employee.employee_id)
+        .filter(Employee.employee_id.like("EMP%"))
+        .order_by(Employee.employee_id.desc())
+        .first()
+    )
+    n = 1
+    if last and last[0] and last[0][3:].isdigit():
+        n = int(last[0][3:]) + 1
+    return {"employee_id": f"EMP{n:04d}", "source": "max"}
+
+
 @router.get("/{employee_pk}", response_model=EmployeeDetailResponse)
 def get_employee(
     employee_pk: UUID,
@@ -397,6 +468,12 @@ def create_employee(
     if db.query(Employee).filter(Employee.user_id == user_id, Employee.is_deleted == False).first():  # noqa: E712
         raise HTTPException(400, "An Employee record already exists for this user")
 
+    # Enforce the grade's CTC band on the incoming pay (annual, or monthly×12).
+    _create_annual = data.get("annual_ctc")
+    if _create_annual in (None, "") and data.get("monthly_ctc") not in (None, ""):
+        _create_annual = Decimal(str(data["monthly_ctc"])) * 12
+    assert_ctc_in_grade_band(db, data.get("grade_id"), _create_annual)
+
     # Resolve lifecycle from category
     cat = data.get("employee_category")
     if cat == EmployeeCategory.PROBATIONARY or cat == EmployeeCategory.PROBATIONARY.value:
@@ -443,6 +520,16 @@ def create_employee(
     bootstrap_onboarding(db, employee=emp, offer=offer_obj, actor_id=admin.id)
 
     db.commit()
+    try:
+        from app.utils.hr.notify import dispatch
+        dispatch(db, "EMPLOYEE_CREATED", emp.user_id, context={
+            "title": "Welcome aboard 👋",
+            "message": f"Your employee profile ({emp.employee_id}) has been set up.",
+            "action_url": "/user/self-service/profile",
+        })
+        db.commit()
+    except Exception:
+        db.rollback()
     emp = _load_with_relations(db, emp.id)
     return _to_detail(emp, reveal_bank=False)
 
@@ -493,6 +580,10 @@ def update_employee(
             if existing:
                 raise HTTPException(409, "Email is already in use by another user")
             user.email = user_email
+            # Changing the login email force-logs-out the employee's live session:
+            # bumping token_version invalidates their already-issued JWTs (see
+            # dependencies.get_current_user). They sign back in with the new email.
+            user.token_version = (user.token_version or 1) + 1
         if user_full_name is not None:
             user.full_name = user_full_name
         if employee_code_in_payload:
@@ -520,6 +611,18 @@ def update_employee(
         any(c in acct for c in "Xx•*") or acct == _mask_account(emp.account_number)
     ):
         update.pop("account_number", None)
+
+    # Enforce the grade's CTC band whenever this edit touches grade or pay.
+    # (Don't validate unrelated edits — an out-of-band legacy record stays
+    # editable for everything except its grade/CTC.)
+    if any(k in update for k in ("grade_id", "annual_ctc", "monthly_ctc")):
+        _eff_grade = update.get("grade_id", emp.grade_id)
+        _eff_annual = update.get("annual_ctc", emp.annual_ctc)
+        if _eff_annual in (None, ""):
+            _eff_monthly = update.get("monthly_ctc", emp.monthly_ctc)
+            if _eff_monthly not in (None, ""):
+                _eff_annual = Decimal(str(_eff_monthly)) * 12
+        assert_ctc_in_grade_band(db, _eff_grade, _eff_annual)
 
     for k, v in update.items():
         setattr(emp, k, v)

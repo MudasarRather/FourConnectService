@@ -55,6 +55,39 @@ def get_policy(db: Session, category_id: UUID) -> Optional[ClaimPolicy]:
     ).first()
 
 
+def _assert_eligible(employee: Employee, category: ClaimCategory,
+                     policy: Optional[ClaimPolicy]) -> None:
+    """Gate WHO may claim a category by the policy's eligibility scope.
+
+    ``policy.eligibility`` shape: {"department_ids", "designation_ids",
+    "grade_ids", "employment_types"}. A missing/empty list for a dimension means
+    "no restriction on that dimension"; a populated list means the employee's
+    value MUST be in it. Empty / null eligibility => everyone is eligible.
+    """
+    elig = (policy.eligibility if policy else None) or {}
+    if not isinstance(elig, dict):
+        return
+    et = employee.employment_type.value if getattr(employee.employment_type, "value", None) else employee.employment_type
+
+    def _allows(key, value) -> bool:
+        allowed = elig.get(key)
+        if not allowed:          # None or empty list → unrestricted
+            return True
+        return str(value) in [str(a) for a in allowed]
+
+    if not (
+        _allows("grade_ids", employee.grade_id)
+        and _allows("department_ids", employee.department_id)
+        and _allows("designation_ids", employee.designation_id)
+        and _allows("employment_types", et)
+    ):
+        raise HTTPException(
+            403,
+            f"You are not eligible to claim under “{category.name}” — this category is "
+            "restricted to specific grades / departments / designations / employment types.",
+        )
+
+
 def _enforce_policy(db: Session, *, employee_id: UUID, category: ClaimCategory,
                     policy: Optional[ClaimPolicy], amount: Decimal,
                     expense_date: date, attachments: list, exclude_claim_id=None) -> None:
@@ -139,6 +172,7 @@ def submit_claim(db: Session, claim: Claim, employee: Employee, actor: User, *,
     category = get_category(db, claim.category_id)
     policy = get_policy(db, claim.category_id)
     if enforce:
+        _assert_eligible(employee, category, policy)
         _enforce_policy(db, employee_id=claim.employee_id, category=category, policy=policy,
                         amount=claim.amount, expense_date=claim.expense_date,
                         attachments=claim.attachments, exclude_claim_id=claim.id)

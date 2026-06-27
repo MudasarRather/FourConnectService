@@ -75,6 +75,24 @@ def _monthly_gross(comp: Optional[EmployeeCompensation], emp: Employee) -> Decim
     return Decimal("0")
 
 
+def _monthly_ctc(comp: Optional[EmployeeCompensation], emp: Employee) -> Decimal:
+    if comp and comp.monthly_ctc:
+        return _d(comp.monthly_ctc)
+    if emp.monthly_ctc:
+        return _d(emp.monthly_ctc)
+    return _monthly_gross(comp, emp)
+
+
+def _settlement_base(comp, emp, basis: str, basic: Decimal) -> Decimal:
+    """Per-month pool a BASIC|GROSS|CTC basis resolves to (default BASIC)."""
+    b = str(basis or "BASIC").upper()
+    if b == "GROSS":
+        return _monthly_gross(comp, emp)
+    if b == "CTC":
+        return _monthly_ctc(comp, emp)
+    return basic
+
+
 # Attendance statuses that never carry paid weight in a final settlement — an
 # unauthorised absence or a leave-without-pay day earns nothing.
 _UNPAID_ATT_STATUSES = ("ABSENT", "LWP")
@@ -193,8 +211,14 @@ def _pending_salary(db: Session, emp: Employee, comp: Optional[EmployeeCompensat
     }
 
 
-def _leave_encashment(db: Session, emp: Employee, basic: Decimal) -> Dict[str, Any]:
-    """Sum encashable closing balances, valued at basic/30 per day."""
+def _leave_encashment(db: Session, emp: Employee, base: Decimal, basis_label: str = "BASIC") -> Dict[str, Any]:
+    """Sum encashable closing balances, valued at base/30 per day.
+
+    ``base`` is the per-month pool the configured ENCASHMENT_BASIS resolves to
+    (BASIC by default, optionally GROSS/CTC); ``basis_label`` is recorded in the
+    snapshot for provenance.
+    """
+    basic = base
     try:
         from app.models.hr.leave_balance import LeaveBalance
         from app.models.hr.leave_type import LeaveType
@@ -219,9 +243,9 @@ def _leave_encashment(db: Session, emp: Employee, basic: Decimal) -> Dict[str, A
         days = max(days, Decimal("0"))
         per_day = (basic / Decimal("30")) if basic else Decimal("0")
         amount = per_day * days
-        return {"amount": _round(amount), "days": _round(days), "per_day": _round(per_day)}
+        return {"amount": _round(amount), "days": _round(days), "per_day": _round(per_day), "basis": basis_label}
     except Exception:
-        return {"amount": Decimal("0"), "days": Decimal("0"), "per_day": Decimal("0")}
+        return {"amount": Decimal("0"), "days": Decimal("0"), "per_day": Decimal("0"), "basis": basis_label}
 
 
 def _gratuity(emp: Employee, policy: Optional[ExitPolicy], basic: Decimal) -> Dict[str, Any]:
@@ -254,10 +278,14 @@ def _approved_unpaid_reimbursements(db: Session, emp: Employee) -> Decimal:
         return Decimal("0")
 
 
-def _notice_recovery(case: ExitCase, policy: Optional[ExitPolicy], comp, emp) -> Dict[str, Any]:
-    """Shortfall (or buyout) days × per-day basis. 0 if waived w/o buyout or full notice served."""
+def _notice_recovery(case: ExitCase, policy: Optional[ExitPolicy], comp, emp, default_basis: str = "BASIC") -> Dict[str, Any]:
+    """Shortfall (or buyout) days × per-day basis. 0 if waived w/o buyout or full notice served.
+
+    The per-policy ``buyout_basis`` wins when a policy applies; otherwise the org
+    default (Payroll Rules → NOTICE_RECOVERY_BASIS, "BASIC" by default) is used.
+    """
     required = resolved_notice_days(case, policy)
-    basis = (policy.buyout_basis if policy else "BASIC")
+    basis = (policy.buyout_basis if policy else default_basis)
     per_day_pool = _monthly_basic(comp, emp) if basis == "BASIC" else _monthly_gross(comp, emp)
     per_day = (per_day_pool / Decimal("30")) if per_day_pool else Decimal("0")
 
@@ -324,11 +352,18 @@ def compute_settlement(
     basic = _monthly_basic(comp, emp)
     lwd = case.last_working_date or case.exit_date
 
+    # Settlement bases from HR Settings → Payroll Rules. Both default to BASIC,
+    # which matches the historical computation → no change until configured. The
+    # per-policy buyout_basis still wins for notice recovery when a policy applies.
+    from app.utils.hr.payroll.rule_config import get_rule
+    enc_basis = str(get_rule(db, "ENCASHMENT_BASIS") or "BASIC").upper()
+    notice_basis = str(get_rule(db, "NOTICE_RECOVERY_BASIS") or "BASIC").upper()
+
     pending = _pending_salary(db, emp, comp, lwd)
-    leave = _leave_encashment(db, emp, basic)
+    leave = _leave_encashment(db, emp, _settlement_base(comp, emp, enc_basis, basic), basis_label=enc_basis)
     grat = _gratuity(emp, policy, basic)
     reimb = _approved_unpaid_reimbursements(db, emp)
-    notice = _notice_recovery(case, policy, comp, emp)
+    notice = _notice_recovery(case, policy, comp, emp, default_basis=notice_basis)
     asset_rec = _clearance_recovery(db, case)
     travel_adv = _travel_advance_recovery(db, emp)
 

@@ -40,6 +40,7 @@ from app.schemas.hr.onboarding import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.lifecycle_guard import SEPARATED
+from app.utils.hr.settings_audit import log_settings_change
 
 
 router = APIRouter(prefix="/hr/onboarding", tags=["HR — Onboarding"])
@@ -765,10 +766,13 @@ def list_templates(
 def create_template(
     payload: ChecklistTemplateCreate,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     tpl = OnboardingChecklistTemplate(**payload.model_dump())
     db.add(tpl)
+    db.flush()
+    log_settings_change(db, "ONBOARDING_CHECKLIST", tpl.id, "CREATE", admin.id,
+                        note=getattr(tpl, "title", None) or getattr(tpl, "name", None))
     db.commit()
     db.refresh(tpl)
     return ChecklistTemplateResponse.model_validate(tpl)
@@ -779,13 +783,15 @@ def update_template(
     tpl_id: UUID,
     payload: ChecklistTemplateUpdate,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     tpl = db.query(OnboardingChecklistTemplate).filter(OnboardingChecklistTemplate.id == tpl_id).first()
     if not tpl:
         raise HTTPException(404, "Not found")
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(tpl, k, v)
+    log_settings_change(db, "ONBOARDING_CHECKLIST", tpl.id, "UPDATE", admin.id,
+                        note=getattr(tpl, "title", None) or getattr(tpl, "name", None))
     db.commit()
     db.refresh(tpl)
     return ChecklistTemplateResponse.model_validate(tpl)

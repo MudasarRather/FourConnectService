@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
+from functools import lru_cache
 from typing import List, Optional, Tuple
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from app.models.hr.employee import Employee
 from app.models.hr.shift import Shift, EmployeeShiftAssignment
+from app.models.hr.location import WorkLocation
 from app.models.hr.attendance import Attendance, AttendanceStatus, AttendanceSource
 from app.models.hr.attendance_punch import AttendancePunch, PunchType
 from app.models.hr.wfh_request import WfhRequest, WfhStatus, WfhRequestType
@@ -32,10 +35,63 @@ from app.models.hr.attendance_log import AttendanceLog, AttendanceLogAction
 from app.models.hr.geo_fence import GeoFence
 
 
-# Business timezone — all wall-clock comparisons (shift start/end, late minutes,
-# half-day cutoff) happen in IST. Storage stays UTC; only the comparison frame
-# moves. India doesn't observe DST so a static UTC+5:30 offset is correct.
+# Default business timezone — the historical org clock and the hard fallback.
+# Storage stays UTC; only the *comparison frame* (shift start/end, late minutes,
+# half-day cutoff, the day a punch belongs to) moves. India doesn't observe DST
+# so a static UTC+5:30 offset is correct and `ZoneInfo("Asia/Kolkata")` is
+# arithmetically identical to this fixed offset — so existing all-India data is
+# byte-for-byte unaffected by the per-location upgrade below.
 IST = timezone(timedelta(hours=5, minutes=30))
+DEFAULT_BUSINESS_TZ_NAME = "Asia/Kolkata"
+
+
+@lru_cache(maxsize=128)
+def business_tz(name: Optional[str]) -> tzinfo:
+    """Resolve an IANA timezone name to a tzinfo, defaulting to IST.
+
+    Returns the fixed IST offset for an empty/unknown name (and as a hard
+    fallback if the IANA db isn't installed) so attendance computation never
+    crashes on a mis-typed or unset work-location timezone — the worst case is
+    "compute in IST", i.e. the legacy behaviour. ``ZoneInfo`` is DST-correct for
+    offices that observe DST (e.g. America/New_York), unlike a fixed offset.
+    """
+    if not name:
+        return IST
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return IST
+
+
+def resolve_tz_for_location(db: Session, work_location_id: Optional[UUID]) -> tzinfo:
+    """Business timezone for a work location id (IST when unset/unknown)."""
+    if not work_location_id:
+        return IST
+    try:
+        tz_name = (
+            db.query(WorkLocation.timezone)
+            .filter(WorkLocation.id == work_location_id)
+            .scalar()
+        )
+        return business_tz(tz_name)
+    except Exception:
+        return IST
+
+
+def resolve_employee_tz(db: Session, employee_id: UUID) -> tzinfo:
+    """Business timezone an employee operates in, derived from their work
+    location's IANA timezone. Falls back to IST when the employee has no
+    location, the location has no timezone, or anything goes wrong."""
+    try:
+        tz_name = (
+            db.query(WorkLocation.timezone)
+            .join(Employee, Employee.work_location_id == WorkLocation.id)
+            .filter(Employee.id == employee_id)
+            .scalar()
+        )
+        return business_tz(tz_name)
+    except Exception:
+        return IST
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -112,30 +168,31 @@ class ComputeResult:
     overtime_hours: float
 
 
-def _combine(d: date, t: time) -> datetime:
-    """Build a tz-aware datetime in IST (business clock).
+def _combine(d: date, t: time, tz: tzinfo = IST) -> datetime:
+    """Build a tz-aware datetime anchored in the business clock `tz`.
 
-    Shift `start_time` / `end_time` columns are stored as naive wall-clock IST
-    values (e.g. 09:00 means 9 AM IST), so any comparison against a UTC-stored
-    punch timestamp must anchor the shift moment in IST. Returning the
-    datetime with `tzinfo=IST` lets aware-aware subtraction normalize to UTC
-    correctly and produces the right late/early/overtime deltas.
+    Shift `start_time` / `end_time` columns are stored as naive wall-clock
+    values LOCAL to the office (e.g. 09:00 means 9 AM at that work location),
+    so any comparison against a UTC-stored punch timestamp must anchor the shift
+    moment in the office timezone. Returning the datetime with `tzinfo=tz` lets
+    aware-aware subtraction normalize to UTC correctly and produces the right
+    late/early/overtime deltas. `tz` defaults to IST (legacy behaviour).
     """
-    return datetime.combine(d, t, tzinfo=IST)
+    return datetime.combine(d, t, tzinfo=tz)
 
 
-def _day_bounds_utc(d: date) -> tuple[datetime, datetime]:
-    """UTC range that covers the IST calendar day `d`.
+def _day_bounds_utc(d: date, tz: tzinfo = IST) -> tuple[datetime, datetime]:
+    """UTC range that covers the office-local calendar day `d`.
 
-    A day in IST (00:00–23:59:59) spans from `d 00:00 IST` to `d+1 00:00 IST`,
-    which in UTC is `d-1 18:30 UTC` to `d 18:30 UTC`. The punch table is keyed
-    on UTC timestamps, so querying "punches on date d (IST)" requires this
-    shifted range — using `d 00:00 UTC` to `d+1 00:00 UTC` would miss the
-    18:30–24:00 IST window and double-count the next day's morning.
+    A day in `tz` (00:00–23:59:59 local) spans from `d 00:00 local` to
+    `d+1 00:00 local`; converted to UTC this is the window the punch table (keyed
+    on UTC timestamps) must be queried with. Using `d 00:00 UTC`..`d+1 00:00 UTC`
+    would slice the wrong 24h for any non-UTC office. `tz` defaults to IST so
+    existing India data resolves to the historical `d-1 18:30`..`d 18:30 UTC`.
     """
-    start_ist = datetime.combine(d, time.min, tzinfo=IST)
-    end_ist = datetime.combine(d + timedelta(days=1), time.min, tzinfo=IST)
-    return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+    start_local = datetime.combine(d, time.min, tzinfo=tz)
+    end_local = datetime.combine(d + timedelta(days=1), time.min, tzinfo=tz)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
 def _build_work_intervals(punches_sorted: List[AttendancePunch]) -> list:
@@ -167,6 +224,7 @@ def compute_attendance_status(
     effective_start: Optional[datetime] = None,
     effective_end: Optional[datetime] = None,
     effective_grace: Optional[int] = None,
+    tz: tzinfo = IST,
 ) -> ComputeResult:
     """Pure status computation from raw punches.
 
@@ -229,8 +287,8 @@ def compute_attendance_status(
     overtime_hours = 0.0
 
     if shift:
-        shift_start_dt = _combine(on_date, shift.start_time)
-        shift_end_dt   = _combine(on_date, shift.end_time)
+        shift_start_dt = _combine(on_date, shift.start_time, tz)
+        shift_end_dt   = _combine(on_date, shift.end_time, tz)
         grace = int(shift.grace_minutes or 0)
         full_day = float(shift.full_day_hours or 8.0)
         half_day = float(shift.half_day_hours or 4.0)
@@ -459,6 +517,11 @@ def daily_rollup(
     # paid HOLIDAY for everyone.
     from app.models.hr.holiday import HolidayType
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
+    # Business clock for this employee = their work location's timezone (IST when
+    # unset). Every wall-clock anchor below (day bounds, shift start/end, OT,
+    # half-day window) is computed in this frame so a non-IST office's punches
+    # are judged against its own local shift times.
+    tz = resolve_tz_for_location(db, emp.work_location_id if emp else None)
     holiday_q = db.query(Holiday).filter(
         Holiday.date == on_date,
         Holiday.is_active == True,   # noqa: E712
@@ -473,7 +536,7 @@ def daily_rollup(
 
     is_week_off = bool(shift and on_date.weekday() in (shift.weekly_off_days or []))
 
-    day_start_utc, day_end_utc = _day_bounds_utc(on_date)
+    day_start_utc, day_end_utc = _day_bounds_utc(on_date, tz)
     punches = (
         db.query(AttendancePunch)
         .filter(
@@ -528,8 +591,8 @@ def daily_rollup(
     eff_start = eff_end = None
     eff_grace = None
     if shift and half_day_match:
-        s_start = _combine(on_date, shift.start_time)
-        s_end   = _combine(on_date, shift.end_time)
+        s_start = _combine(on_date, shift.start_time, tz)
+        s_end   = _combine(on_date, shift.end_time, tz)
         if s_end <= s_start:
             from datetime import timedelta as _td2
             s_end += _td2(days=1)
@@ -544,6 +607,7 @@ def daily_rollup(
     result = compute_attendance_status(
         punches, shift, on_date,
         effective_start=eff_start, effective_end=eff_end, effective_grace=eff_grace,
+        tz=tz,
     )
 
     if wfh_match:
@@ -760,7 +824,7 @@ def daily_rollup(
         # Compose a descriptive reason for the auto-detected case.
         post_min_past = 0
         if shift:
-            shift_end_dt = _combine(on_date, shift.end_time)
+            shift_end_dt = _combine(on_date, shift.end_time, tz)
             if result.check_out_time > shift_end_dt:
                 post_min_past = int((result.check_out_time - shift_end_dt).total_seconds() / 60)
         auto_reason = (
@@ -983,6 +1047,7 @@ def finalize_orphan_open_punches(
     """
     today = date.today()
     cutoff = today - timedelta(days=lookback_days)
+    tz = resolve_employee_tz(db, employee_id)
     rows = (
         db.query(Attendance)
         .filter(
@@ -999,7 +1064,7 @@ def finalize_orphan_open_punches(
     )
     finalized = 0
     for att in rows:
-        day_start_utc, day_end_utc = _day_bounds_utc(att.date)
+        day_start_utc, day_end_utc = _day_bounds_utc(att.date, tz)
         day_punches = (
             db.query(AttendancePunch)
             .filter(

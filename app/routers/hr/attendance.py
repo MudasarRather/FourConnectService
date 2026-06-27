@@ -45,6 +45,7 @@ from app.utils.dependencies import get_current_user, get_current_superuser
 from app.utils.hr.attendance_logic import (
     daily_rollup, mark_absentees, lock_day, resolve_shift, verify_geofence, log,
     finalize_orphan_open_punches, GeoVerifyResult, _day_bounds_utc,
+    resolve_employee_tz,
 )
 from app.utils.hr.lifecycle_guard import guard_within_tenure
 
@@ -484,6 +485,9 @@ def admin_punch_on_behalf(
         raise HTTPException(404, "Employee not found")
     today = date.today()
     target_date = on_date or today
+    # Bucket punches into the employee's office-local day so the idempotency
+    # window matches the tz-aware daily_rollup (IST fallback for India offices).
+    emp_tz = resolve_employee_tz(db, emp.id)
     # A leaving / departed employee may not have punches recorded past LWD.
     guard_within_tenure(emp, target_date, "punch attendance")
     requested = payload.punch_type
@@ -516,7 +520,7 @@ def admin_punch_on_behalf(
             raise HTTPException(409, "No open punches to finalize — clock-in row had no punch evidence")
         db.commit()
         # Return the synthetic OUT punch we just created for that day.
-        day_start_utc, day_end_utc = _day_bounds_utc(target_date)
+        day_start_utc, day_end_utc = _day_bounds_utc(target_date, resolve_employee_tz(db, emp.id))
         latest_out = (
             db.query(AttendancePunch)
             .filter(
@@ -534,8 +538,8 @@ def admin_punch_on_behalf(
 
     # ── Today (existing path) ─────────────────────────────────────────────
     # IST-bounded day window (punches are stored UTC; the business clock is IST).
-    today_start_utc_admin = datetime.combine(target_date, dtime.min, tzinfo=IST).astimezone(timezone.utc)
-    tomorrow_start_utc_admin = datetime.combine(target_date + timedelta(days=1), dtime.min, tzinfo=IST).astimezone(timezone.utc)
+    today_start_utc_admin = datetime.combine(target_date, dtime.min, tzinfo=emp_tz).astimezone(timezone.utc)
+    tomorrow_start_utc_admin = datetime.combine(target_date + timedelta(days=1), dtime.min, tzinfo=emp_tz).astimezone(timezone.utc)
     punches = (
         db.query(AttendancePunch)
         .filter(
@@ -669,7 +673,9 @@ def break_anomalies(
     individual breaks that ran long.
     """
     target_date = on_date or date.today()
-    day_start_utc, day_end_utc = _day_bounds_utc(target_date)
+    # NOTE: the punch-day window is resolved PER EMPLOYEE inside the loop below,
+    # in each one's office timezone (IST fallback) — a single org-wide IST window
+    # would slice the wrong 24h for a non-IST office's punches.
 
     base = (
         db.query(Attendance)
@@ -725,7 +731,11 @@ def break_anomalies(
         if severity and sev != severity:
             continue
 
-        # Pull break segments from raw punches for the day.
+        # Pull break segments from raw punches for the day — bucket against the
+        # employee's office-local day (IST fallback) so the window matches the
+        # tz-aware rollup that produced this row.
+        emp_tz = resolve_employee_tz(db, att.employee_id)
+        day_start_utc, day_end_utc = _day_bounds_utc(att.date, emp_tz)
         punches = (
             db.query(AttendancePunch)
             .filter(
@@ -739,10 +749,10 @@ def break_anomalies(
         segments: list = []
         open_start = None
         windows = (shift.break_windows if shift else None) or []
-        def _in_window(p_time):
+        def _in_window(p_time, tz=emp_tz):
             if not windows:
                 return True
-            local = p_time.astimezone(IST).time()
+            local = p_time.astimezone(tz).time()
             for w in windows:
                 try:
                     ws = w.get("start_time"); we = w.get("end_time")
@@ -878,7 +888,11 @@ def trigger_lock_day(
 @router.get("/me/today", response_model=MeTodayResponse)
 def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     emp = _resolve_self_employee(db, user)
-    today = date.today()
+    # Self-service status is computed against the employee's OFFICE clock
+    # (work-location timezone, IST fallback) so a non-IST employee sees the
+    # right "today", late/early state and shift countdowns.
+    emp_tz = resolve_employee_tz(db, emp.id)
+    today = datetime.now(emp_tz).date()
 
     # Self-heal: if the user forgot to clock out yesterday (or earlier within
     # the lookback window) and the day rolled over, finalize the orphan IN now
@@ -896,10 +910,10 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
         .first()
     )
 
-    # Determine open punch. Query bounds are in IST (business day) — punches
-    # are stored UTC; we convert the IST day window to UTC for the filter.
-    today_start_utc = datetime.combine(today, dtime.min, tzinfo=IST).astimezone(timezone.utc)
-    tomorrow_start_utc = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=IST).astimezone(timezone.utc)
+    # Determine open punch. Query bounds are the employee's office-local day —
+    # punches are stored UTC; we convert that local day window to UTC for the filter.
+    today_start_utc = datetime.combine(today, dtime.min, tzinfo=emp_tz).astimezone(timezone.utc)
+    tomorrow_start_utc = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=emp_tz).astimezone(timezone.utc)
     punches = (
         db.query(AttendancePunch)
         .filter(AttendancePunch.employee_id == emp.id,
@@ -1002,7 +1016,7 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
     can_break_end = open_punch == PunchType.BREAK_START
 
     # Policy state — drives the user-page UX
-    now_local = _now_local()
+    now_local = _now_local(emp_tz)
     is_late = False
     minutes_late = 0
     requires_late_approval = False
@@ -1026,14 +1040,14 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
     effective_grace = 0
 
     if shift:
-        effective_start_dt, effective_end_dt = _effective_shift_window(shift, today, half_day)
+        effective_start_dt, effective_end_dt = _effective_shift_window(shift, today, half_day, emp_tz)
         effective_start_str = effective_start_dt.strftime("%H:%M")
         effective_end_str = effective_end_dt.strftime("%H:%M")
         minutes_until_shift_start = max(0, int((effective_start_dt - now_local).total_seconds() // 60))
         minutes_until_shift_end = max(0, int((effective_end_dt - now_local).total_seconds() // 60))
 
         effective_grace = _effective_grace_minutes(shift, half_day)
-        minutes_late = _minutes_late_now(shift, now_local, effective_start=effective_start_dt)
+        minutes_late = _minutes_late_now(shift, now_local, effective_start=effective_start_dt, tz=emp_tz)
         is_late = minutes_late > effective_grace
         threshold = int(shift.late_self_punch_threshold_minutes or 0)
 
@@ -1104,9 +1118,9 @@ def me_today(db: Session = Depends(get_db), user: User = Depends(get_current_use
             pending_early_exit_request_id = corr.id
             pending_early_exit_request_status = corr.status.value
 
-    break_used = _break_used_minutes_today(punches, now_local) if shift else 0
+    break_used = _break_used_minutes_today(punches, now_local, emp_tz) if shift else 0
     break_cap = int(shift.break_minutes or 0) if shift else 0
-    current_window, next_window, in_window_now = _classify_break_windows(shift, now_local) if shift else (None, None, True)
+    current_window, next_window, in_window_now = _classify_break_windows(shift, now_local, emp_tz) if shift else (None, None, True)
 
     if open_punch == PunchType.BREAK_START:
         next_action = "break_end"
@@ -1182,13 +1196,14 @@ def _hhmm_to_time(s: str) -> dtime:
     return dtime(int(h), int(m))
 
 
-def _now_local() -> datetime:
-    """Current wall-clock time in IST. Storage uses UTC; comparisons use IST."""
-    return datetime.now(IST)
+def _now_local(tz=IST) -> datetime:
+    """Current wall-clock time in the business tz (IST default). Storage uses
+    UTC; live-clock comparisons run in the employee's office timezone."""
+    return datetime.now(tz)
 
 
-def _shift_start_local(shift: Shift, on_date: date) -> datetime:
-    return datetime.combine(on_date, shift.start_time, tzinfo=IST)
+def _shift_start_local(shift: Shift, on_date: date, tz=IST) -> datetime:
+    return datetime.combine(on_date, shift.start_time, tzinfo=tz)
 
 
 def _approved_half_day(
@@ -1213,7 +1228,7 @@ def _approved_half_day(
 
 
 def _effective_shift_window(
-    shift: Shift, on_date: date, half_day: Optional[HalfDayRequest],
+    shift: Shift, on_date: date, half_day: Optional[HalfDayRequest], tz=IST,
 ) -> tuple[datetime, datetime]:
     """Return (effective_start, effective_end) wall-clock IST datetimes.
 
@@ -1225,8 +1240,8 @@ def _effective_shift_window(
     Wraps past midnight when start > end (night shift) — same convention as
     `_shift_end_local`.
     """
-    start_dt = datetime.combine(on_date, shift.start_time, tzinfo=IST)
-    end_dt = datetime.combine(on_date, shift.end_time, tzinfo=IST)
+    start_dt = datetime.combine(on_date, shift.start_time, tzinfo=tz)
+    end_dt = datetime.combine(on_date, shift.end_time, tzinfo=tz)
     if end_dt <= start_dt:
         end_dt += timedelta(days=1)
 
@@ -1248,27 +1263,27 @@ def _effective_grace_minutes(shift: Shift, half_day: Optional[HalfDayRequest]) -
 
 def _minutes_late_now(
     shift: Shift, now_local: datetime,
-    *, effective_start: Optional[datetime] = None,
+    *, effective_start: Optional[datetime] = None, tz=IST,
 ) -> int:
     """Minutes past the effective shift start (negative if before).
 
     Callers that have already resolved the effective start should pass it in;
     otherwise this falls back to `shift.start_time` (legacy behaviour).
     """
-    start = effective_start or _shift_start_local(shift, now_local.date())
+    start = effective_start or _shift_start_local(shift, now_local.date(), tz)
     return int((now_local - start).total_seconds() // 60)
 
 
-def _break_used_minutes_today(today_punches: list, now_local: datetime) -> int:
+def _break_used_minutes_today(today_punches: list, now_local: datetime, tz=IST) -> int:
     """Sum of completed break durations + currently open break duration."""
     total = 0
     open_start_local: Optional[datetime] = None
     for p in today_punches:
-        # punch_time is stored UTC-aware → convert to IST for elapsed math.
+        # punch_time is stored UTC-aware → convert to the business tz for elapsed math.
         pt = p.punch_time
         if pt.tzinfo is None:
             pt = pt.replace(tzinfo=timezone.utc)
-        pt_local = pt.astimezone(IST)
+        pt_local = pt.astimezone(tz)
         if p.punch_type == PunchType.BREAK_START:
             open_start_local = pt_local
         elif p.punch_type == PunchType.BREAK_END and open_start_local is not None:
@@ -1279,7 +1294,7 @@ def _break_used_minutes_today(today_punches: list, now_local: datetime) -> int:
     return total
 
 
-def _classify_break_windows(shift: Shift, now_local: datetime):
+def _classify_break_windows(shift: Shift, now_local: datetime, tz=IST):
     """Return (current_window, next_window, in_window_now) where each window
     is a CurrentBreakWindow dict-shape or None."""
     windows = list(shift.break_windows or [])
@@ -1298,7 +1313,7 @@ def _classify_break_windows(shift: Shift, now_local: datetime):
             current = CurrentBreakWindow(
                 label=w["label"], start_time=w["start_time"], end_time=w["end_time"],
                 max_minutes=int(w["max_minutes"]), is_active_now=True,
-                minutes_until_end=max(0, int((datetime.combine(now_local.date(), et, tzinfo=IST) - now_local).total_seconds() // 60)),
+                minutes_until_end=max(0, int((datetime.combine(now_local.date(), et, tzinfo=tz) - now_local).total_seconds() // 60)),
             )
             break
     if current is None:
@@ -1312,7 +1327,7 @@ def _classify_break_windows(shift: Shift, now_local: datetime):
             next_w = CurrentBreakWindow(
                 label=w["label"], start_time=w["start_time"], end_time=w["end_time"],
                 max_minutes=int(w["max_minutes"]), is_active_now=False,
-                minutes_until_start=max(0, int((datetime.combine(now_local.date(), st, tzinfo=IST) - now_local).total_seconds() // 60)),
+                minutes_until_start=max(0, int((datetime.combine(now_local.date(), st, tzinfo=tz) - now_local).total_seconds() // 60)),
             )
     return current, next_w, current is not None
 
@@ -1323,12 +1338,13 @@ def _classify_break_windows(shift: Shift, now_local: datetime):
 EARLY_PUNCH_BUFFER_MINUTES = 30
 
 
-def _shift_end_local(shift: Shift, on_date: date) -> datetime:
-    """Wall-clock shift end in IST. If end_time is earlier than start_time the
-    shift wraps past midnight (e.g. 22:00–06:00) — push end to the next day.
+def _shift_end_local(shift: Shift, on_date: date, tz=IST) -> datetime:
+    """Wall-clock shift end in the business tz. If end_time is earlier than
+    start_time the shift wraps past midnight (e.g. 22:00–06:00) — push end to
+    the next day.
     """
-    start = datetime.combine(on_date, shift.start_time, tzinfo=IST)
-    end = datetime.combine(on_date, shift.end_time, tzinfo=IST)
+    start = datetime.combine(on_date, shift.start_time, tzinfo=tz)
+    end = datetime.combine(on_date, shift.end_time, tzinfo=tz)
     if end <= start:
         end += timedelta(days=1)
     return end
@@ -1361,6 +1377,7 @@ def _validate_punch_policy(
     *,
     db: Optional[Session] = None,
     employee_id: Optional[UUID] = None,
+    tz=IST,
 ):
     """Raise HTTPException if policy rules are violated.
 
@@ -1375,7 +1392,7 @@ def _validate_punch_policy(
     """
     if not shift:
         return
-    now_local = _now_local()
+    now_local = _now_local(tz)
     today = now_local.date()
 
     # Resolve half-day awareness so a FIRST-off employee at 14:00 isn't treated
@@ -1387,7 +1404,7 @@ def _validate_punch_policy(
         if db is not None and employee_id is not None
         else None
     )
-    effective_start, effective_end = _effective_shift_window(shift, today, half_day)
+    effective_start, effective_end = _effective_shift_window(shift, today, half_day, tz)
     grace = _effective_grace_minutes(shift, half_day)
     effective_start_str = effective_start.strftime("%H:%M")
 
@@ -1415,7 +1432,7 @@ def _validate_punch_policy(
 
         if shift.late_punch_requires_approval:
             threshold = int(shift.late_self_punch_threshold_minutes or 0)
-            minutes_late = _minutes_late_now(shift, now_local, effective_start=effective_start)
+            minutes_late = _minutes_late_now(shift, now_local, effective_start=effective_start, tz=tz)
             if minutes_late > grace + threshold:
                 raise HTTPException(
                     status_code=423,
@@ -1468,7 +1485,7 @@ def _validate_punch_policy(
         return
 
     if expected_type == PunchType.BREAK_START:
-        used = _break_used_minutes_today(today_punches, now_local)
+        used = _break_used_minutes_today(today_punches, now_local, tz)
         cap = int(shift.break_minutes or 0)
         if cap and used >= cap:
             raise HTTPException(
@@ -1630,10 +1647,16 @@ def _create_punch(
     guard_open_in_required: bool,
 ) -> AttendancePunch:
     """Shared punch creator with idempotency + geofence verification."""
-    today = date.today()
-    # IST-bounded day window (punches are stored UTC; the business clock is IST).
-    today_start_utc = datetime.combine(today, dtime.min, tzinfo=IST).astimezone(timezone.utc)
-    tomorrow_start_utc = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=IST).astimezone(timezone.utc)
+    # The day a punch belongs to is the employee's OFFICE-LOCAL day (IST fallback),
+    # not the server's calendar date — so an employee in a non-IST office rolls
+    # into the correct local day and the idempotency window matches daily_rollup's
+    # tz-aware day bounds. For an India workforce this is identical to the legacy
+    # IST behaviour.
+    emp_tz = resolve_employee_tz(db, emp.id)
+    today = datetime.now(emp_tz).date()
+    # Office-local day window (punches are stored UTC; the business clock is emp_tz).
+    today_start_utc = datetime.combine(today, dtime.min, tzinfo=emp_tz).astimezone(timezone.utc)
+    tomorrow_start_utc = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=emp_tz).astimezone(timezone.utc)
     punches = (
         db.query(AttendancePunch)
         .filter(AttendancePunch.employee_id == emp.id,
@@ -1677,7 +1700,7 @@ def _create_punch(
     # Self clock-in is not allowed on a weekly-off / company-holiday day.
     if expected_type == PunchType.IN:
         _assert_self_punch_allowed_today(db, emp, shift, today)
-    _validate_punch_policy(shift, expected_type, punches, db=db, employee_id=emp.id)
+    _validate_punch_policy(shift, expected_type, punches, db=db, employee_id=emp.id, tz=emp_tz)
 
     geo = verify_geofence(db, emp.id, payload.geo_lat, payload.geo_lng)
     flagged = (payload.geo_lat is not None and payload.geo_lng is not None) and not geo.verified
@@ -1893,9 +1916,10 @@ def me_request_early_exit(
     `[EARLY_EXIT]` correction and lets the OUT punch through.
     """
     emp = _resolve_self_employee(db, user)
-    today = date.today()
+    emp_tz = resolve_employee_tz(db, emp.id)
+    today = datetime.now(emp_tz).date()
     shift = resolve_shift(db, emp.id, today)
-    now_local = _now_local()
+    now_local = _now_local(emp_tz)
     now_utc = datetime.now(timezone.utc)
 
     # Block duplicate pending requests for the same day.
@@ -1914,7 +1938,7 @@ def me_request_early_exit(
 
     minutes_remaining = 0
     if shift:
-        minutes_remaining = max(0, int((_shift_end_local(shift, today) - now_local).total_seconds() // 60))
+        minutes_remaining = max(0, int((_shift_end_local(shift, today, emp_tz) - now_local).total_seconds() // 60))
     tag = f"[EARLY_EXIT] (leaving with {minutes_remaining} min left of shift) "
     reason = (tag + body.reason).strip()[:1000]
 
@@ -1965,9 +1989,10 @@ def me_request_late_punch(
     actual IN punch and trigger the daily rollup, marking the day as LATE.
     """
     emp = _resolve_self_employee(db, user)
-    today = date.today()
+    emp_tz = resolve_employee_tz(db, emp.id)
+    today = datetime.now(emp_tz).date()
     shift = resolve_shift(db, emp.id, today)
-    now_local = _now_local()
+    now_local = _now_local(emp_tz)
     now_utc = datetime.now(timezone.utc)
 
     # Prevent duplicate pending requests for the same day.
@@ -1987,8 +2012,8 @@ def me_request_late_punch(
     # records the *real* late minutes (vs midshift), not 200+ minutes past 9 AM.
     if shift:
         _hd = _approved_half_day(db, emp.id, today)
-        _eff_start, _eff_end = _effective_shift_window(shift, today, _hd)
-        minutes_late = _minutes_late_now(shift, now_local, effective_start=_eff_start)
+        _eff_start, _eff_end = _effective_shift_window(shift, today, _hd, emp_tz)
+        minutes_late = _minutes_late_now(shift, now_local, effective_start=_eff_start, tz=emp_tz)
         # Enforce the same cap the /me/today UI honours: no self late-punch
         # request once past the 2h half-day cutoff or after the shift has
         # ended. Beyond that it's a half-day/no-show that needs admin
@@ -2092,11 +2117,12 @@ def me_day_detail(
     if finalize_orphan_open_punches(db, emp.id, lookback_days=7, actor_id=None):
         db.commit()
 
-    # Build IST-bounded day window and pull punches in that range.
-    day_start_ist = datetime.combine(on_date, dtime.min, tzinfo=IST)
-    day_end_ist = datetime.combine(on_date + timedelta(days=1), dtime.min, tzinfo=IST)
-    day_start_utc = day_start_ist.astimezone(timezone.utc)
-    day_end_utc = day_end_ist.astimezone(timezone.utc)
+    # Build the employee's office-local day window and pull punches in that range.
+    emp_tz = resolve_employee_tz(db, emp.id)
+    day_start_local = datetime.combine(on_date, dtime.min, tzinfo=emp_tz)
+    day_end_local = datetime.combine(on_date + timedelta(days=1), dtime.min, tzinfo=emp_tz)
+    day_start_utc = day_start_local.astimezone(timezone.utc)
+    day_end_utc = day_end_local.astimezone(timezone.utc)
 
     att = (
         db.query(Attendance)

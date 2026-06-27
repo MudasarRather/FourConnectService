@@ -20,6 +20,7 @@ from app.schemas.hr.onboarding import (
 )
 from app.utils.dependencies import get_current_superuser
 from app.utils.hr.lifecycle_guard import guard_employable
+from app.utils.hr.settings_audit import log_settings_change
 
 
 router = APIRouter(prefix="/hr/welcome-kit", tags=["HR — Welcome Kit"])
@@ -45,12 +46,14 @@ def list_templates(
 def create_template(
     payload: WelcomeKitTemplateUpsert,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     if db.query(WelcomeKitTemplate).filter(WelcomeKitTemplate.name == payload.name).first():
         raise HTTPException(400, "Template name already exists")
     t = WelcomeKitTemplate(**payload.model_dump())
     db.add(t)
+    db.flush()
+    log_settings_change(db, "WELCOME_KIT", t.id, "CREATE", admin.id, note=t.name)
     db.commit()
     db.refresh(t)
     return WelcomeKitTemplateResponse.model_validate(t)
@@ -61,13 +64,14 @@ def update_template(
     tpl_id: UUID,
     payload: WelcomeKitTemplateUpsert,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_current_superuser),
 ):
     t = db.query(WelcomeKitTemplate).filter(WelcomeKitTemplate.id == tpl_id, WelcomeKitTemplate.is_deleted == False).first()  # noqa: E712
     if not t:
         raise HTTPException(404, "Template not found")
     for k, v in payload.model_dump().items():
         setattr(t, k, v)
+    log_settings_change(db, "WELCOME_KIT", t.id, "UPDATE", admin.id, note=t.name)
     db.commit()
     db.refresh(t)
     return WelcomeKitTemplateResponse.model_validate(t)

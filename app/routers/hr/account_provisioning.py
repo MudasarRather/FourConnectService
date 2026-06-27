@@ -170,10 +170,21 @@ def set_credentials(
     if payload.auto_generate:
         pwd = _gen_password()
         generated = pwd
-    if pwd:
-        if len(pwd) < 8:
-            raise HTTPException(400, "Password must be at least 8 characters")
-        user.hashed_password = get_password_hash(pwd)
+    # set-credentials MUST set a password — that is its entire purpose. Previously
+    # an empty password silently skipped the hash update while still returning 200
+    # (and activating), so a "Reset password" with a blank field LEFT THE OLD
+    # PASSWORD VALID — a serious security hole (the reset appeared to succeed but
+    # nothing changed). Reject it so a reset can never silently fail; pure
+    # re-activation without a password change lives on the /activate endpoint.
+    if not pwd:
+        raise HTTPException(400, "A new password is required to set or reset the ERP login — type one or use auto-generate.")
+    if len(pwd) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    user.hashed_password = get_password_hash(pwd)
+    # Force-logout any live session: bumping token_version invalidates every JWT
+    # minted before this reset (see dependencies.get_current_user). The employee
+    # must sign in again with the new password.
+    user.token_version = (user.token_version or 1) + 1
 
     if payload.activate:
         user.is_active = True

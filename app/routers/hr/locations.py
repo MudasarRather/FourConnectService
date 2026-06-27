@@ -80,13 +80,20 @@ def update_location(
 @router.delete("/{location_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_location(
     location_id: UUID,
+    reason: str | None = None,
     db: Session = Depends(get_db),
     admin: User = Depends(get_current_superuser),
 ):
     _track_actor(db, admin.id)
+    # Soft-delete reason → sealed into the settings audit ledger. audit.py reads
+    # session.info["audit_note"] on the after_update event and folds it into the
+    # change snapshot, so the ledger records *why*, not just *what*.
+    if reason and reason.strip():
+        db.info["audit_note"] = reason.strip()[:600]
     loc = db.query(WorkLocation).filter(WorkLocation.id == location_id).first()
     if not loc:
         raise HTTPException(404, "Work location not found")
     loc.is_deleted = True
     db.commit()
+    db.info.pop("audit_note", None)
     return None

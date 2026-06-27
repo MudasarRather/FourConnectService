@@ -61,6 +61,13 @@ def run_cron():
         lv = run_leave_maintenance(db)
         print(f"- Leave maintenance: {lv}")
 
+        # 8. Notification scans: time-based HR events (birthday, work anniversary,
+        #    probation ending, contract expiry, asset return due, missing attendance).
+        #    Each routes through the NotificationRule matrix and is day-idempotent.
+        from app.utils.hr.notification_scans import run_notification_scans
+        ns = run_notification_scans(db)
+        print(f"- Notification scans: {ns}")
+
         print("Success: All transitions processed.")
     except Exception as e:
         print(f"Error during task transitions: {e}")

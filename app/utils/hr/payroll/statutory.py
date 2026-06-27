@@ -8,6 +8,7 @@ re-print reproduces the original numbers after rates change.
 """
 from __future__ import annotations
 
+import re
 from datetime import date
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -40,9 +41,14 @@ _DEFAULTS = {
     "REBATE_87A_MAX_OLD": Decimal("12500"),
 }
 
-_DEFAULT_PT_SLABS = [  # Karnataka-style monthly
-    {"upto": 24999, "amount": 0},
-    {"upto": None, "amount": 200},
+# Professional Tax is a STATE levy — each state sets its own slabs and five
+# states/UTs (Delhi, Haryana, UP, Rajasthan, etc.) levy none at all. So the safe
+# NATIONAL default is "no PT": employees in a state with no configured PT_SLABS
+# row deduct nothing, rather than inheriting another state's amount. Per-state
+# slabs live as state-scoped StatutoryConfig rows and are resolved per employee
+# from their work-location state (see ``resolve_pt_slabs``).
+_DEFAULT_PT_SLABS = [
+    {"upto": None, "amount": 0},
 ]
 _DEFAULT_TDS_NEW = [  # FY2025-26 (AY2026-27) new regime — Union Budget 2025
     {"upto": 400000, "rate": 0.0},
@@ -91,6 +97,19 @@ def load_config(db: Session, fiscal_year: str, state_code: Optional[str] = None)
             cfg[r.key] = r.value_json if r.value_json is not None else (
                 Decimal(str(r.value_num)) if r.value_num is not None else None
             )
+    # Professional Tax is state-scoped: collect EVERY state's PT_SLABS row into a
+    # by-state map (independent of the national resolution above, which only sees
+    # ``state_code``). The per-employee resolver picks from this map by the
+    # employee's work-location state; unmatched states fall back to the national
+    # PT_SLABS (= no PT). ``PT_SLABS_NATIONAL`` is a STABLE copy of the national
+    # fallback because ``cfg['PT_SLABS']`` is overwritten per employee downstream.
+    by_state: Dict[str, list] = {}
+    for r in rows:
+        if r.key == "PT_SLABS" and r.state_code and r.value_json is not None:
+            by_state[str(r.state_code).strip().upper()] = r.value_json
+    cfg["PT_SLABS_BY_STATE"] = by_state
+    cfg["PT_SLABS_NATIONAL"] = cfg.get("PT_SLABS") or _DEFAULT_PT_SLABS
+
     # backfill defaults
     for k, v in _DEFAULTS.items():
         cfg.setdefault(k, v)
@@ -98,6 +117,14 @@ def load_config(db: Session, fiscal_year: str, state_code: Optional[str] = None)
     cfg.setdefault("TDS_SLABS_NEW", _DEFAULT_TDS_NEW)
     cfg.setdefault("TDS_SLABS_OLD", _DEFAULT_TDS_OLD)
     cfg.setdefault("SURCHARGE_SLABS", _DEFAULT_SURCHARGE)
+    # HR Settings — Payroll Rules. Attached under a dedicated namespace so the
+    # engine can consume them incrementally; present-day computation ignores
+    # cfg["RULES"], so this is a no-op for existing payslips (best-effort).
+    try:
+        from app.utils.hr.payroll.rule_config import get_all_rules
+        cfg["RULES"] = get_all_rules(db, fiscal_year)
+    except Exception:
+        cfg.setdefault("RULES", {})
     return cfg
 
 
@@ -130,6 +157,60 @@ def calc_esi(gross: Decimal, cfg: Dict, employer: bool = False) -> Decimal:
         return Decimal("0.00")
     rate = _dec(cfg.get("ESI_EMPLOYER_RATE" if employer else "ESI_EMP_RATE"))
     return (gross * rate).quantize(Decimal("0.01"))
+
+
+# Indian state / UT name → standard 2-letter code. Work-location ``state`` is
+# free-text (HR types "Karnataka"), but PT state rows key on the code ("KA"), so
+# we normalize. Keys are letters-only (spaces / "&" / "and" / dots stripped) so
+# "Tamil Nadu", "tamilnadu" and "TAMIL NADU" all resolve. An already-valid code
+# typed directly is accepted as-is.
+_STATE_NAME_TO_CODE = {
+    "andhrapradesh": "AP", "arunachalpradesh": "AR", "assam": "AS", "bihar": "BR",
+    "chhattisgarh": "CG", "chattisgarh": "CG", "goa": "GA", "gujarat": "GJ",
+    "haryana": "HR", "himachalpradesh": "HP", "jharkhand": "JH", "karnataka": "KA",
+    "kerala": "KL", "madhyapradesh": "MP", "maharashtra": "MH", "manipur": "MN",
+    "meghalaya": "ML", "mizoram": "MZ", "nagaland": "NL", "odisha": "OD",
+    "orissa": "OD", "punjab": "PB", "rajasthan": "RJ", "sikkim": "SK",
+    "tamilnadu": "TN", "telangana": "TS", "tripura": "TR", "uttarpradesh": "UP",
+    "uttarakhand": "UK", "uttaranchal": "UK", "westbengal": "WB",
+    # Union Territories
+    "andamannicobarislands": "AN", "andamannicobar": "AN", "chandigarh": "CH",
+    "dadranagarhavelidamandiu": "DN", "dadranagarhaveli": "DN", "damandiu": "DD",
+    "delhi": "DL", "newdelhi": "DL", "nationalcapitalterritoryofdelhi": "DL",
+    "jammukashmir": "JK", "ladakh": "LA", "lakshadweep": "LD", "puducherry": "PY",
+    "pondicherry": "PY",
+}
+_STATE_CODES = set(_STATE_NAME_TO_CODE.values())
+
+
+def india_state_code(value: Optional[str]) -> Optional[str]:
+    """Normalize a free-text state name (or an existing code) to its 2-letter code.
+
+    Returns None for blank / non-Indian / unrecognised values so the caller falls
+    back to the national PT slabs (= no PT)."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    up = s.upper()
+    if up in _STATE_CODES:
+        return up
+    return _STATE_NAME_TO_CODE.get(re.sub(r"[^a-z]", "", s.lower()))
+
+
+def resolve_pt_slabs(cfg: Dict, state: Optional[str]) -> List[Dict]:
+    """PT slabs for an employee's work-location state.
+
+    State-scoped slabs win; otherwise the national fallback (configured national
+    PT_SLABS row, else ``_DEFAULT_PT_SLABS`` = no PT). Reads the STABLE keys
+    populated by ``load_config`` — never ``cfg['PT_SLABS']``, which callers
+    overwrite per employee for the engine to read."""
+    code = india_state_code(state)
+    by_state = cfg.get("PT_SLABS_BY_STATE") or {}
+    if code and code in by_state and by_state[code]:
+        return by_state[code]
+    return cfg.get("PT_SLABS_NATIONAL") or _DEFAULT_PT_SLABS
 
 
 def calc_professional_tax(monthly_gross: Decimal, cfg: Dict) -> Decimal:
@@ -223,7 +304,7 @@ def old_regime_deductions(declarations: Optional[Dict], cfg: Dict) -> Decimal:
     total = Decimal("0")
     total += min(_dec(decl.get("sec_80c")), _dec(cfg.get("SEC_80C_CAP"), "150000"))           # 80C/80CCC/80CCD(1)
     total += min(_dec(decl.get("sec_80ccd_1b")), _dec(cfg.get("SEC_80CCD1B_CAP"), "50000"))    # NPS additional
-    total += min(_dec(decl.get("sec_80d")), _dec(cfg.get("SEC_80D_CAP"), "100000"))            # medical insurance (self+senior parents)
+    total += min(_dec(decl.get("sec_80d")), _dec(cfg.get("SEC_80D_CAP"), "25000"))             # medical insurance (base self/family cap; seed-aligned)
     total += _dec(decl.get("sec_80e"))                                                          # education-loan interest (no cap)
     total += _dec(decl.get("sec_80g"))                                                          # donations (simplified — no qualifying-limit math)
     total += min(_dec(decl.get("sec_80tta")), _dec(cfg.get("SEC_80TTA_CAP"), "10000"))          # savings-interest

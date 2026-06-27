@@ -10,6 +10,8 @@ class DesignationBase(BaseModel):
     grade_id: Optional[UUID] = None
     department_id: Optional[UUID] = None
     level: Optional[int] = None
+    reporting_to_designation_id: Optional[UUID] = None
+    approval_authority: Optional[dict] = None
 
 
 class DesignationCreate(DesignationBase):
@@ -23,6 +25,8 @@ class DesignationUpdate(BaseModel):
     grade_id: Optional[UUID] = None
     department_id: Optional[UUID] = None
     level: Optional[int] = None
+    reporting_to_designation_id: Optional[UUID] = None
+    approval_authority: Optional[dict] = None
 
 
 class DesignationResponse(DesignationBase):

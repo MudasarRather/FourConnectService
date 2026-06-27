@@ -52,6 +52,7 @@ def finalize_due_attendance(db, *, lookback_days: int = 2) -> int:
     """
     from app.utils.hr.attendance_logic import (
         resolve_shift, mark_absentees, daily_rollup, _combine, IST,
+        resolve_employee_tz,
     )
     from app.models.hr.attendance import Attendance, AttendanceSource
     from app.models.hr.employee import Employee, LifecycleState
@@ -85,23 +86,30 @@ def finalize_due_attendance(db, *, lookback_days: int = 2) -> int:
 
     for emp in emps:
         try:
-            shift = resolve_shift(db, emp.id, today)
+            # Finalize each employee against THEIR office clock: "today" and the
+            # shift-end instant are computed in the work location's timezone
+            # (IST fallback), so a non-IST office isn't finalized on the wrong
+            # calendar day or before its local shift has actually ended.
+            emp_tz = resolve_employee_tz(db, emp.id)
+            emp_today = datetime.now(emp_tz).date()
+            shift = resolve_shift(db, emp.id, emp_today)
             if not shift:
                 continue
-            end_dt = _combine(today, shift.end_time)
+            end_dt = _combine(emp_today, shift.end_time, emp_tz)
             if shift.end_time <= shift.start_time:   # overnight shift ends next day
                 end_dt = end_dt + timedelta(days=1)
             # Wait until the shift has genuinely ended (+5 min settle window).
+            # Instant comparison — now_ist and end_dt are both tz-aware.
             if now_ist < end_dt + timedelta(minutes=5):
                 continue
             existing = (
                 db.query(Attendance)
-                .filter(Attendance.employee_id == emp.id, Attendance.date == today)
+                .filter(Attendance.employee_id == emp.id, Attendance.date == emp_today)
                 .first()
             )
             if existing and existing.is_locked:
                 continue  # admin-locked rows are authoritative
-            daily_rollup(db, emp.id, today, source=AttendanceSource.SYSTEM)
+            daily_rollup(db, emp.id, emp_today, source=AttendanceSource.SYSTEM)
             db.commit()
             processed += 1
         except Exception:

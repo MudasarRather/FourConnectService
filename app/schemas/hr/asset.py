@@ -35,7 +35,7 @@ class _AssetExtras(BaseModel):
 
 class AssetCreate(_AssetExtras):
     asset_code: str
-    asset_type: AssetType
+    asset_type: str
     brand: Optional[str] = None
     model: Optional[str] = None
     serial_number: Optional[str] = None
@@ -49,7 +49,7 @@ class AssetCreate(_AssetExtras):
 
 class AssetUpdate(_AssetExtras):
     asset_code: Optional[str] = None
-    asset_type: Optional[AssetType] = None
+    asset_type: Optional[str] = None
     brand: Optional[str] = None
     model: Optional[str] = None
     serial_number: Optional[str] = None
@@ -65,7 +65,7 @@ class AssetResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     asset_code: str
-    asset_type: AssetType
+    asset_type: str
     brand: Optional[str] = None
     model: Optional[str] = None
     serial_number: Optional[str] = None
@@ -136,7 +136,7 @@ class AssetAllocationResponse(BaseModel):
     id: UUID
     asset_id: UUID
     asset_code: Optional[str] = None
-    asset_type: Optional[AssetType] = None
+    asset_type: Optional[str] = None
     # Asset descriptors (additive — power the holding-card detail view; non-financial).
     brand: Optional[str] = None
     model: Optional[str] = None

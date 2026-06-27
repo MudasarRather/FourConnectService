@@ -62,6 +62,7 @@ class _EmployeeBaseFields(BaseModel):
     employee_category: Optional[EmployeeCategory] = None
     joining_date: Optional[date] = None
     confirmation_date: Optional[date] = None
+    contract_end_date: Optional[date] = None
     probation_months: Optional[int] = 6
     reporting_manager_id: Optional[UUID] = None
     hr_manager_id: Optional[UUID] = None
@@ -171,6 +172,7 @@ class EmployeeUpdate(BaseModel):
     employment_type: Optional[EmploymentType] = None
     employee_category: Optional[EmployeeCategory] = None
     joining_date: Optional[date] = None
+    contract_end_date: Optional[date] = None
     probation_months: Optional[int] = None
     reporting_manager_id: Optional[UUID] = None
     hr_manager_id: Optional[UUID] = None
@@ -227,6 +229,10 @@ class _LocationSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     name: str
+    code: Optional[str] = None
+    city: Optional[str] = None
+    timezone: Optional[str] = None              # IANA id, e.g. "Asia/Kolkata"
+    weekly_off_pattern: Optional[dict] = None
 
 
 class EmployeeResponse(BaseModel):
@@ -321,6 +327,7 @@ class EmployeeDetailResponse(BaseModel):
     employee_category: Optional[str] = None
     joining_date: Optional[date] = None
     confirmation_date: Optional[date] = None
+    contract_end_date: Optional[date] = None
     probation_months: Optional[int] = None
     pay_level: Optional[str] = None
     notice_period_days: Optional[int] = None

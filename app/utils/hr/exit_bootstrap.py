@@ -66,6 +66,18 @@ def bootstrap_exit(db: Session, case: ExitCase, actor_id: Optional[UUID]) -> Non
             ))
         db.flush()
         recompute_clearance_progress(db, case)
+        # Notify the employee their exit clearance is now open (caller commits).
+        try:
+            from app.utils.hr.notify import dispatch
+            uid = case.employee.user_id if case.employee else None
+            if uid:
+                dispatch(db, "CLEARANCE_PENDING", uid, context={
+                    "title": "Clearance items pending",
+                    "message": f"Exit clearance for case {case.case_number} is now open — please complete your items.",
+                    "action_url": "/user/self-service/exit",
+                })
+        except Exception:
+            pass
 
     # ── Settlement draft + initial compute ──
     if case.settlement is None:

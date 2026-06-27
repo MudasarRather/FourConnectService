@@ -239,6 +239,17 @@ def create_assignment(
     db.commit()
     db.refresh(a)
     p = db.query(TrainingProgram).filter(TrainingProgram.id == a.program_id).first()
+    try:
+        from app.utils.hr.notify import dispatch
+        if emp and emp.user_id:
+            dispatch(db, "TRAINING_ASSIGNED", emp.user_id, context={
+                "title": "New training assigned",
+                "message": f"You have been assigned: {p.name if p else 'a training program'}.",
+                "action_url": "/user/self-service/training",
+            })
+            db.commit()
+    except Exception:
+        db.rollback()
     return TrainingAssignmentResponse(
         id=a.id, program_id=a.program_id,
         program_name=p.name if p else None,

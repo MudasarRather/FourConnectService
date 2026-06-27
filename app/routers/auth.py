@@ -88,13 +88,13 @@ def signup(user_data: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_user)
     
-    # Create access token
+    # Create access token (carries `tv` for credential-change session invalidation)
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": str(new_user.id)},
+        data={"sub": str(new_user.id), "tv": new_user.token_version},
         expires_delta=access_token_expires
     )
-    
+
     return {"access_token": access_token, "token_type": "bearer"}
 
 
@@ -142,7 +142,7 @@ def login(credentials: UserLogin):
             # than a generic 500.
             try:
                 cur.execute(
-                    "SELECT id, email, full_name, hashed_password, is_active, is_superuser, is_activated "
+                    "SELECT id, email, full_name, hashed_password, is_active, is_superuser, is_activated, token_version "
                     "FROM users WHERE email = %s",
                     (credentials.email,)
                 )
@@ -183,6 +183,13 @@ def login(credentials: UserLogin):
         user.is_active = user_row['is_active']
         user.is_superuser = user_row['is_superuser']
         user.is_activated = user_row['is_activated']
+        # token_version drives session invalidation (see dependencies.get_current_user).
+        # Absent in the schema-drift fallback SELECT → default 1.
+        try:
+            _tv = user_row['token_version']
+        except (KeyError, IndexError):
+            _tv = 1
+        user.token_version = 1 if _tv is None else int(_tv)
 
         # Verify password (argon2 via passlib — see app/utils/auth.py).
         try:
@@ -205,10 +212,11 @@ def login(credentials: UserLogin):
                 detail="Inactive user account"
             )
 
-        # Create access token
+        # Create access token — carries `tv` so the session can be invalidated
+        # server-side when the user's email / password is changed by an admin.
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": str(user.id)},
+            data={"sub": str(user.id), "tv": user.token_version},
             expires_delta=access_token_expires
         )
 
@@ -243,17 +251,40 @@ def login(credentials: UserLogin):
 
 
 @router.get("/me", response_model=UserResponse)
-def get_current_user_info(current_user: User = Depends(get_current_user)):
+def get_current_user_info(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
-    Get current user information
-    
-    Args:
-        current_user: Current authenticated user from dependency
-        
-    Returns:
-        Current user data
+    Get current user information, enriched with the linked employee's work-location
+    timezone so self-service UIs anchor time-of-day to the employee's official work
+    location (never the viewer's device clock).
     """
-    return current_user
+    resp = UserResponse.model_validate(current_user)
+    # Optional enrichment — must never break /auth/me (hit by the auth heartbeat).
+    try:
+        from app.models.hr.employee import Employee
+        from app.models.hr.location import WorkLocation
+        emp = (
+            db.query(Employee.work_location_id, Employee.work_location_text)
+            .filter(Employee.user_id == current_user.id)
+            .first()
+        )
+        if emp:
+            if emp.work_location_id:
+                wl = (
+                    db.query(WorkLocation.timezone, WorkLocation.name)
+                    .filter(WorkLocation.id == emp.work_location_id)
+                    .first()
+                )
+                if wl:
+                    resp.work_location_timezone = wl.timezone
+                    resp.work_location_name = wl.name
+            if not resp.work_location_name:
+                resp.work_location_name = emp.work_location_text
+    except Exception:
+        pass
+    return resp
 
 
 @router.put("/me", response_model=UserResponse)

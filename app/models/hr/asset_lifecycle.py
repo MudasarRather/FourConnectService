@@ -152,7 +152,11 @@ class AssetCategory(Base):
     name = Column(String(120), unique=True, nullable=False)
     code = Column(String(30), unique=True, nullable=False, index=True)
     parent_category_id = Column(UUID(as_uuid=True), ForeignKey("hr_asset_categories.id"), nullable=True)
-    default_asset_type = Column(Enum(AssetType, name="hr_asset_type", create_type=False), nullable=True)
+    default_asset_type = Column(String(40), nullable=True)   # code from AssetTypeDef catalog
+    # Asset types this class governs (opt-in allow-list of AssetType string values).
+    # Empty/null = the class accepts ANY type. Drives the type filter in the
+    # asset-register form; default_asset_type is the pre-selected one within this set.
+    allowed_asset_types = Column(JSONB, nullable=True)
     depreciation_method = Column(String(30), nullable=True)   # STRAIGHT_LINE / NONE / ...
     useful_life_months = Column(Integer, nullable=True)
     description = Column(Text, nullable=True)
@@ -163,6 +167,27 @@ class AssetCategory(Base):
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
     parent = relationship("AssetCategory", remote_side=[id])
+
+
+class AssetTypeDef(Base):
+    """User-manageable catalog of asset *types* (the physical-form tag stored on
+    ``Asset.asset_type``). Built-ins are seeded with ``is_system=True`` (code locked +
+    delete-protected → deactivate only); admins can add their own. ``icon`` holds a
+    lucide icon name the UI maps to a glyph. Distinct from ``AssetCategory`` (the
+    depreciation/grouping taxonomy) — this is the physical-kind catalog."""
+    __tablename__ = "hr_asset_type_defs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    code = Column(String(40), unique=True, nullable=False, index=True)   # e.g. LAPTOP, BICYCLE
+    label = Column(String(80), nullable=False)
+    icon = Column(String(40), nullable=True)            # lucide icon name (UI hint)
+    sort_order = Column(Integer, default=0, nullable=False)
+    is_system = Column(Boolean, default=False, nullable=False)   # built-in → can't be deleted
+    is_active = Column(Boolean, default=True, nullable=False)
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
 
 class Vendor(Base):

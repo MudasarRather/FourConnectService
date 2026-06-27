@@ -565,6 +565,20 @@ def create_case(
                      exit_case_id=case.id, entity_id=case.id, actor_id=admin.id,
                      to_status=case.status.value, note="HR-initiated exit case")
     db.commit()
+    # Notify the reporting manager (internal awareness). The employee is NOT pinged
+    # here — this endpoint is HR-initiated/DRAFT and may be a sensitive in-progress
+    # action; the employee-facing exit ping is CLEARANCE_PENDING (fired on accept).
+    try:
+        from app.utils.hr.notify import dispatch
+        if case.manager_id:
+            dispatch(db, "EXIT_INITIATED", case.manager_id, audience="MANAGER", context={
+                "title": "Exit initiated for a team member",
+                "message": f"Exit case {case.case_number} has been initiated.",
+                "action_url": "/admin/hr/exit/dashboard",
+            })
+            db.commit()
+    except Exception:
+        db.rollback()
     return _detail(db, _get_case(db, case.id))
 
 

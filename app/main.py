@@ -141,6 +141,19 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Seed Support Desk defaults (ticket/change/problem numbering series, the
+    # default SLA package, starter categories, baseline settings). Idempotent.
+    try:
+        from app.database import SessionLocal
+        from app.utils.support_desk import seed_support_desk_defaults
+        _db = SessionLocal()
+        try:
+            seed_support_desk_defaults(_db)
+        finally:
+            _db.close()
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
 
 # Configure CORS — local dev origins + production frontend domains.
 # Keep this list in sync with the global exception handler below.
@@ -213,6 +226,7 @@ from app.routers import (
     archive,
     documents_hub,
     hr,
+    support_desk,
 )
 
 
@@ -237,6 +251,7 @@ app.include_router(drive.router, prefix="/api")
 app.include_router(archive.router, prefix="/api")
 app.include_router(documents_hub.router, prefix="/api")
 app.include_router(hr.router, prefix="/api")
+app.include_router(support_desk.router, prefix="/api")
 
 # Root endpoint
 @app.get("/")

@@ -1,0 +1,79 @@
+"""Support Desk routers package — aggregates every sub-router under one
+APIRouter so main.py registers the whole module with a single include_router.
+
+Each sub-router declares its own ``/support-desk/<resource>`` (admin),
+``/support-desk/me/<resource>`` (self-service) or ``/public/support/<resource>``
+(no-auth client portal) prefix. Importing this package also imports the models
+(via the routers) so ``Base.metadata.create_all()`` creates the tables on boot.
+
+Specific / self-service / public routers register BEFORE the broad tickets
+router — defensive against any future shared-root shadowing.
+"""
+from fastapi import APIRouter
+
+from app.routers.support_desk.dashboard import router as _dashboard_router
+from app.routers.support_desk.tickets_self import router as _tickets_self_router
+from app.routers.support_desk.self_catalog import router as _self_catalog_router
+from app.routers.support_desk.public_portal import router as _public_portal_router
+from app.routers.support_desk.masters import (
+    organizations_router as _organizations_router,
+    customers_router as _customers_router,
+    contracts_router as _contracts_router,
+    sla_router as _sla_router,
+    categories_router as _categories_router,
+)
+from app.routers.support_desk.catalog import (
+    kb_categories_router as _kb_categories_router,
+    articles_router as _articles_router,
+    service_items_router as _service_items_router,
+    service_requests_router as _service_requests_router,
+)
+from app.routers.support_desk.itil import (
+    change_router as _change_router,
+    problem_router as _problem_router,
+    asset_router as _asset_router,
+)
+from app.routers.support_desk.ops import (
+    announcements_router as _announcements_router,
+    automation_router as _automation_router,
+    settings_router as _settings_router,
+)
+from app.routers.support_desk.audit import router as _audit_router
+from app.routers.support_desk.integrations import router as _integrations_router
+from app.routers.support_desk.tickets import router as _tickets_router
+
+router = APIRouter()
+
+# Dashboard + self-service + public (distinct prefixes, registered first)
+router.include_router(_dashboard_router)
+router.include_router(_tickets_self_router)   # /support-desk/me/tickets
+router.include_router(_self_catalog_router)   # /support-desk/me/knowledge-base + /announcements
+router.include_router(_public_portal_router)  # /public/support
+
+# Masters
+router.include_router(_organizations_router)
+router.include_router(_customers_router)
+router.include_router(_contracts_router)
+router.include_router(_sla_router)
+router.include_router(_categories_router)
+
+# Knowledge Base + Service Catalog
+router.include_router(_kb_categories_router)
+router.include_router(_articles_router)
+router.include_router(_service_items_router)
+router.include_router(_service_requests_router)
+
+# ITIL
+router.include_router(_change_router)
+router.include_router(_problem_router)
+router.include_router(_asset_router)
+
+# Ops
+router.include_router(_announcements_router)
+router.include_router(_automation_router)
+router.include_router(_settings_router)
+router.include_router(_audit_router)
+router.include_router(_integrations_router)  # /tickets/{id}/to-task, /service-requests/{id}/to-invoice
+
+# Broad tickets router (has /support-desk/tickets/{ticket_id}) — last.
+router.include_router(_tickets_router)

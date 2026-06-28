@@ -24,7 +24,7 @@ from app.schemas.support_desk.itil import (
     ProblemCreate, ProblemUpdate, ProblemResponse,
     CustomerAssetCreate, CustomerAssetUpdate, CustomerAssetResponse,
 )
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_support_agent
 from app.utils.support_desk import sla as sla_util
 from app.utils.support_desk.audit import write_audit
 
@@ -53,7 +53,7 @@ _CHANGE_STATUSES = {s.value for s in ChangeStatus}
 
 
 @change_router.get("/", response_model=List[ChangeRequestResponse])
-def list_changes(status_f: Optional[str] = None, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def list_changes(status_f: Optional[str] = None, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     query = db.query(SdChangeRequest).filter(SdChangeRequest.is_deleted == False)  # noqa: E712
     if status_f:
         query = query.filter(SdChangeRequest.status == status_f)
@@ -65,7 +65,7 @@ def list_changes(status_f: Optional[str] = None, db: Session = Depends(get_db), 
 
 
 @change_router.post("/", response_model=ChangeRequestResponse, status_code=status.HTTP_201_CREATED)
-def create_change(payload: ChangeRequestCreate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def create_change(payload: ChangeRequestCreate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     c = SdChangeRequest(**payload.model_dump(exclude_unset=True),
                         change_number=_number(db, NUMBERING_MODULE_CHANGE, "CHG"),
                         created_by_id=admin.id, status=ChangeStatus.DRAFT.value)
@@ -79,7 +79,7 @@ def create_change(payload: ChangeRequestCreate, request: Request, db: Session = 
 
 
 @change_router.get("/{cid}", response_model=ChangeRequestResponse)
-def get_change(cid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def get_change(cid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     c = db.query(SdChangeRequest).filter(SdChangeRequest.id == cid, SdChangeRequest.is_deleted == False).first()  # noqa: E712
     if not c:
         raise HTTPException(404, "Change request not found")
@@ -87,7 +87,7 @@ def get_change(cid: UUID, db: Session = Depends(get_db), admin: User = Depends(g
 
 
 @change_router.patch("/{cid}", response_model=ChangeRequestResponse)
-def update_change(cid: UUID, payload: ChangeRequestUpdate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def update_change(cid: UUID, payload: ChangeRequestUpdate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     c = db.query(SdChangeRequest).filter(SdChangeRequest.id == cid, SdChangeRequest.is_deleted == False).first()  # noqa: E712
     if not c:
         raise HTTPException(404, "Change request not found")
@@ -107,7 +107,7 @@ def update_change(cid: UUID, payload: ChangeRequestUpdate, request: Request, db:
 
 
 @change_router.delete("/{cid}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_change(cid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def delete_change(cid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     c = db.query(SdChangeRequest).filter(SdChangeRequest.id == cid, SdChangeRequest.is_deleted == False).first()  # noqa: E712
     if not c:
         raise HTTPException(404, "Change request not found")
@@ -121,7 +121,7 @@ problem_router = APIRouter(prefix="/support-desk/problems", tags=["Support Desk 
 
 
 @problem_router.get("/", response_model=List[ProblemResponse])
-def list_problems(status_f: Optional[str] = None, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def list_problems(status_f: Optional[str] = None, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     query = db.query(SdProblem).filter(SdProblem.is_deleted == False)  # noqa: E712
     if status_f:
         query = query.filter(SdProblem.status == status_f)
@@ -129,7 +129,7 @@ def list_problems(status_f: Optional[str] = None, db: Session = Depends(get_db),
 
 
 @problem_router.post("/", response_model=ProblemResponse, status_code=status.HTTP_201_CREATED)
-def create_problem(payload: ProblemCreate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def create_problem(payload: ProblemCreate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     data = payload.model_dump(exclude_unset=True)
     # store UUID lists as strings in JSONB
     for key in ("linked_ticket_ids", "linked_change_ids", "linked_asset_ids"):
@@ -147,7 +147,7 @@ def create_problem(payload: ProblemCreate, request: Request, db: Session = Depen
 
 
 @problem_router.get("/{pid}", response_model=ProblemResponse)
-def get_problem(pid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def get_problem(pid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     p = db.query(SdProblem).filter(SdProblem.id == pid, SdProblem.is_deleted == False).first()  # noqa: E712
     if not p:
         raise HTTPException(404, "Problem not found")
@@ -155,7 +155,7 @@ def get_problem(pid: UUID, db: Session = Depends(get_db), admin: User = Depends(
 
 
 @problem_router.patch("/{pid}", response_model=ProblemResponse)
-def update_problem(pid: UUID, payload: ProblemUpdate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def update_problem(pid: UUID, payload: ProblemUpdate, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     p = db.query(SdProblem).filter(SdProblem.id == pid, SdProblem.is_deleted == False).first()  # noqa: E712
     if not p:
         raise HTTPException(404, "Problem not found")
@@ -172,7 +172,7 @@ def update_problem(pid: UUID, payload: ProblemUpdate, request: Request, db: Sess
 
 
 @problem_router.delete("/{pid}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_problem(pid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def delete_problem(pid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     p = db.query(SdProblem).filter(SdProblem.id == pid, SdProblem.is_deleted == False).first()  # noqa: E712
     if not p:
         raise HTTPException(404, "Problem not found")
@@ -187,7 +187,7 @@ asset_router = APIRouter(prefix="/support-desk/customer-assets", tags=["Support 
 
 @asset_router.get("/", response_model=List[CustomerAssetResponse])
 def list_assets(organization_id: Optional[UUID] = None, asset_type: Optional[str] = None,
-                db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+                db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     query = db.query(SdCustomerAsset).filter(SdCustomerAsset.is_deleted == False)  # noqa: E712
     if organization_id:
         query = query.filter(SdCustomerAsset.organization_id == organization_id)
@@ -201,7 +201,7 @@ def list_assets(organization_id: Optional[UUID] = None, asset_type: Optional[str
 
 
 @asset_router.post("/", response_model=CustomerAssetResponse, status_code=status.HTTP_201_CREATED)
-def create_asset(payload: CustomerAssetCreate, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def create_asset(payload: CustomerAssetCreate, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     a = SdCustomerAsset(**payload.model_dump(exclude_unset=True))
     db.add(a)
     db.commit()
@@ -210,7 +210,7 @@ def create_asset(payload: CustomerAssetCreate, db: Session = Depends(get_db), ad
 
 
 @asset_router.patch("/{aid}", response_model=CustomerAssetResponse)
-def update_asset(aid: UUID, payload: CustomerAssetUpdate, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def update_asset(aid: UUID, payload: CustomerAssetUpdate, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     a = db.query(SdCustomerAsset).filter(SdCustomerAsset.id == aid, SdCustomerAsset.is_deleted == False).first()  # noqa: E712
     if not a:
         raise HTTPException(404, "Asset not found")
@@ -222,7 +222,7 @@ def update_asset(aid: UUID, payload: CustomerAssetUpdate, db: Session = Depends(
 
 
 @asset_router.delete("/{aid}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_asset(aid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def delete_asset(aid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     a = db.query(SdCustomerAsset).filter(SdCustomerAsset.id == aid, SdCustomerAsset.is_deleted == False).first()  # noqa: E712
     if not a:
         raise HTTPException(404, "Asset not found")

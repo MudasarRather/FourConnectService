@@ -22,7 +22,7 @@ from app.database import get_db
 from app.models.user import User
 from app.models.support_desk.ticket import SdTicket, SdTicketActivity
 from app.models.support_desk.catalog import SdServiceRequest
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_support_agent
 from app.utils.support_desk.audit import write_audit
 
 router = APIRouter(prefix="/support-desk", tags=["Support Desk — ERP Integrations"])
@@ -49,7 +49,7 @@ def ticket_to_task(
     body: ToTaskBody,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     """Spin a project Task off a ticket and remember the link on ticket.links."""
     t = db.query(SdTicket).filter(SdTicket.id == ticket_id, SdTicket.is_deleted == False).first()  # noqa: E712
@@ -94,7 +94,7 @@ def service_request_to_invoice(
     body: ToInvoiceBody,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     """Raise a ProjectPayment (invoice line) from a service request against a project."""
     sr = db.query(SdServiceRequest).filter(

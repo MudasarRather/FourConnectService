@@ -28,7 +28,7 @@ from app.schemas.support_desk.ticket import (
     TicketCreate, TicketUpdate, TicketResponse, TicketDetailResponse, TicketListResponse,
     TicketAssign, TicketStatusChange, TicketCsat, CommentCreate, CommentResponse, ActivityResponse,
 )
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_support_agent
 from app.utils.support_desk import sla as sla_util
 from app.utils.support_desk.audit import write_audit
 from app.routers.support_desk._common import (
@@ -76,7 +76,7 @@ def list_tickets(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(SdTicket).filter(SdTicket.is_deleted == False)  # noqa: E712
 
@@ -130,7 +130,7 @@ def create_ticket(
     payload: TicketCreate,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     if payload.priority not in _PRIORITIES:
         raise HTTPException(422, f"Invalid priority '{payload.priority}'")
@@ -189,7 +189,7 @@ def create_ticket(
 def get_ticket(
     ticket_id: UUID,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     enrich_ticket(db, t)
@@ -203,7 +203,7 @@ def update_ticket(
     payload: TicketUpdate,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     update = payload.model_dump(exclude_unset=True)
@@ -242,7 +242,7 @@ def assign_ticket(
     payload: TicketAssign,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     data = payload.model_dump(exclude_unset=True)
@@ -267,7 +267,7 @@ def change_status(
     payload: TicketStatusChange,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     new = payload.status
     if new not in _STATUSES:
@@ -317,7 +317,7 @@ def escalate_ticket(
     ticket_id: UUID,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     t.is_escalated = True
@@ -343,7 +343,7 @@ def set_csat(
     ticket_id: UUID,
     payload: TicketCsat,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     t.csat_score = payload.csat_score
@@ -359,7 +359,7 @@ def set_csat(
 def list_comments(
     ticket_id: UUID,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     _get_ticket(db, ticket_id)
     return (db.query(SdTicketComment).filter(SdTicketComment.ticket_id == ticket_id)
@@ -372,7 +372,7 @@ def add_comment(
     payload: CommentCreate,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     c = SdTicketComment(
@@ -401,7 +401,7 @@ def add_comment(
 def list_activities(
     ticket_id: UUID,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     _get_ticket(db, ticket_id)
     return (db.query(SdTicketActivity).filter(SdTicketActivity.ticket_id == ticket_id)
@@ -414,7 +414,7 @@ def delete_ticket(
     ticket_id: UUID,
     request: Request,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     t = _get_ticket(db, ticket_id)
     t.is_deleted = True
@@ -428,7 +428,7 @@ def delete_ticket(
 def rotate_portal_token(
     ticket_id: UUID,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     """Mint/refresh the public-portal token + security window for client access."""
     t = _get_ticket(db, ticket_id)

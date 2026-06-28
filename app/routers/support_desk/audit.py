@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.models.audit_log import AuditLog
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_support_agent
 
 router = APIRouter(prefix="/support-desk/audit-logs", tags=["Support Desk — Audit Logs"])
 
@@ -25,7 +25,7 @@ def list_audit_logs(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=100),
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(AuditLog).filter(AuditLog.action.like("support.%"))
     if action:

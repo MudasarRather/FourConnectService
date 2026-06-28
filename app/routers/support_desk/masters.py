@@ -23,8 +23,11 @@ from app.schemas.support_desk.core import (
     SlaPackageCreate, SlaPackageUpdate, SlaPackageResponse,
     CategoryCreate, CategoryUpdate, CategoryResponse,
 )
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_current_superuser, get_support_agent
 from app.utils.support_desk.audit import write_audit
+
+# Reads (lists) are open to support agents for triage context + ticket-create
+# pickers; every create/update/delete below stays superuser (admin-only config).
 
 
 def _org_names(db: Session, org_ids: set) -> dict:
@@ -44,7 +47,7 @@ def list_orgs(
     q: Optional[str] = None,
     include_inactive: bool = False,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(SdOrganization).filter(SdOrganization.is_deleted == False)  # noqa: E712
     if not include_inactive:
@@ -125,7 +128,7 @@ def list_customers(
     organization_id: Optional[UUID] = None,
     q: Optional[str] = None,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(SdCustomer).filter(SdCustomer.is_deleted == False)  # noqa: E712
     if organization_id:
@@ -190,7 +193,7 @@ contracts_router = APIRouter(prefix="/support-desk/contracts", tags=["Support De
 def list_contracts(
     organization_id: Optional[UUID] = None,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(SdContract).filter(SdContract.is_deleted == False)  # noqa: E712
     if organization_id:
@@ -250,7 +253,7 @@ sla_router = APIRouter(prefix="/support-desk/sla-packages", tags=["Support Desk 
 
 
 @sla_router.get("/", response_model=List[SlaPackageResponse])
-def list_sla(db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def list_sla(db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     return db.query(SdSlaPackage).filter(SdSlaPackage.is_deleted == False).order_by(SdSlaPackage.name).all()  # noqa: E712
 
 
@@ -309,7 +312,7 @@ categories_router = APIRouter(prefix="/support-desk/categories", tags=["Support 
 
 
 @categories_router.get("/", response_model=List[CategoryResponse])
-def list_categories(db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def list_categories(db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     return (db.query(SdCategory).filter(SdCategory.is_deleted == False)  # noqa: E712
             .order_by(SdCategory.sort_order, SdCategory.name).all())
 

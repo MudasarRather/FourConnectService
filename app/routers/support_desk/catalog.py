@@ -21,8 +21,11 @@ from app.schemas.support_desk.catalog import (
     ServiceItemCreate, ServiceItemUpdate, ServiceItemResponse,
     ServiceRequestCreate, ServiceRequestUpdate, ServiceRequestResponse,
 )
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_current_superuser, get_support_agent
 from app.utils.support_desk import sla as sla_util
+
+# Reads (lists) are open to support agents (KB articles, service catalog, service
+# requests). Authoring/CUD + approvals stay superuser (admin-only).
 
 
 # ═══════════ KB Categories ═══════════
@@ -81,7 +84,7 @@ def list_articles(
     status_f: Optional[str] = None,
     q: Optional[str] = None,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(SdKnowledgeArticle).filter(SdKnowledgeArticle.is_deleted == False)  # noqa: E712
     if category_id:
@@ -152,7 +155,7 @@ service_items_router = APIRouter(prefix="/support-desk/service-items", tags=["Su
 
 
 @service_items_router.get("/", response_model=List[ServiceItemResponse])
-def list_service_items(db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def list_service_items(db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     return db.query(SdServiceItem).filter(SdServiceItem.is_deleted == False).order_by(SdServiceItem.name).all()  # noqa: E712
 
 
@@ -195,7 +198,7 @@ service_requests_router = APIRouter(prefix="/support-desk/service-requests", tag
 def list_service_requests(
     status_f: Optional[str] = None,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     query = db.query(SdServiceRequest).filter(SdServiceRequest.is_deleted == False)  # noqa: E712
     if status_f:

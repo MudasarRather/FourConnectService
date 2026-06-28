@@ -31,6 +31,9 @@ class User(Base):
     avatar_url = Column(String, nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     is_superuser = Column(Boolean, default=False, nullable=False)
+    # Support Desk agent flag — lets a regular employee work the support desk
+    # (tickets, ITIL, dashboards) on the /user panel without being a full superuser.
+    is_support_agent = Column(Boolean, default=False, server_default="false", nullable=False)
     is_activated = Column(Boolean, default=False, nullable=False)  # Account activation status
     activation_code = Column(String, nullable=True)  # 8-digit activation code
     # Session-invalidation counter. Issued JWTs carry a `tv` claim equal to this

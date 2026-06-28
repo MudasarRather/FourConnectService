@@ -14,7 +14,7 @@ from app.models.support_desk.constants import (
     TicketStatus, TicketPriority, OPEN_TICKET_STATUSES,
 )
 from app.schemas.support_desk.dashboard import SupportDashboardResponse
-from app.utils.dependencies import get_current_superuser
+from app.utils.dependencies import get_support_agent
 
 router = APIRouter(prefix="/support-desk/dashboard", tags=["Support Desk — Dashboard"])
 
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/support-desk/dashboard", tags=["Support Desk — Das
 @router.get("/", response_model=SupportDashboardResponse)
 def support_dashboard(
     db: Session = Depends(get_db),
-    admin: User = Depends(get_current_superuser),
+    admin: User = Depends(get_support_agent),
 ):
     base = db.query(SdTicket).filter(SdTicket.is_deleted == False)  # noqa: E712
 

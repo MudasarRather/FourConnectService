@@ -105,3 +105,18 @@ def get_current_superuser(
             detail="Superadmin access required"
         )
     return current_user
+
+
+def get_support_agent(
+    current_user: User = Depends(get_current_user)
+) -> User:
+    """Dependency for Support Desk OPERATIONAL endpoints (tickets, ITIL, dashboards,
+    audit-read, triage context reads). Allows a full superuser OR a flagged support
+    agent — a regular employee who works the desk on the /user panel. Config/master
+    MUTATIONS stay on get_current_superuser (admin-only)."""
+    if not (current_user.is_superuser or getattr(current_user, "is_support_agent", False)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Support agent access required"
+        )
+    return current_user

@@ -62,6 +62,66 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Support Desk ("Vendor Relay Station"): add the pending-vendor lifecycle columns to
+    # the existing support_tickets table that create_all() can't add. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_vendor_columns
+        ensure_ticket_vendor_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk ("Suspension Dock"): on-hold governance columns (hold_reason_code,
+    # hold-review stamps) + the hold_until expiry-sweep index. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_hold_columns
+        ensure_ticket_hold_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk ("War Room"): critical-ops ACK + stakeholder-update-cadence columns
+    # + the next_update_due_at sweep index. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_critical_columns
+        ensure_ticket_critical_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk ("Thermal Updraft" escalated desk): structured escalation workflow
+    # columns (type/reason-code/by/target-team, esc-ACK, response clock, auto-escalation
+    # stamp) + sweep indexes. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_escalation_columns
+        ensure_ticket_escalation_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk ("Möbius Loop" Reopened desk): reopen-lifecycle metadata columns
+    # (source / reason-code / cycle stamps / latency / prev-resolution snapshot) + indexes
+    # + DDL-safety for the model-only reopened_count/reopen_reason. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_reopen_columns
+        ensure_ticket_reopen_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk ("Archive of Record" Closed desk): follow-up linkage column
+    # (follow_up_of_id → the sealed ticket a new case continues) + lookup index.
+    # Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_followup_columns
+        ensure_ticket_followup_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk ("Copperplate Studio" Templates desk): template lifecycle/analytics/
+    # defaults columns + the template_id provenance stamp on support_tickets + indexes.
+    # Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_template_studio_columns
+        ensure_template_studio_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     # Start the certification-expiry monitor + compliance auto-reassign engine on a
     # daily-ish cadence. Both run on their own NullPool engine, are idempotent, and
     # are fully guarded so they can never block boot or contend with StaticPool.

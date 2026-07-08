@@ -23,12 +23,40 @@ from app.models.support_desk.constants import (
 from app.schemas.support_desk.ticket import PublicTicketCreate, PublicCommentCreate
 from app.utils.support_desk import sla as sla_util
 from app.utils.support_desk.audit import write_audit
-from app.routers.support_desk._common import generate_ticket_number, resolve_sla_package
+from app.routers.support_desk._common import (
+    generate_ticket_number, resolve_sla_package, reactivate_on_customer_reply,
+    auto_reopen_on_customer_reply,
+)
 
 router = APIRouter(prefix="/public/support", tags=["Support Desk — Public Portal"])
 
 PORTAL_TOKEN_TTL_DAYS = 30
 _PRIORITIES = {p.value for p in TicketPriority}
+
+# ── Rate limiting (no-auth surface = brute-force / spam target) ──
+# In-process sliding window per client IP. Fine for this single-process backend
+# (StaticPool = one worker); swap for slowapi/Redis if the app ever scales out.
+_RL_BUCKETS: dict = {}
+_RL_MAX_KEYS = 10_000   # hard cap so a spoofed-IP flood can't balloon memory
+
+
+def _throttle(request: Request, bucket: str, limit: int, window_s: int) -> None:
+    import time
+    from collections import deque
+    ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() \
+        or (request.client.host if request.client else "?")
+    key = f"{bucket}:{ip}"
+    now = time.monotonic()
+    dq = _RL_BUCKETS.get(key)
+    if dq is None:
+        if len(_RL_BUCKETS) >= _RL_MAX_KEYS:
+            _RL_BUCKETS.clear()   # crude but bounded — better than unbounded growth
+        dq = _RL_BUCKETS[key] = deque()
+    while dq and now - dq[0] > window_s:
+        dq.popleft()
+    if len(dq) >= limit:
+        raise HTTPException(429, "Too many requests — please wait a moment and try again.")
+    dq.append(now)
 
 
 def _portal_ticket(db: Session, token: str) -> SdTicket:
@@ -75,6 +103,7 @@ def _public_view(db: Session, t: SdTicket) -> dict:
 @router.post("/tickets")
 def submit_public_ticket(payload: PublicTicketCreate, request: Request, db: Session = Depends(get_db)):
     """Public submission. Gated by a valid, active organization code."""
+    _throttle(request, "submit", limit=5, window_s=600)     # 5 tickets / 10 min / IP
     if payload.priority not in _PRIORITIES:
         payload.priority = TicketPriority.MEDIUM.value
     code = (payload.org_code or "").strip()
@@ -132,21 +161,31 @@ def submit_public_ticket(payload: PublicTicketCreate, request: Request, db: Sess
 
 
 @router.get("/tickets/{token}")
-def view_public_ticket(token: str, db: Session = Depends(get_db)):
+def view_public_ticket(token: str, request: Request, db: Session = Depends(get_db)):
+    _throttle(request, "view", limit=60, window_s=60)       # also slows token enumeration
     t = _portal_ticket(db, token)
     return _public_view(db, t)
 
 
 @router.post("/tickets/{token}/comments")
 def reply_public_ticket(token: str, payload: PublicCommentCreate, request: Request, db: Session = Depends(get_db)):
+    _throttle(request, "reply", limit=20, window_s=600)     # 20 replies / 10 min / IP
     t = _portal_ticket(db, token)
     db.add(SdTicketComment(
         ticket_id=t.id, author_name=t.contact_name or "Client",
         author_kind=CommentAuthorKind.CUSTOMER.value, body=payload.body,
         is_internal=False, attachments=payload.attachments or [],
     ))
+    t.last_customer_reply_at = sla_util.now_utc()
     db.add(SdTicketActivity(ticket_id=t.id, actor_name=t.contact_name or "Client",
                             action="replied", detail={"via": "public_portal"}))
+    # Loophole fix: a client reply through the portal reactivates an awaiting-customer ticket
+    # (out of pending_customer into active work) so it re-enters the agent's queue. And a
+    # reply to a RESOLVED ticket inside the reopen window auto-reopens it (source='portal')
+    # — the fix evidently didn't hold; without this the reply lands silently and the
+    # auto-close sweep buries the ticket days later.
+    if not reactivate_on_customer_reply(db, t):
+        auto_reopen_on_customer_reply(db, t, t.contact_name or "Client")
     if t.assigned_agent_id:
         try:
             from app.utils.hr.notify import dispatch

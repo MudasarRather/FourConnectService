@@ -8,7 +8,7 @@ from app.models.support_desk.core import (
     SdOrganization, SdCustomer, SdSlaPackage, SdContract, SdCategory,
 )
 from app.models.support_desk.ticket import (
-    SdTicket, SdTicketComment, SdTicketActivity,
+    SdTicket, SdTicketComment, SdTicketActivity, SdTicketReminder,
 )
 from app.models.support_desk.catalog import (
     SdKbCategory, SdKnowledgeArticle, SdServiceItem, SdServiceRequest,
@@ -22,7 +22,7 @@ from app.models.support_desk.ops import (
 
 __all__ = [
     "SdOrganization", "SdCustomer", "SdSlaPackage", "SdContract", "SdCategory",
-    "SdTicket", "SdTicketComment", "SdTicketActivity",
+    "SdTicket", "SdTicketComment", "SdTicketActivity", "SdTicketReminder",
     "SdKbCategory", "SdKnowledgeArticle", "SdServiceItem", "SdServiceRequest",
     "SdChangeRequest", "SdProblem", "SdCustomerAsset",
     "SdAnnouncement", "SdAutomationRule", "SdSetting",

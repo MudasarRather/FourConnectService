@@ -192,6 +192,7 @@ class CategoryBase(BaseModel):
     icon: Optional[str] = None
     color: Optional[str] = None
     sort_order: int = 0
+    request_types: List[str] = Field(default_factory=list)   # request types this category applies to (top-level)
     default_team: Optional[str] = None
     is_active: bool = True
 
@@ -206,6 +207,7 @@ class CategoryUpdate(BaseModel):
     icon: Optional[str] = None
     color: Optional[str] = None
     sort_order: Optional[int] = None
+    request_types: Optional[List[str]] = None
     default_team: Optional[str] = None
     is_active: Optional[bool] = None
 

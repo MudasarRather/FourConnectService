@@ -40,6 +40,12 @@ from app.routers.support_desk.ops import (
 )
 from app.routers.support_desk.audit import router as _audit_router
 from app.routers.support_desk.integrations import router as _integrations_router
+from app.routers.support_desk.workspace import (
+    teams_router as _teams_router,
+    queues_router as _queues_router,
+    saved_views_router as _saved_views_router,
+)
+from app.routers.support_desk.templates import templates_router as _templates_router
 from app.routers.support_desk.tickets import router as _tickets_router
 
 router = APIRouter()
@@ -74,6 +80,12 @@ router.include_router(_automation_router)
 router.include_router(_settings_router)
 router.include_router(_audit_router)
 router.include_router(_integrations_router)  # /tickets/{id}/to-task, /service-requests/{id}/to-invoice
+
+# Phase-3 workspace entities
+router.include_router(_teams_router)
+router.include_router(_queues_router)
+router.include_router(_saved_views_router)
+router.include_router(_templates_router)
 
 # Broad tickets router (has /support-desk/tickets/{ticket_id}) — last.
 router.include_router(_tickets_router)

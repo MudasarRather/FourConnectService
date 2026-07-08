@@ -139,6 +139,10 @@ class SdCategory(Base):
     icon = Column(String(40), nullable=True)
     color = Column(String(20), nullable=True)
     sort_order = Column(Integer, nullable=False, default=0)
+    # Which request TYPES this (top-level) category applies to — drives the
+    # request_type → category → subcategory cascade in the create form. Empty = all types.
+    # Subcategories inherit their parent's request types.
+    request_types = Column(JSONB, nullable=False, default=list)
     # Optional default routing
     default_team = Column(String(80), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True, index=True)

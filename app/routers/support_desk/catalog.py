@@ -117,7 +117,9 @@ def create_article(payload: ArticleCreate, db: Session = Depends(get_db), admin:
 
 
 @articles_router.get("/{aid}", response_model=ArticleResponse)
-def get_article(aid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def get_article(aid: UUID, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    # Reads are open to support agents (matches the list route + the module rule above) —
+    # the KCS promote flow needs the authoring agent to open their own harvested draft.
     a = db.query(SdKnowledgeArticle).filter(SdKnowledgeArticle.id == aid, SdKnowledgeArticle.is_deleted == False).first()  # noqa: E712
     if not a:
         raise HTTPException(404, "Article not found")
@@ -125,11 +127,18 @@ def get_article(aid: UUID, db: Session = Depends(get_db), admin: User = Depends(
 
 
 @articles_router.patch("/{aid}", response_model=ArticleResponse)
-def update_article(aid: UUID, payload: ArticleUpdate, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def update_article(aid: UUID, payload: ArticleUpdate, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     a = db.query(SdKnowledgeArticle).filter(SdKnowledgeArticle.id == aid, SdKnowledgeArticle.is_deleted == False).first()  # noqa: E712
     if not a:
         raise HTTPException(404, "Article not found")
     update = payload.model_dump(exclude_unset=True)
+    # KCS editing rule: a non-superuser agent may polish only their OWN article while it
+    # is still a DRAFT — and can never publish it (editorial review stays superuser).
+    if not getattr(admin, "is_superuser", False):
+        if a.author_id != admin.id or a.status != ArticleStatus.DRAFT.value:
+            raise HTTPException(403, "Only the author may edit a draft; published articles are editorial-only.")
+        if update.get("status") and update["status"] != ArticleStatus.DRAFT.value:
+            raise HTTPException(403, "Publishing is an editorial act — ask a desk admin to review and publish.")
     was_published = a.status == ArticleStatus.PUBLISHED.value
     for k, v in update.items():
         setattr(a, k, v)

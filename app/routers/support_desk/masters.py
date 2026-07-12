@@ -261,6 +261,10 @@ def list_sla(db: Session = Depends(get_db), admin: User = Depends(get_support_ag
 def create_sla(payload: SlaPackageCreate, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
     if db.query(SdSlaPackage).filter(SdSlaPackage.name == payload.name, SdSlaPackage.is_deleted == False).first():  # noqa: E712
         raise HTTPException(400, "SLA package name already exists")
+    from app.utils.support_desk.sla import validate_coverage
+    cov_err = validate_coverage(payload.coverage)
+    if cov_err:
+        raise HTTPException(422, cov_err)
     pkg = SdSlaPackage(**payload.model_dump(exclude_unset=True))
     if pkg.is_default:
         db.query(SdSlaPackage).update({SdSlaPackage.is_default: False})
@@ -286,10 +290,17 @@ def update_sla(sid: UUID, payload: SlaPackageUpdate, db: Session = Depends(get_d
     if not pkg:
         raise HTTPException(404, "SLA package not found")
     update = payload.model_dump(exclude_unset=True)
+    if "coverage" in update:
+        from app.utils.support_desk.sla import validate_coverage
+        cov_err = validate_coverage(update["coverage"])
+        if cov_err:
+            raise HTTPException(422, cov_err)
     if update.get("is_default"):
         db.query(SdSlaPackage).filter(SdSlaPackage.id != sid).update({SdSlaPackage.is_default: False})
     for k, v in update.items():
         setattr(pkg, k, v)
+    write_audit(db, entity_type="sla_package", op="updated", entity_id=pkg.id, actor_id=admin.id,
+                details={"name": pkg.name, "fields": sorted(update.keys())})
     db.commit()
     db.refresh(pkg)
     return pkg
@@ -303,6 +314,8 @@ def delete_sla(sid: UUID, db: Session = Depends(get_db), admin: User = Depends(g
     if pkg.is_default:
         raise HTTPException(409, "Cannot delete the default SLA package")
     pkg.is_deleted = True
+    write_audit(db, entity_type="sla_package", op="deleted", entity_id=pkg.id, actor_id=admin.id,
+                details={"name": pkg.name})
     db.commit()
     return None
 

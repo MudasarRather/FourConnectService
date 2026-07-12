@@ -22,23 +22,159 @@ from sqlalchemy import func
 
 from app.models.user import User
 from app.models.support_desk.ticket import SdTicket, SdTicketActivity
-from app.models.support_desk.workspace import SdTeam, SdQueue
+from app.models.support_desk.workspace import SdTeam, SdQueue, SdSkill, SdAgentStatus
 from app.models.support_desk.constants import TERMINAL_TICKET_STATUSES
 
+# Agent statuses that make a member INELIGIBLE for auto-assignment (Zendesk unified
+# agent status). 'focus' still receives work — it only mutes desk chatter; away/offline
+# do not. An agent with NO status row counts as online.
+UNAVAILABLE_STATUSES = {"away", "offline"}
 
-def _find_queue_for_category(db, category_id) -> SdQueue | None:
-    """The first active queue that routes this category (Python filter — queue counts
-    are tiny and JSONB element-containment operators are finicky across drivers)."""
-    if not category_id:
+
+def _open_in_queue(db, queue_id) -> int:
+    """ACTIVE work in a queue (non-terminal, merged tombstones excluded) — the same
+    definition the delete/deactivate guard uses, so capacity means one thing."""
+    return (db.query(SdTicket)
+            .filter(SdTicket.queue_id == queue_id, SdTicket.is_deleted == False,  # noqa: E712
+                    SdTicket.merged_into_id.is_(None),
+                    SdTicket.status.notin_(list(TERMINAL_TICKET_STATUSES)))
+            .count())
+
+
+def apply_overflow(db, queue: SdQueue):
+    """Capacity gate (config v2): a queue at/over its ``capacity_limit`` spills new
+    work to its ``overflow_queue_id`` — ONE hop only (never chained), FAIL-OPEN
+    (no/invalid/inactive overflow target → the ticket stays put; a full queue is
+    better than a lost one). Returns ``(final_queue, hopped)``. Creation-time
+    routing only — manual moves never pass through this gate."""
+    try:
+        cap = getattr(queue, "capacity_limit", None)
+        of_id = getattr(queue, "overflow_queue_id", None)
+        if not cap or int(cap) <= 0 or not of_id:
+            return queue, False
+        if _open_in_queue(db, queue.id) < int(cap):
+            return queue, False
+        target = (db.query(SdQueue)
+                  .filter(SdQueue.id == of_id, SdQueue.is_deleted == False,  # noqa: E712
+                          SdQueue.is_active == True).first())  # noqa: E712
+        if not target or str(target.id) == str(queue.id):
+            return queue, False
+        return target, True
+    except Exception:
+        return queue, False
+
+
+def apply_queue_sla(db, t: SdTicket, queue: SdQueue) -> None:
+    """Per-queue SLA policy (config v2): a lane with its own ``sla_package_id``
+    re-classes tickets that landed carrying only the desk-default package (or none).
+    Precedence stays explicit/rule > organization > QUEUE > default — an org contract
+    or a rule's ``set_sla_package`` always wins. Recomputes the still-open deadlines
+    from creation so the clock matches the new class. Best-effort, never raises."""
+    try:
+        pkg_id = getattr(queue, "sla_package_id", None)
+        if not pkg_id or str(t.sla_package_id or "") == str(pkg_id):
+            return
+        from app.models.support_desk.core import SdSlaPackage, SdOrganization
+        if t.sla_package_id is not None:
+            # Org-derived package wins over the queue's.
+            if t.organization_id:
+                org = db.query(SdOrganization).filter(SdOrganization.id == t.organization_id).first()
+                if org and org.sla_package_id and str(org.sla_package_id) == str(t.sla_package_id):
+                    return
+            # Anything other than the desk default was explicitly chosen (agent pick
+            # or a rule's set_sla_package) — leave it alone.
+            default = (db.query(SdSlaPackage)
+                       .filter(SdSlaPackage.is_default == True, SdSlaPackage.is_deleted == False)  # noqa: E712
+                       .first())
+            if not default or str(default.id) != str(t.sla_package_id):
+                return
+        pkg = (db.query(SdSlaPackage)
+               .filter(SdSlaPackage.id == pkg_id, SdSlaPackage.is_deleted == False)  # noqa: E712
+               .first())
+        if not pkg:
+            return
+        from app.utils.support_desk import sla as sla_util
+        t.sla_package_id = pkg.id
+        rd, rsd = sla_util.compute_deadlines(pkg, t.priority, start=t.created_at or sla_util.now_utc())
+        if getattr(t, "first_responded_at", None) is None:
+            t.response_due_at = rd
+        if getattr(t, "resolved_at", None) is None:
+            t.resolution_due_at = rsd
+        db.add(SdTicketActivity(
+            ticket_id=t.id, actor_user_id=None, actor_name="Routing",
+            action="sla_reclassed",
+            detail={"queue": queue.name, "package": pkg.name, "by": "queue_sla"}))
+    except Exception:
+        pass
+
+
+def _filter_available(db, pool: list) -> list:
+    """Drop away/offline agents from an auto-assign pool. FAIL-OPEN: if that empties
+    the pool (whole team signed off), the original pool is returned — a queue must
+    never wedge because presence data says nobody is home."""
+    if not pool:
+        return pool
+    rows = (db.query(SdAgentStatus)
+            .filter(SdAgentStatus.user_id.in_([u.id for u in pool]),
+                    SdAgentStatus.status.in_(list(UNAVAILABLE_STATUSES))).all())
+    unavailable = {str(r.user_id) for r in rows}
+    if not unavailable:
+        return pool
+    kept = [u for u in pool if str(u.id) not in unavailable]
+    return kept or pool
+
+
+def _filter_skilled(db, queue: SdQueue, pool: list) -> list:
+    """Keep agents holding ALL of the queue's required skills (Zendesk required-skills
+    routing). FAIL-OPEN: no qualified agent → the whole pool, so skill gaps degrade to
+    ordinary team routing instead of starving the queue."""
+    skill_ids = [str(x) for x in (getattr(queue, "skill_ids", None) or [])]
+    if not pool or not skill_ids:
+        return pool
+    skills = (db.query(SdSkill)
+              .filter(SdSkill.id.in_(skill_ids), SdSkill.is_deleted == False,  # noqa: E712
+                      SdSkill.is_active == True).all())  # noqa: E712
+    if not skills:
+        return pool   # every referenced skill was deleted/retired — nothing to gate on
+    rosters = [{str(a) for a in (s.agent_ids or [])} for s in skills]
+    kept = [u for u in pool if all(str(u.id) in r for r in rosters)]
+    return kept or pool
+
+
+def _find_queue_for_category(db, category_id, subcategory_id=None) -> SdQueue | None:
+    """The best active queue that routes this category OR subcategory (Python filter —
+    queue counts are tiny and JSONB element-containment operators are finicky across
+    drivers). A lane whose list names the ticket's SUBCATEGORY wins over one naming
+    only the parent category (most-specific-first — a "Laptop / Desktop" lane must
+    catch a Hardware>Laptop ticket even though the ticket's category_id is Hardware).
+    Within the same specificity, drain priority decides — NOT the accident of
+    alphabetical order (an "L1" lane must not shadow "L2" just by name)."""
+    if not category_id and not subcategory_id:
         return None
-    cid = str(category_id)
     queues = db.query(SdQueue).filter(
         SdQueue.is_active == True, SdQueue.is_deleted == False,  # noqa: E712
-    ).order_by(SdQueue.name).all()
-    for qz in queues:
-        if cid in [str(x) for x in (qz.category_ids or [])]:
-            return qz
+    ).order_by(SdQueue.queue_priority.desc(), SdQueue.name).all()
+    for wanted in (subcategory_id, category_id):
+        if not wanted:
+            continue
+        w = str(wanted)
+        for qz in queues:
+            if w in [str(x) for x in (qz.category_ids or [])]:
+                return qz
     return None
+
+
+def _find_queue_for_team(db, team_id) -> SdQueue | None:
+    """The team's own lane: the active queue whose crew is this team (highest
+    drain priority first). Used to park team-routed tickets — the tier desks are
+    queue-scoped, so a ticket with a team but no queue is invisible on every lane."""
+    if not team_id:
+        return None
+    return (db.query(SdQueue)
+            .filter(SdQueue.is_deleted == False, SdQueue.is_active == True,  # noqa: E712
+                    SdQueue.team_id == team_id)
+            .order_by(SdQueue.queue_priority.desc(), SdQueue.name)
+            .first())
 
 
 def _candidate_agents(db, queue: SdQueue) -> list:
@@ -141,8 +277,11 @@ def teams_handling(db, ticket_type, category_id=None) -> list[SdTeam]:
     return out
 
 
-def _pick_load_balanced(db, pool: list):
-    """The member with the fewest open (non-terminal) tickets; ties break on pool order."""
+def _pick_load_balanced(db, pool: list, max_load: int | None = None):
+    """The member with the fewest open (non-terminal) tickets; ties break on pool order.
+    ``max_load`` (queue capacity cap) drops members at/over the cap first — SOFT cap:
+    if everyone is capped, the least-loaded member still wins (fail-open, the queue
+    must never wedge on capacity data)."""
     if not pool:
         return None
     ids = [u.id for u in pool]
@@ -151,29 +290,53 @@ def _pick_load_balanced(db, pool: list):
                     SdTicket.status.notin_(TERMINAL_TICKET_STATUSES))
             .group_by(SdTicket.assigned_agent_id).all())
     counts = {str(r[0]): r[1] for r in rows}
+    if max_load and int(max_load) > 0:
+        under = [u for u in pool if counts.get(str(u.id), 0) < int(max_load)]
+        if under:
+            pool = under
     return min(pool, key=lambda u: counts.get(str(u.id), 0))
 
 
 def match_route(db, t: SdTicket) -> dict:
-    """READ-ONLY: which queue + team WOULD this ticket route to? Mirrors the *matching*
-    half of route_and_assign (queue-by-category → team; team-by-type+category fallback)
-    using the same `_find_*` helpers, but mutates NOTHING — no queue_id/team_id writes,
-    no activity rows, no auto-assign. Powers the create-page routing preview so the
-    agent sees the destination team + SLA before the ticket exists. Returns
+    """READ-ONLY: which queue + team WOULD this ticket route to? Mirrors the FULL
+    creation chain in order — explicit queue → automation rules (dry run) →
+    queue-by-category → team-by-type+category → park in the team's own lane — but
+    mutates NOTHING: no queue_id/team_id writes, no activity rows, no auto-assign.
+    Powers the create-page routing preview so the agent sees the destination team +
+    SLA before the ticket exists. The rule simulation matters: the real create path
+    runs `evaluate_rules` BEFORE the category router, so a preview that skips the
+    rules can promise one team while a routing rule delivers another. Returns
     {queue, team} (ORM objects or None). Best-effort — never raises."""
     queue = team = None
     try:
         if t.queue_id:
             queue = db.query(SdQueue).filter(SdQueue.id == t.queue_id, SdQueue.is_deleted == False).first()  # noqa: E712
         if not queue:
-            queue = _find_queue_for_category(db, t.category_id)
-        # Resolved team: an explicit team wins, else the queue's team, else type/category match.
+            # Dry-run the on_create rule chain — first-match wins on the real path too.
+            import uuid as _uuid
+            from app.utils.support_desk.rules import evaluate_rules  # local: avoid import cycle
+            decision = (evaluate_rules(db, t, trigger="on_create", dry_run=True) or {}).get("decision") or {}
+            if decision.get("queue_id"):
+                queue = db.query(SdQueue).filter(SdQueue.id == _uuid.UUID(decision["queue_id"]), SdQueue.is_deleted == False).first()  # noqa: E712
+            if decision.get("team_id"):
+                team = db.query(SdTeam).filter(SdTeam.id == _uuid.UUID(decision["team_id"]), SdTeam.is_deleted == False).first()  # noqa: E712
+        if not queue:
+            queue = _find_queue_for_category(db, t.category_id, t.subcategory_id)
+        # Resolved team: an explicit team wins, else the rules' team, else the queue's
+        # team, else type/category match.
         if t.team_id:
             team = db.query(SdTeam).filter(SdTeam.id == t.team_id, SdTeam.is_deleted == False).first()  # noqa: E712
         if not team and queue and queue.team_id:
             team = db.query(SdTeam).filter(SdTeam.id == queue.team_id, SdTeam.is_deleted == False).first()  # noqa: E712
         if not team:
             team = _find_team_for_type(db, t.ticket_type, t.category_id)
+        # Park preview: a team-routed ticket lands in the team's own lane (step 4 of
+        # route_and_assign) — show that lane instead of "no queue".
+        if not queue and team:
+            queue = _find_queue_for_team(db, team.id)
+        # Capacity preview: mirror the overflow hop so the promise matches the route.
+        if queue is not None:
+            queue, _hopped = apply_overflow(db, queue)
     except Exception:
         pass
     return {"queue": queue, "team": team}
@@ -185,28 +348,35 @@ def route_and_assign(db, t: SdTicket) -> dict:
     out = {"queue_id": None, "queue_name": None, "assigned_user_id": None}
     try:
         # 1) ROUTE — honour an explicit queue, else derive from the category map.
+        #    Either way the capacity gate runs: a full lane spills ONE hop to its
+        #    overflow target (creation-time routing only — manual moves never spill).
         queue = None
         if t.queue_id:
             queue = db.query(SdQueue).filter(SdQueue.id == t.queue_id, SdQueue.is_deleted == False).first()  # noqa: E712
         if not queue:
-            queue = _find_queue_for_category(db, t.category_id)
-            if queue:
-                t.queue_id = queue.id
+            queue = _find_queue_for_category(db, t.category_id, t.subcategory_id)
         if queue:
+            queue, hopped = apply_overflow(db, queue)
+            t.queue_id = queue.id
             if queue.team_id and not t.team_id:
                 t.team_id = queue.team_id
             out["queue_id"] = queue.id
             out["queue_name"] = queue.name
+            detail = {"queue": queue.name}
+            if hopped:
+                detail["by"] = "overflow"
             db.add(SdTicketActivity(ticket_id=t.id, actor_user_id=None, actor_name="Routing",
-                                    action="routed", detail={"queue": queue.name}))
+                                    action="routed", detail=detail))
 
         # 2) ASSIGN — only if the queue auto-assigns, method != manual, and it's unassigned.
         if (queue and queue.auto_assign and (queue.assignment_method or "round_robin") != "manual"
                 and not t.assigned_agent_id):
-            pool = _candidate_agents(db, queue)
+            # Skill gate → availability gate, both FAIL-OPEN (see the helpers).
+            pool = _filter_available(db, _filter_skilled(db, queue, _candidate_agents(db, queue)))
             if pool:
                 method = queue.assignment_method or "round_robin"
-                picked = _pick_load_balanced(db, pool) if method == "load_balanced" else _pick_round_robin(queue, pool)
+                picked = (_pick_load_balanced(db, pool, getattr(queue, "max_agent_load", None))
+                          if method == "load_balanced" else _pick_round_robin(queue, pool))
                 if picked:
                     t.assigned_agent_id = picked.id
                     queue.rr_last_user_id = picked.id   # advance the cursor for both methods
@@ -219,6 +389,10 @@ def route_and_assign(db, t: SdTicket) -> dict:
         # 3) TEAM ROUTING — when no queue claimed a team, route by the ticket's request
         #    TYPE (and/or category) to the team that declares it. Then, if that team is
         #    set to auto-assign, claim a member (round-robin / load-balanced).
+        #    NOTE: when a QUEUE already claimed the ticket (rule- or category-routed),
+        #    the team router may still fill team_id for the seal, but the queue's own
+        #    assignment policy governs — a manual lane must not be drained by another
+        #    team's auto-assign (the e2e probe caught exactly this).
         if not t.team_id:
             team = _find_team_for_type(db, t.ticket_type, t.category_id)
             if team:
@@ -227,9 +401,10 @@ def route_and_assign(db, t: SdTicket) -> dict:
                 out["team_name"] = team.name
                 db.add(SdTicketActivity(ticket_id=t.id, actor_user_id=None, actor_name="Routing",
                                         action="routed", detail={"team": team.name, "by": "request_type"}))
-                if (team.auto_assign and (team.assignment_method or "round_robin") != "manual"
+                if (queue is None and team.auto_assign
+                        and (team.assignment_method or "round_robin") != "manual"
                         and not t.assigned_agent_id):
-                    pool = _agents_of_team(db, team)
+                    pool = _filter_available(db, _agents_of_team(db, team))
                     if pool:
                         method = team.assignment_method or "round_robin"
                         picked = _pick_load_balanced(db, pool) if method == "load_balanced" else _round_robin(team.rr_last_user_id, pool)
@@ -241,6 +416,32 @@ def route_and_assign(db, t: SdTicket) -> dict:
                                 ticket_id=t.id, actor_user_id=None, actor_name="Auto-assign",
                                 action="assigned",
                                 detail={"assigned_agent_id": str(picked.id), "method": method, "team": team.name, "auto": True}))
+
+        # 4) PARK — a ticket that holds a team but no queue is invisible on every tier
+        #    desk (the lane grids are queue-scoped), so "routed to Tier 2" would never
+        #    surface on the L2 board. Park it in the team's own lane. Parking is
+        #    placement only — the lane's assignment policy was already honoured above,
+        #    so a manual lane stays manual.
+        if t.team_id and not t.queue_id:
+            team_queue = _find_queue_for_team(db, t.team_id)
+            if team_queue:
+                team_queue, hopped = apply_overflow(db, team_queue)
+                t.queue_id = team_queue.id
+                out["queue_id"] = team_queue.id
+                out["queue_name"] = team_queue.name
+                db.add(SdTicketActivity(
+                    ticket_id=t.id, actor_user_id=None, actor_name="Routing",
+                    action="routed",
+                    detail={"queue": team_queue.name, "by": "overflow" if hopped else "team_queue"}))
+                queue = queue or team_queue
+
+        # 5) SLA POLICY — the lane that finally holds the ticket may carry its own
+        #    SLA package (config v2). Applied last so overflow hops re-class too.
+        if t.queue_id:
+            final_q = queue if (queue and str(queue.id) == str(t.queue_id)) else (
+                db.query(SdQueue).filter(SdQueue.id == t.queue_id).first())
+            if final_q is not None:
+                apply_queue_sla(db, t, final_q)
     except Exception:
         # Routing must never break ticket creation.
         pass

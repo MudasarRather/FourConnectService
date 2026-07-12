@@ -128,6 +128,17 @@ def run_cron():
         eo = sweep_escalation_response_overdue(db)
         print(f"- Support escalation sweep: {ae} auto-escalated, {eo} response-overdue nudge(s).")
 
+        # 15b. Support Desk: time-based automation rules — admin-configured escalation
+        #      policies ("open past X mins at priority Y → escalate to tier Z / notify").
+        #      Runs AFTER the breach sweep so freshly-flagged tickets are visible to
+        #      rule conditions. Idempotent per (ticket, rule) via rule_fired activities;
+        #      the Queues overview/tier boards also run it opportunistically.
+        from app.utils.support_desk.rules import sweep_time_based_rules
+        tb = sweep_time_based_rules(db)
+        if tb:
+            db.commit()
+        print(f"- Support time-based rules: fired on {tb} ticket(s).")
+
         # 16. Support Desk: retention sweep — auto-archive CLOSED records older than
         #     SUPPORT_CLOSED_AUTOARCHIVE_DAYS into deep storage (auto_retention; legal-hold
         #     exempt). Runs AFTER the auto-close sweep so a record can close and age out in

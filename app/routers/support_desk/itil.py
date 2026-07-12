@@ -120,12 +120,66 @@ def delete_change(cid: UUID, db: Session = Depends(get_db), admin: User = Depend
 problem_router = APIRouter(prefix="/support-desk/problems", tags=["Support Desk — Problem Management"])
 
 
+def _require_problem_actor(db: Session, p: SdProblem, admin: User, action: str = "modify it") -> None:
+    """Owner-tier gate for problem MUTATIONS. Reads stay desk-wide (the KEDB is shared
+    knowledge), but rewriting a problem — root cause, status, workaround, links, delete,
+    cascade — is reserved to a superuser, the problem's owner or creator, or an agent who
+    commands at least one of its linked incidents (the teams actually working the recurring
+    tickets). A passing agent who can merely SEE a KEDB entry must not be able to rewrite or
+    close it (previously every route was get_support_agent with no scope at all)."""
+    if getattr(admin, "is_superuser", False):
+        return
+    uid = str(admin.id)
+    if (p.owner_id and str(p.owner_id) == uid) or (p.created_by_id and str(p.created_by_id) == uid):
+        return
+    from app.routers.support_desk.tickets import _get_ticket, _require_ticket_actor
+    for raw in (p.linked_ticket_ids or []):
+        try:
+            tid = UUID(str(raw))
+        except (ValueError, TypeError):
+            continue
+        try:
+            t = _get_ticket(db, tid, admin)                       # team seal (404 outside scope)
+            _require_ticket_actor(db, t, admin, "manage the linked problem")
+            return                                                # commands ≥1 linked incident
+        except HTTPException:
+            continue
+    raise HTTPException(
+        403, f"Only the problem owner, an agent working a linked ticket, or an admin can {action}.")
+
+
 @problem_router.get("/", response_model=List[ProblemResponse])
-def list_problems(status_f: Optional[str] = None, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+def list_problems(status_f: Optional[str] = None,
+                  q: Optional[str] = None,
+                  known_only: bool = False,
+                  limit: int = 200,
+                  db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    """Problem roster + the KEDB lookup ("has this been seen before?"): ``q`` searches
+    number/title/description/root-cause/workaround; ``known_only`` narrows to the
+    Known-Error DB (status=known_error OR a published workaround)."""
+    from sqlalchemy import or_
     query = db.query(SdProblem).filter(SdProblem.is_deleted == False)  # noqa: E712
     if status_f:
         query = query.filter(SdProblem.status == status_f)
-    return query.order_by(SdProblem.created_at.desc()).all()
+    if known_only:
+        query = query.filter(or_(SdProblem.status == ProblemStatus.KNOWN_ERROR.value,
+                                 SdProblem.workaround_published == True))  # noqa: E712
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        query = query.filter(or_(SdProblem.problem_number.ilike(like),
+                                 SdProblem.title.ilike(like),
+                                 SdProblem.description.ilike(like),
+                                 SdProblem.root_cause.ilike(like),
+                                 SdProblem.workaround.ilike(like)))
+    rows = query.order_by(SdProblem.created_at.desc()).limit(max(1, min(limit, 500))).all()
+    names = {}
+    ids = {r.owner_id for r in rows if r.owner_id}
+    if ids:
+        names = {str(u.id): (u.full_name or u.email) for u in
+                 db.query(User).filter(User.id.in_(ids)).all()}
+    for r in rows:
+        r.owner_name = names.get(str(r.owner_id)) if r.owner_id else None
+    return rows
 
 
 @problem_router.post("/", response_model=ProblemResponse, status_code=status.HTTP_201_CREATED)
@@ -135,6 +189,9 @@ def create_problem(payload: ProblemCreate, request: Request, db: Session = Depen
     for key in ("linked_ticket_ids", "linked_change_ids", "linked_asset_ids"):
         if key in data and data[key] is not None:
             data[key] = [str(x) for x in data[key]]
+    # Default owner to the creator so they retain owner-tier edit rights (see
+    # _require_problem_actor) — an admin can reassign ownership later.
+    data.setdefault("owner_id", admin.id)
     p = SdProblem(**data, problem_number=_number(db, NUMBERING_MODULE_PROBLEM, "PRB"),
                   created_by_id=admin.id, status=ProblemStatus.OPEN.value)
     db.add(p)
@@ -159,6 +216,7 @@ def update_problem(pid: UUID, payload: ProblemUpdate, request: Request, db: Sess
     p = db.query(SdProblem).filter(SdProblem.id == pid, SdProblem.is_deleted == False).first()  # noqa: E712
     if not p:
         raise HTTPException(404, "Problem not found")
+    _require_problem_actor(db, p, admin, "modify it")
     data = payload.model_dump(exclude_unset=True)
     for key in ("linked_ticket_ids", "linked_change_ids", "linked_asset_ids"):
         if key in data and data[key] is not None:
@@ -176,6 +234,7 @@ def delete_problem(pid: UUID, db: Session = Depends(get_db), admin: User = Depen
     p = db.query(SdProblem).filter(SdProblem.id == pid, SdProblem.is_deleted == False).first()  # noqa: E712
     if not p:
         raise HTTPException(404, "Problem not found")
+    _require_problem_actor(db, p, admin, "delete it")
     p.is_deleted = True
     db.commit()
     return None

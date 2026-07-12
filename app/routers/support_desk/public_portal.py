@@ -22,6 +22,8 @@ from app.models.support_desk.constants import (
 )
 from app.schemas.support_desk.ticket import PublicTicketCreate, PublicCommentCreate
 from app.utils.support_desk import sla as sla_util
+from app.utils.support_desk.assignment import route_and_assign
+from app.utils.support_desk.rules import evaluate_rules, apply_default_queue
 from app.utils.support_desk.audit import write_audit
 from app.routers.support_desk._common import (
     generate_ticket_number, resolve_sla_package, reactivate_on_customer_reply,
@@ -148,6 +150,12 @@ def submit_public_ticket(payload: PublicTicketCreate, request: Request, db: Sess
     db.flush()
     db.add(SdTicketActivity(ticket_id=t.id, actor_name=payload.contact_name or payload.email or "Client",
                             action="created", detail={"via": "public_portal"}))
+    # Routing chain (first-match): automation rules → category/type router →
+    # default-queue fallback — portal tickets must land in a queue like any other
+    # intake instead of sitting invisible outside every team's seal. Best-effort.
+    evaluate_rules(db, t)
+    route_and_assign(db, t)
+    apply_default_queue(db, t)
     write_audit(db, entity_type="ticket", op="created", entity_id=t.id, request=request,
                 details={"via": "public_portal", "org_code": code})
     db.commit()

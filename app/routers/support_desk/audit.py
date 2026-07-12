@@ -9,9 +9,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from sqlalchemy import and_, or_
+
 from app.database import get_db
 from app.models.user import User
 from app.models.audit_log import AuditLog
+from app.models.support_desk.ticket import SdTicket
 from app.utils.dependencies import get_support_agent
 
 router = APIRouter(prefix="/support-desk/audit-logs", tags=["Support Desk — Audit Logs"])
@@ -28,6 +31,22 @@ def list_audit_logs(
     admin: User = Depends(get_support_agent),
 ):
     query = db.query(AuditLog).filter(AuditLog.action.like("support.%"))
+
+    # Team-seal (was a desk-wide leak): a non-superuser agent must not page the whole
+    # desk's audit trail. Scope them to the ticket ledger the agent UI is built for —
+    # audit rows for tickets in their _agent_scope — plus their own actions on any
+    # entity. Cross-team ticket trails and desk-wide config audit (problems / queues /
+    # teams / changes) stay superuser-only. entity_type is stored as "support.<entity>"
+    # (see utils/support_desk/audit.write_audit).
+    if not getattr(admin, "is_superuser", False):
+        from app.routers.support_desk.tickets import _agent_scope
+        cond, _ctx = _agent_scope(db, admin)
+        scoped_ticket_ids = db.query(SdTicket.id).filter(cond).scalar_subquery()
+        query = query.filter(or_(
+            and_(AuditLog.entity_type == "support.ticket",
+                 AuditLog.entity_id.in_(scoped_ticket_ids)),
+            AuditLog.user_id == admin.id,
+        ))
     if action:
         query = query.filter(AuditLog.action == action)
     if entity_type:

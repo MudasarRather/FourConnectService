@@ -230,6 +230,30 @@ class HoldReason(str, enum.Enum):
 
 HOLD_REASON_CODES = [r.value for r in HoldReason]
 
+
+class SkipReason(str, enum.Enum):
+    """Play-mode skip reasons (Zendesk guided-mode skip audit)."""
+    NOT_MY_SKILL = "not_my_skill"
+    NEED_INFO = "need_info"
+    DUPLICATE_SUSPECT = "duplicate_suspect"
+    BLOCKED = "blocked"
+    OTHER = "other"
+
+
+SKIP_REASON_CODES = [r.value for r in SkipReason]
+
+# Tier de-escalation (send-back) reasons — L2→L1 / L3→L2 returns are reason-coded so
+# the receiving tier knows WHY the ticket came back.
+class TierDescendReason(str, enum.Enum):
+    RESOLVED_AT_TIER = "resolved_at_tier"
+    MISROUTED = "misrouted"
+    NEEDS_BASIC_TROUBLESHOOTING = "needs_basic_troubleshooting"
+    CUSTOMER_ACTION_DONE = "customer_action_done"
+    OTHER = "other"
+
+
+TIER_DESCEND_REASON_CODES = [r.value for r in TierDescendReason]
+
 # A ticket on hold this many days without a hold review (extend/re-confirm) is flagged
 # STALE — surfaced on the On-Hold board and nudged by the stale-hold sweep. Holds with a
 # hold_until release date auto-resume via the expiry sweep instead.

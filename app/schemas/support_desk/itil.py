@@ -70,6 +70,9 @@ class ProblemCreate(BaseModel):
     resolution_plan: Optional[str] = None
     preventive_measures: Optional[str] = None
     lessons_learned: Optional[str] = None
+    workaround: Optional[str] = None
+    workaround_published: bool = False
+    owner_id: Optional[UUID] = None
 
 
 class ProblemUpdate(BaseModel):
@@ -86,6 +89,9 @@ class ProblemUpdate(BaseModel):
     resolution_plan: Optional[str] = None
     preventive_measures: Optional[str] = None
     lessons_learned: Optional[str] = None
+    workaround: Optional[str] = None
+    workaround_published: Optional[bool] = None
+    owner_id: Optional[UUID] = None
 
 
 class ProblemResponse(BaseModel):
@@ -105,9 +111,14 @@ class ProblemResponse(BaseModel):
     resolution_plan: Optional[str] = None
     preventive_measures: Optional[str] = None
     lessons_learned: Optional[str] = None
+    workaround: Optional[str] = None
+    workaround_published: bool = False
+    owner_id: Optional[UUID] = None
     created_by_id: Optional[UUID] = None
     created_at: datetime
     updated_at: datetime
+    owner_name: Optional[str] = None
+    organization_name: Optional[str] = None
 
 
 # ─────────── Customer Asset ───────────

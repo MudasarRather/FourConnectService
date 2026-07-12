@@ -2,10 +2,20 @@
 
 Deadlines are derived from an SLA package's priority matrix at ticket creation;
 display states are computed on read. Pure functions — no DB writes here.
+
+Coverage calendars (SdSlaPackage.coverage): with mode="business_hours" the SLA
+clock only runs inside the configured window (tz + weekdays + start/end, minus
+holidays) — a ticket raised on a Sunday or a holiday starts its clock at the next
+covered minute, so weekends/holidays can never breach an 8x5 desk. Empty/{} or
+mode="24x7" keeps the legacy wall-clock behaviour; per-priority overrides let a
+critical tier stay 24x7 on an otherwise business-hours package. Deadlines stay
+ABSOLUTE instants (all downstream SQL filters / sweeps / sorts unchanged) — the
+calendar only decides where the deadline lands.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
+from zoneinfo import ZoneInfo
 
 from app.models.support_desk.constants import SLA_PAUSE_STATUSES
 
@@ -60,19 +70,142 @@ def apply_pause_transition(ticket, old_status: str, new_status: str, ref: dateti
         ticket.sla_paused_since = None
 
 
+# ─────────────────────────── Coverage calendar ───────────────────────────
+
+COVERAGE_MODES = {"24x7", "business_hours"}
+
+# Hard iteration cap for the day-walk: 2 years of consecutive non-covered days means the
+# calendar is misconfigured (e.g. every day a holiday) — fall back to wall-clock rather
+# than looping forever or stalling the deadline out to infinity.
+_MAX_WALK_DAYS = 750
+
+
+def _parse_hhmm(s, default: dtime) -> dtime:
+    try:
+        hh, mm = str(s).strip().split(":")
+        return dtime(int(hh), int(mm))
+    except Exception:
+        return default
+
+
+def resolve_coverage(package, priority: str) -> dict | None:
+    """The effective coverage calendar for this (package, priority), or None for 24x7.
+
+    None ⇒ legacy wall-clock math. A business_hours dict is returned only when it is
+    actually usable (a real window); degenerate configs (no days, start==end, bad tz)
+    fail OPEN to 24x7 — a broken calendar must never freeze the desk's clocks.
+    """
+    cov = getattr(package, "coverage", None) or {}
+    if not isinstance(cov, dict) or not cov:
+        return None
+    mode = cov.get("mode") or "24x7"
+    over = cov.get("priority_overrides") or {}
+    if isinstance(over, dict) and priority and over.get(str(priority)) in COVERAGE_MODES:
+        mode = over[str(priority)]
+    if mode != "business_hours":
+        return None
+    days = [int(d) for d in (cov.get("days") or []) if str(d).strip().isdigit() and 1 <= int(d) <= 7]
+    if not days:
+        return None
+    start_t = _parse_hhmm(cov.get("start"), dtime(9, 0))
+    end_t = _parse_hhmm(cov.get("end"), dtime(18, 0))
+    if (end_t.hour, end_t.minute) <= (start_t.hour, start_t.minute):
+        return None
+    try:
+        tz = ZoneInfo(str(cov.get("tz") or "UTC"))
+    except Exception:
+        tz = timezone.utc
+    holidays = {str(h).strip() for h in (cov.get("holidays") or []) if str(h).strip()}
+    return {"tz": tz, "days": set(days), "start": start_t, "end": end_t, "holidays": holidays}
+
+
+def add_covered_minutes(start: datetime, minutes: int, cov: dict) -> datetime:
+    """Advance ``minutes`` of COVERED time from ``start`` under a resolved business-hours
+    calendar (skipping nights, off-days and holidays), returning an absolute UTC instant.
+
+    A ticket raised outside coverage (Sunday night, a holiday) starts its clock at the
+    next covered minute — so the deadline lands inside working hours, never on a day
+    nobody is rostered."""
+    tz, days, w_start, w_end, holidays = cov["tz"], cov["days"], cov["start"], cov["end"], cov["holidays"]
+    cursor = _aware(start).astimezone(tz)
+    remaining = timedelta(minutes=int(minutes))
+
+    for _ in range(_MAX_WALK_DAYS):
+        day = cursor.date()
+        covered_day = (day.isoweekday() in days) and (day.isoformat() not in holidays)
+        if covered_day:
+            win_open = datetime.combine(day, w_start, tzinfo=tz)
+            win_close = datetime.combine(day, w_end, tzinfo=tz)
+            if cursor < win_open:
+                cursor = win_open
+            if cursor < win_close:
+                available = win_close - cursor
+                if remaining <= available:
+                    return (cursor + remaining).astimezone(timezone.utc)
+                remaining -= available
+        # jump to the next day's window start
+        nxt = day + timedelta(days=1)
+        cursor = datetime.combine(nxt, w_start, tzinfo=tz)
+
+    # Misconfigured calendar (nothing covered for 2 years) — wall-clock fallback.
+    return (_aware(start) + timedelta(minutes=int(minutes))).astimezone(timezone.utc)
+
+
+def validate_coverage(cov) -> str | None:
+    """Validate an inbound coverage payload; returns an error string or None when OK.
+    Used by the SLA package create/update routes (422 on bad config)."""
+    import re as _re
+    if cov in (None, {}):
+        return None
+    if not isinstance(cov, dict):
+        return "coverage must be an object"
+    mode = cov.get("mode") or "24x7"
+    if mode not in COVERAGE_MODES:
+        return f"coverage.mode must be one of {sorted(COVERAGE_MODES)}"
+    over = cov.get("priority_overrides")
+    if over is not None:
+        if not isinstance(over, dict) or any(v not in COVERAGE_MODES for v in over.values()):
+            return "coverage.priority_overrides values must be '24x7' or 'business_hours'"
+    if mode != "business_hours":
+        return None
+    days = cov.get("days") or []
+    if not isinstance(days, list) or not days or any(not str(d).strip().isdigit() or not 1 <= int(d) <= 7 for d in days):
+        return "coverage.days must be a non-empty list of ISO weekdays (1=Mon … 7=Sun)"
+    hhmm = _re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+    if not hhmm.match(str(cov.get("start") or "")) or not hhmm.match(str(cov.get("end") or "")):
+        return "coverage.start / coverage.end must be HH:MM (24h)"
+    st, en = _parse_hhmm(cov.get("start"), dtime(9, 0)), _parse_hhmm(cov.get("end"), dtime(18, 0))
+    if (en.hour, en.minute) <= (st.hour, st.minute):
+        return "coverage.end must be after coverage.start (overnight windows aren't supported)"
+    try:
+        ZoneInfo(str(cov.get("tz") or "UTC"))
+    except Exception:
+        return f"coverage.tz '{cov.get('tz')}' is not a valid IANA timezone"
+    for h in (cov.get("holidays") or []):
+        if not _re.match(r"^\d{4}-\d{2}-\d{2}$", str(h).strip()):
+            return f"coverage.holidays entries must be YYYY-MM-DD (got '{h}')"
+    return None
+
+
 def compute_deadlines(package, priority: str, start: datetime | None = None):
     """Return (response_due_at, resolution_due_at) for a priority on a package.
 
     ``package`` is an SdSlaPackage (or None). Missing rows → (None, None) so the
-    ticket simply has no SLA clock rather than erroring.
-    """
+    ticket simply has no SLA clock rather than erroring. When the package carries a
+    business-hours coverage calendar the target minutes are counted in COVERED time
+    (see add_covered_minutes); otherwise legacy wall-clock addition."""
     start = start or now_utc()
     matrix = getattr(package, "matrix", None) or {}
     row = matrix.get(priority) or matrix.get(str(priority)) or {}
     resp = row.get("response_mins")
     reso = row.get("resolution_mins")
-    response_due = start + timedelta(minutes=int(resp)) if resp else None
-    resolution_due = start + timedelta(minutes=int(reso)) if reso else None
+    cov = resolve_coverage(package, priority)
+    if cov is None:
+        response_due = start + timedelta(minutes=int(resp)) if resp else None
+        resolution_due = start + timedelta(minutes=int(reso)) if reso else None
+        return response_due, resolution_due
+    response_due = add_covered_minutes(start, int(resp), cov) if resp else None
+    resolution_due = add_covered_minutes(start, int(reso), cov) if reso else None
     return response_due, resolution_due
 
 

@@ -69,7 +69,11 @@ class SdTicketViewer(Base):
 
 
 class SdQueue(Base):
-    """A work queue — skill/level-based intake bucket, optionally owned by a team."""
+    """A work queue — skill/level-based intake bucket, optionally owned by a team.
+
+    Queue-engine columns (``tier`` … ``business_hours``) land on the live DB via
+    ``add_support_queue_engine_columns.py`` (create_all never alters existing tables).
+    """
     __tablename__ = "support_queues"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
@@ -82,6 +86,22 @@ class SdQueue(Base):
     assignment_method = Column(String(20), nullable=False, default="round_robin")  # manual | round_robin | load_balanced
     category_ids = Column(JSONB, nullable=False, default=list)     # categories this queue routes [category_uuid, ...]
     rr_last_user_id = Column(UUID(as_uuid=True), nullable=True)    # round-robin cursor (last auto-assigned member)
+
+    # ── Queue engine (ServiceNow AWA / Zendesk omnichannel semantics) ──
+    tier = Column(Integer, nullable=True, index=True)              # 1|2|3 support tier; NULL = untiered specialty queue
+    skill_ids = Column(JSONB, nullable=False, default=list)        # skills required for auto-assignment [skill_uuid, ...]
+    serve_order = Column(String(20), nullable=False, default="priority_age")  # priority_age | sla_breach (play-mode serve policy)
+    queue_priority = Column(Integer, nullable=False, default=50)   # 1-100 cross-queue drain order (higher drains first)
+    max_agent_load = Column(Integer, nullable=True)                # per-agent open-ticket soft cap for load_balanced
+    is_default = Column(Boolean, nullable=False, default=False)    # the un-deletable fallback queue (at most one)
+    business_hours = Column(JSONB, nullable=True)                  # {tz, days, start, end} override; falls back to team's
+
+    # ── Config v2 (ServiceNow/Zendesk parity — land on the live DB via
+    #    ``add_support_queue_config_v2_columns.py``; create_all never alters) ──
+    sla_package_id = Column(UUID(as_uuid=True), ForeignKey("support_sla_packages.id"), nullable=True)  # per-queue SLA policy
+    capacity_limit = Column(Integer, nullable=True)                # open-ticket cap; NULL = unlimited
+    overflow_queue_id = Column(UUID(as_uuid=True), nullable=True)  # spill target when at capacity (one hop, no chains)
+
     is_active = Column(Boolean, nullable=False, default=True, index=True)
     is_deleted = Column(Boolean, nullable=False, default=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -89,6 +109,63 @@ class SdQueue(Base):
 
     def __repr__(self):
         return f"<SdQueue {self.code or self.name}>"
+
+
+class SdSkill(Base):
+    """A routing skill (Zendesk skills-based routing). ``agent_ids`` is a JSONB roster
+    (same style as ``SdTeam.member_ids``) — the agents who hold this skill. Queues
+    reference skills via ``SdQueue.skill_ids``; auto-assignment prefers agents holding
+    ALL of a queue's skills and fails open to the whole team when none qualify."""
+    __tablename__ = "support_skills"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    name = Column(String(120), nullable=False)
+    code = Column(String(40), nullable=True, unique=True, index=True)
+    description = Column(Text, nullable=True)
+    color = Column(String(20), nullable=True)
+    agent_ids = Column(JSONB, nullable=False, default=list)        # [user_id, ...]
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    is_deleted = Column(Boolean, nullable=False, default=False, index=True)
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<SdSkill {self.code or self.name}>"
+
+
+class SdAgentStatus(Base):
+    """Unified agent status (Zendesk agent statuses). One row per agent; absent row
+    reads as 'online' so the desk works before anyone touches the toggle. Auto-assign
+    skips away/offline agents and fails open to everyone when nobody is online."""
+    __tablename__ = "support_agent_status"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    status = Column(String(16), nullable=False, default="online")  # online | away | focus | offline
+    status_note = Column(String(200), nullable=True)
+    changed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<SdAgentStatus {self.user_id}:{self.status}>"
+
+
+class SdTicketSkip(Base):
+    """One row per play-mode skip (Zendesk skip-with-reason audit). Serve-next excludes
+    a ticket the caller skipped today; supervisors read the per-agent skip report."""
+    __tablename__ = "support_ticket_skips"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    ticket_id = Column(UUID(as_uuid=True), ForeignKey("support_tickets.id"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    reason_code = Column(String(40), nullable=False)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    __table_args__ = (Index("ix_support_ticket_skips_user_day", "user_id", "created_at"),)
+
+    def __repr__(self):
+        return f"<SdTicketSkip {self.ticket_id}:{self.user_id}>"
 
 
 class SdSavedView(Base):

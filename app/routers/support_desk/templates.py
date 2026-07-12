@@ -203,11 +203,18 @@ def list_templates(
 # ─────────────────────────── Stats (sealed hero aggregate) ───────────────────────────
 @templates_router.get("/stats", response_model=TemplateStatsResponse)
 def template_stats(db: Session = Depends(get_db), user: User = Depends(get_support_agent)):
-    base = db.query(SdTicketTemplate).filter(SdTicketTemplate.is_deleted == False)  # noqa: E712
+    # Visibility seal (was a leak): the template LIST sealed non-superusers via
+    # _scope_filter, but the stats hero aggregated over EVERY template — leaking other
+    # agents' personal plates and other teams' names/icons/usage through top_used /
+    # recently_used / coverage. Thread the same scope through every template-identity
+    # aggregate so the hero shows only what the caller could open in the list.
+    tpl_scope = [] if getattr(user, "is_superuser", False) else [_scope_filter(db, user)]
+
+    base = db.query(SdTicketTemplate).filter(SdTicketTemplate.is_deleted == False, *tpl_scope)  # noqa: E712
 
     by_status = dict(
         db.query(SdTicketTemplate.status, func.count(SdTicketTemplate.id))
-        .filter(SdTicketTemplate.is_deleted == False)  # noqa: E712
+        .filter(SdTicketTemplate.is_deleted == False, *tpl_scope)  # noqa: E712
         .group_by(SdTicketTemplate.status)
         .all()
     )
@@ -218,7 +225,7 @@ def template_stats(db: Session = Depends(get_db), user: User = Depends(get_suppo
 
     usage_total = int(
         db.query(func.coalesce(func.sum(SdTicketTemplate.usage_count), 0))
-        .filter(SdTicketTemplate.is_deleted == False)  # noqa: E712
+        .filter(SdTicketTemplate.is_deleted == False, *tpl_scope)  # noqa: E712
         .scalar() or 0
     )
     unused = base.filter(
@@ -238,7 +245,8 @@ def template_stats(db: Session = Depends(get_db), user: User = Depends(get_suppo
                          usage_count=r[4] or 0, last_used_at=r[5], status=r[6] or "active")
         for r in db.query(*chip_cols)
         .filter(SdTicketTemplate.is_deleted == False,  # noqa: E712
-                SdTicketTemplate.status == "active", SdTicketTemplate.usage_count > 0)
+                SdTicketTemplate.status == "active", SdTicketTemplate.usage_count > 0,
+                *tpl_scope)
         .order_by(SdTicketTemplate.usage_count.desc()).limit(5).all()
     ]
     recently_used = [
@@ -246,7 +254,7 @@ def template_stats(db: Session = Depends(get_db), user: User = Depends(get_suppo
                          usage_count=r[4] or 0, last_used_at=r[5], status=r[6] or "active")
         for r in db.query(*chip_cols)
         .filter(SdTicketTemplate.is_deleted == False,  # noqa: E712
-                SdTicketTemplate.last_used_at.isnot(None))
+                SdTicketTemplate.last_used_at.isnot(None), *tpl_scope)
         .order_by(SdTicketTemplate.last_used_at.desc()).limit(5).all()
     ]
 
@@ -255,7 +263,7 @@ def template_stats(db: Session = Depends(get_db), user: User = Depends(get_suppo
         db.query(SdTicketTemplate.category_id, func.count(SdTicketTemplate.id))
         .filter(SdTicketTemplate.is_deleted == False,  # noqa: E712
                 SdTicketTemplate.status == "active",
-                SdTicketTemplate.category_id.isnot(None))
+                SdTicketTemplate.category_id.isnot(None), *tpl_scope)
         .group_by(SdTicketTemplate.category_id).all()
     )
     cat_names = {}
@@ -274,7 +282,7 @@ def template_stats(db: Session = Depends(get_db), user: User = Depends(get_suppo
         db.query(SdTicketTemplate.team_id, func.count(SdTicketTemplate.id))
         .filter(SdTicketTemplate.is_deleted == False,  # noqa: E712
                 SdTicketTemplate.status == "active",
-                SdTicketTemplate.team_id.isnot(None))
+                SdTicketTemplate.team_id.isnot(None), *tpl_scope)
         .group_by(SdTicketTemplate.team_id).all()
     )
     team_names = {}

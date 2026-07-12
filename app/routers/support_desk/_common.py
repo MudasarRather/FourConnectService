@@ -33,6 +33,10 @@ def _notify_safe(db: Session, event: str, recipient_user_id, ticket: SdTicket, *
         return
     try:
         from app.utils.hr.notify import dispatch
+        from app.utils.support_desk import wires
+        wires.post_webhook(db, event, ticket, title)
+        if not wires.allows(db, event):
+            return
         deep = f"{action_url}{'&' if '?' in action_url else '?'}ticket={ticket.id}"
         dispatch(db, event, recipient_user_id,
                  context={"title": title, "message": f"{ticket.ticket_number}: {ticket.subject}", "action_url": deep},

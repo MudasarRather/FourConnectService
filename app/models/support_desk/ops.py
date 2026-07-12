@@ -32,10 +32,16 @@ class SdAnnouncement(Base):
 
 
 class SdAutomationRule(Base):
-    """Condition → action rule. Evaluated on ticket create (Phase 6 wires the engine).
+    """Condition → action rule, evaluated by ``app.utils.support_desk.rules``.
 
     ``conditions`` shape: [{"field":"priority","op":"eq","value":"critical"}, ...]
-    ``actions`` shape: [{"type":"assign_team","value":"Infrastructure"}, ...]
+    ``actions`` shape: [{"type":"route_queue","value":"<queue_uuid>"}, ...]
+
+    ``trigger``: 'on_create' rules run first-match at ticket creation (before the
+    category/type fallback router); 'time_based' rules double as auto-escalation
+    policies — swept against open tickets whose age exceeds ``time_threshold_mins``.
+    ``stop_processing``: True = first-match semantics; False = fall-through so later
+    rules may still fire. New columns land via ``add_support_queue_engine_columns.py``.
     """
     __tablename__ = "support_automation_rules"
 
@@ -46,6 +52,9 @@ class SdAutomationRule(Base):
     conditions = Column(JSONB, nullable=False, default=list)
     actions = Column(JSONB, nullable=False, default=list)
     order_index = Column(Integer, nullable=False, default=0)
+    trigger = Column(String(16), nullable=False, default="on_create")  # on_create | time_based
+    stop_processing = Column(Boolean, nullable=False, default=True)
+    time_threshold_mins = Column(Integer, nullable=True)               # time_based: minimum open age
     is_active = Column(Boolean, nullable=False, default=True, index=True)
     last_run_at = Column(DateTime(timezone=True), nullable=True)
     run_count = Column(Integer, nullable=False, default=0)
@@ -53,6 +62,28 @@ class SdAutomationRule(Base):
     is_deleted = Column(Boolean, nullable=False, default=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class SdRuleRevision(Base):
+    """One row per routing-rule change (ServiceNow-style config versioning).
+
+    ``snapshot`` is the rule's FULL state AFTER the change (``action`` says what
+    happened); ``version`` counts up per rule. NEW table — auto-created by
+    ``Base.metadata.create_all()``. Powers the Queue Config "Ledger" panel's
+    per-rule history + diff view.
+    """
+    __tablename__ = "support_rule_revisions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    rule_id = Column(UUID(as_uuid=True), ForeignKey("support_automation_rules.id"), nullable=False, index=True)
+    version = Column(Integer, nullable=False, default=1)
+    action = Column(String(16), nullable=False, default="updated")  # created | updated | deleted
+    snapshot = Column(JSONB, nullable=False, default=dict)
+    changed_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<SdRuleRevision {self.rule_id} v{self.version} {self.action}>"
 
 
 class SdSetting(Base):

@@ -45,6 +45,14 @@ from app.routers.support_desk.workspace import (
     queues_router as _queues_router,
     saved_views_router as _saved_views_router,
 )
+from app.routers.support_desk.queue_ops import (
+    skills_router as _skills_router,
+    agent_status_router as _agent_status_router,
+    queue_ops_router as _queue_ops_router,
+    ticket_tier_router as _ticket_tier_router,
+)
+from app.routers.support_desk.l2_ops import l2_router as _l2_router
+from app.routers.support_desk.l3_ops import l3_router as _l3_router
 from app.routers.support_desk.templates import templates_router as _templates_router
 from app.routers.support_desk.tickets import router as _tickets_router
 
@@ -83,7 +91,20 @@ router.include_router(_integrations_router)  # /tickets/{id}/to-task, /service-r
 
 # Phase-3 workspace entities
 router.include_router(_teams_router)
+# Queue Engine: literal /queues/{overview,tier/*} routes register BEFORE the CRUD
+# queues router, and /tickets/{id}/{skip,tier-*} + /tickets/skip-report BEFORE the
+# broad tickets router (route-shadowing discipline).
+router.include_router(_queue_ops_router)
 router.include_router(_queues_router)
+router.include_router(_skills_router)
+router.include_router(_agent_status_router)
+router.include_router(_ticket_tier_router)
+# L2 workbench (/tickets/{id}/{worklogs,watch,watchers,swarm*}) — literal suffixes,
+# registered before the broad tickets router like the tier routes above.
+router.include_router(_l2_router)
+# L3 workbench (/tickets/{id}/handoff-dossier + /problems/{pid}/resolve-linked) —
+# literal suffixes, registered before the broad tickets router like l2_ops above.
+router.include_router(_l3_router)
 router.include_router(_saved_views_router)
 router.include_router(_templates_router)
 

@@ -55,6 +55,12 @@ class SdProblem(Base):
     resolution_plan = Column(Text, nullable=True)
     preventive_measures = Column(Text, nullable=True)
     lessons_learned = Column(Text, nullable=True)
+    # Known-Error DB (L3 workbench): the interim fix lower tiers can apply while the
+    # permanent fix ships, and whether it's published to them. Owner = the accountable
+    # L3 engineer. Columns exist in the live DB via add_support_problem_kedb_columns.py.
+    workaround = Column(Text, nullable=True)
+    workaround_published = Column(Boolean, nullable=False, default=False)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     is_deleted = Column(Boolean, nullable=False, default=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

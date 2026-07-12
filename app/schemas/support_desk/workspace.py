@@ -174,6 +174,33 @@ class TeamsOverviewResponse(BaseModel):
 
 
 # ─────────────────────────── Queue ───────────────────────────
+_SERVE_ORDERS = {"priority_age", "sla_breach"}
+
+
+def _check_tier(v):
+    if v is not None and v not in (1, 2, 3):
+        raise ValueError("tier must be 1, 2 or 3 (or null for an untiered queue)")
+    return v
+
+
+def _check_serve_order(v):
+    if v is not None and v not in _SERVE_ORDERS:
+        raise ValueError(f"serve_order must be one of {sorted(_SERVE_ORDERS)}")
+    return v
+
+
+def _check_queue_priority(v):
+    if v is not None and not (1 <= int(v) <= 100):
+        raise ValueError("queue_priority must be between 1 and 100")
+    return v
+
+
+def _check_capacity(v):
+    if v is not None and int(v) < 1:
+        raise ValueError("capacity_limit must be at least 1 (leave it empty for unlimited)")
+    return v
+
+
 class QueueCreate(BaseModel):
     name: str
     code: Optional[str] = None
@@ -183,8 +210,24 @@ class QueueCreate(BaseModel):
     auto_assign: bool = False
     assignment_method: str = "round_robin"   # manual | round_robin | load_balanced
     category_ids: List[UUID] = Field(default_factory=list)
+    # queue engine
+    tier: Optional[int] = None               # 1|2|3 support tier
+    skill_ids: List[UUID] = Field(default_factory=list)
+    serve_order: str = "priority_age"        # priority_age | sla_breach
+    queue_priority: int = 50                 # 1-100 cross-queue drain order
+    max_agent_load: Optional[int] = None
+    is_default: bool = False
+    business_hours: Optional[Dict[str, Any]] = None
+    # config v2
+    sla_package_id: Optional[UUID] = None      # per-queue SLA policy (org > queue > default)
+    capacity_limit: Optional[int] = None       # open-ticket cap; None = unlimited
+    overflow_queue_id: Optional[UUID] = None   # spill target when at capacity
 
     _v_method = field_validator("assignment_method")(_check_assignment_method)
+    _v_tier = field_validator("tier")(_check_tier)
+    _v_serve = field_validator("serve_order")(_check_serve_order)
+    _v_qpri = field_validator("queue_priority")(_check_queue_priority)
+    _v_cap = field_validator("capacity_limit")(_check_capacity)
 
 
 class QueueUpdate(BaseModel):
@@ -197,8 +240,27 @@ class QueueUpdate(BaseModel):
     assignment_method: Optional[str] = None
     category_ids: Optional[List[UUID]] = None
     is_active: Optional[bool] = None
+    # queue engine
+    tier: Optional[int] = None
+    skill_ids: Optional[List[UUID]] = None
+    serve_order: Optional[str] = None
+    queue_priority: Optional[int] = None
+    max_agent_load: Optional[int] = None
+    is_default: Optional[bool] = None
+    business_hours: Optional[Dict[str, Any]] = None
+    # config v2
+    sla_package_id: Optional[UUID] = None
+    capacity_limit: Optional[int] = None
+    overflow_queue_id: Optional[UUID] = None
+    # Delete/deactivate directive (not a column — popped by the router): where open
+    # tickets go when this queue is removed.
+    reassign_to: Optional[UUID] = None
 
     _v_method = field_validator("assignment_method")(_check_assignment_method)
+    _v_tier = field_validator("tier")(_check_tier)
+    _v_serve = field_validator("serve_order")(_check_serve_order)
+    _v_qpri = field_validator("queue_priority")(_check_queue_priority)
+    _v_cap = field_validator("capacity_limit")(_check_capacity)
 
 
 class QueueResponse(BaseModel):
@@ -214,9 +276,239 @@ class QueueResponse(BaseModel):
     category_ids: List[Any] = Field(default_factory=list)
     is_active: bool
     created_at: datetime
+    # queue engine (all defaulted — stable against pre-migration rows)
+    tier: Optional[int] = None
+    skill_ids: List[Any] = Field(default_factory=list)
+    serve_order: str = "priority_age"
+    queue_priority: int = 50
+    max_agent_load: Optional[int] = None
+    is_default: bool = False
+    business_hours: Optional[Dict[str, Any]] = None
+    # config v2 (all defaulted — stable against pre-migration rows)
+    sla_package_id: Optional[UUID] = None
+    capacity_limit: Optional[int] = None
+    overflow_queue_id: Optional[UUID] = None
     # enriched
     team_name: Optional[str] = None
     open_ticket_count: Optional[int] = None
+
+
+# ───────────── Queue engine — overview / stats / tier board / skills ─────────────
+class QueueFlowPoint(BaseModel):
+    day: datetime
+    inflow: int = 0
+    outflow: int = 0
+
+
+class QueueOverviewCard(BaseModel):
+    id: UUID
+    name: str
+    code: Optional[str] = None
+    color: Optional[str] = None
+    tier: Optional[int] = None
+    is_active: bool = True
+    is_default: bool = False
+    auto_assign: bool = False
+    assignment_method: str = "round_robin"
+    serve_order: str = "priority_age"
+    queue_priority: int = 50
+    team_id: Optional[UUID] = None
+    team_name: Optional[str] = None
+    category_count: int = 0
+    skill_count: int = 0
+    rule_count: int = 0                       # active routing rules targeting this queue
+    agents_total: int = 0
+    agents_online: int = 0
+    coverage_open: Optional[bool] = None      # inside business hours right now? None = unknown
+    capacity_limit: Optional[int] = None      # open-ticket cap (config v2); None = unlimited
+    at_capacity: bool = False                 # open >= capacity_limit right now
+    # live counts (active = non-terminal, merged tombstones excluded)
+    open: int = 0
+    in_progress: int = 0
+    unassigned: int = 0
+    breached: int = 0
+    due_soon: int = 0
+    critical: int = 0
+    on_hold: int = 0
+    # speed & quality
+    avg_wait_mins: Optional[float] = None     # created → first assignment, 7d
+    oldest_wait_mins: Optional[float] = None  # oldest still-unassigned ticket
+    sla_attainment_7d: Optional[float] = None # % of 7d-resolved tickets inside target
+    resolved_7d: int = 0
+    health: str = "green"                     # green | amber | red
+    flow: List[QueueFlowPoint] = Field(default_factory=list)  # 7 daily buckets
+    # ── Vitals Bay telemetry (additive, 2026-07) ──
+    aging: Dict[str, int] = Field(default_factory=dict)   # open-ticket age buckets: lt_1h/h1_4/h4_24/d1_3/gt_3d
+    burn_rate_hr: Optional[float] = None      # resolved in trailing 4h ÷ 4
+    drain_eta_mins: Optional[float] = None    # open ÷ burn rate (None when burn is 0 or nothing open)
+    crew_capacity: Optional[int] = None       # agents_total × max_agent_load (None = uncapped crew)
+    load_pct: Optional[float] = None          # open ÷ crew_capacity × 100
+    reopens_range: int = 0                    # 'reopened' activities landing in this queue over the range
+
+
+class TierFlowEdge(BaseModel):
+    """Escalation flow between tiers over the range (the Sankey edges)."""
+    from_tier: int
+    to_tier: int
+    count: int = 0
+
+
+class QueuesOverviewResponse(BaseModel):
+    generated_at: datetime
+    queue_count: int = 0
+    queues: List[QueueOverviewCard] = Field(default_factory=list)
+    tier_rollup: Dict[str, Any] = Field(default_factory=dict)   # {"1": {...}, "2": {...}, "3": {...}, "untiered": {...}}
+    tier_flow: List[TierFlowEdge] = Field(default_factory=list)
+    totals: Dict[str, Any] = Field(default_factory=dict)        # fleet rollup for the hero
+    auto_routed_today: int = 0
+    skips_today: int = 0
+    # ── Vitals Bay telemetry (additive, 2026-07 — every key optional so old clients keep working) ──
+    flow_interval: str = "day"                                  # 'day' | 'hour' (hourly only when days <= 2)
+    deltas: Dict[str, Any] = Field(default_factory=dict)        # {key: {now, prev, pct}} period-over-period
+    aging: Dict[str, int] = Field(default_factory=dict)         # fleet open-ticket age histogram
+    sla_split: Dict[str, Any] = Field(default_factory=dict)     # {response, resolution, by_priority:{...}}
+    burn: Dict[str, Any] = Field(default_factory=dict)          # {burn_rate_hr, drain_eta_mins}
+    utilization: Dict[str, Any] = Field(default_factory=dict)   # {load_pct, crew_capacity, open_capped, top_agents:[...]}
+    breach_horizon: List[Dict[str, Any]] = Field(default_factory=list)  # next tickets about to breach
+    reopens_range: int = 0                                      # fleet 'reopened' events in range
+
+
+class QueueStatsResponse(BaseModel):
+    """Queue drawer drill — one queue, deep."""
+    id: UUID
+    name: str
+    generated_at: datetime
+    card: QueueOverviewCard
+    status_counts: Dict[str, int] = Field(default_factory=dict)
+    priority_counts: Dict[str, int] = Field(default_factory=dict)
+    load: List[Dict[str, Any]] = Field(default_factory=list)     # [{user_id,name,status,open_count}]
+    categories: List[Dict[str, Any]] = Field(default_factory=list)
+    skills: List[Dict[str, Any]] = Field(default_factory=list)
+    rules: List[Dict[str, Any]] = Field(default_factory=list)    # rules routing INTO this queue
+    recent_activity: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class TierBoardResponse(BaseModel):
+    """One tier's working queue — tickets + the stats block, in one request."""
+    tier: int
+    generated_at: datetime
+    items: List[Any] = Field(default_factory=list)               # TicketResponse dicts (enriched)
+    total: int = 0
+    queues: List[Dict[str, Any]] = Field(default_factory=list)   # [{id,name,color,open}] tier queues for the filter rail
+    stats: Dict[str, Any] = Field(default_factory=dict)          # status/priority counts, oldest_wait, my_load, skips_today, escalated_in/out
+
+
+class ServeNextResponse(BaseModel):
+    ticket: Optional[Any] = None                                 # enriched TicketResponse dict, or None when drained
+    remaining: int = 0
+    reason: Optional[str] = None                                 # why empty: 'drained' | 'all_viewed' | 'no_queues'
+
+
+class SkipCreate(BaseModel):
+    reason_code: str                                             # not_my_skill | need_info | duplicate_suspect | blocked | other
+    note: Optional[str] = None
+
+
+class TierEscalateRequest(BaseModel):
+    to_tier: int
+    reason_code: Optional[str] = None
+    reason: Optional[str] = None
+    diagnosis: Optional[str] = None                              # required for L2→L3 (enforced in the router)
+    queue_id: Optional[UUID] = None                              # explicit target queue override
+
+    _v_tier = field_validator("to_tier")(_check_tier)
+
+
+class TierDescendRequest(BaseModel):
+    to_tier: int
+    reason_code: Optional[str] = None                            # resolved_at_tier | misrouted | needs_basic_troubleshooting
+    reason: Optional[str] = None
+    queue_id: Optional[UUID] = None
+
+    _v_tier = field_validator("to_tier")(_check_tier)
+
+
+# ─────────────────────────── Skill ───────────────────────────
+class SkillCreate(BaseModel):
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    agent_ids: List[UUID] = Field(default_factory=list)
+
+
+class SkillUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    agent_ids: Optional[List[UUID]] = None
+    is_active: Optional[bool] = None
+
+
+class SkillResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    name: str
+    code: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    agent_ids: List[Any] = Field(default_factory=list)
+    is_active: bool
+    created_at: datetime
+    # enriched
+    agents: List[Dict[str, Any]] = Field(default_factory=list)   # [{id,name}]
+    queue_count: int = 0                                         # queues requiring this skill
+
+
+class AgentStatusEntry(BaseModel):
+    user_id: UUID
+    name: Optional[str] = None
+    status: str = "online"
+    status_note: Optional[str] = None
+    changed_at: Optional[datetime] = None
+    open_count: int = 0
+    team_ids: List[Any] = Field(default_factory=list)
+
+
+class AgentStatusRosterResponse(BaseModel):
+    generated_at: datetime
+    me: Optional[AgentStatusEntry] = None
+    agents: List[AgentStatusEntry] = Field(default_factory=list)
+
+
+class MyStatusUpdate(BaseModel):
+    status: str                                                  # online | away | focus | offline
+    status_note: Optional[str] = None
+
+    @field_validator("status")
+    @classmethod
+    def _v_status(cls, v):
+        if v not in {"online", "away", "focus", "offline"}:
+            raise ValueError("status must be one of ['away', 'focus', 'offline', 'online']")
+        return v
+
+
+# ─────────────────────────── Routing rules — simulate ───────────────────────────
+class RuleSimulateRequest(BaseModel):
+    """A sample ticket payload to dry-run through the rule engine."""
+    subject: Optional[str] = None
+    description: Optional[str] = None
+    ticket_type: Optional[str] = None
+    priority: Optional[str] = None
+    source: Optional[str] = None
+    impact: Optional[str] = None
+    urgency: Optional[str] = None
+    category_id: Optional[UUID] = None
+    subcategory_id: Optional[UUID] = None
+    organization_id: Optional[UUID] = None
+    tags: List[str] = Field(default_factory=list)
+
+
+class RuleSimulateResponse(BaseModel):
+    matched: List[Dict[str, Any]] = Field(default_factory=list)  # [{rule_id,name,order_index,actions,stopped}]
+    decision: Dict[str, Any] = Field(default_factory=dict)       # {queue_id,queue_name,team_id,team_name,priority,sla_package_id,tags,via}
+    fallback_used: bool = False                                  # category/type router decided (no rule matched)
 
 
 # ─────────────────────────── Saved View ───────────────────────────

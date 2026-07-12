@@ -69,6 +69,7 @@ from app.utils.support_desk.workbench import compute_workbench
 from app.utils.support_desk.assignment import (
     route_and_assign, match_route, teams_handling, _agents_of_team, _round_robin,
 )
+from app.utils.support_desk.rules import evaluate_rules, apply_default_queue
 from app.routers.support_desk._common import (
     generate_ticket_number, resolve_sla_package, enrich_tickets, enrich_ticket, maybe_auto_close,
     _user_names, reactivate_on_customer_reply, auto_reopen_on_customer_reply,
@@ -139,6 +140,34 @@ def _as_uuid(v):
         return None
 
 
+def _in_active_swarm(db: Session, ticket_id, user_id) -> bool:
+    """True while a swarm is LIVE on the ticket and ``user_id`` is a participant. Swarm
+    participation grants owner-tier act rights for the DURATION of the swarm only — join
+    used to write the agent permanently into ``collaborators`` (owner-tier forever, long
+    after the swarm ended). Now rights follow the swarm's life via this check; ending the
+    swarm withdraws them. Cheap: one indexed lookup on the small swarm table."""
+    from app.models.support_desk.collab import SdSwarmSession
+    s = (db.query(SdSwarmSession)
+         .filter(SdSwarmSession.ticket_id == ticket_id, SdSwarmSession.status == "active")
+         .first())
+    if not s:
+        return False
+    return str(user_id) in {str(u) for u in (s.participant_ids or [])}
+
+
+def _is_lead(team, user_id) -> bool:
+    """Does ``user_id`` lead ``team``? True for the ``lead_user_id`` column OR a
+    ``member_roles`` entry of ``'lead'``. Two lead definitions coexist on SdTeam and
+    could drift — a team saved with member_roles[uid]='lead' but a NULL lead_user_id
+    left NOBODY recognized as lead by the actor gates (real defect: Tier 2 lead). Every
+    authorization path resolves lead through this helper so the two can't diverge; team
+    writes additionally normalize lead_user_id from member_roles (see workspace.py)."""
+    uid = str(user_id)
+    if team.lead_user_id and str(team.lead_user_id) == uid:
+        return True
+    return (team.member_roles or {}).get(uid) == "lead"
+
+
 def _team_context(db: Session, user: User) -> dict:
     """Everything the user-panel 'team' surfaces need: the user's reporting reports,
     the support teams they belong to, and the derived assignee pool + purview.
@@ -152,7 +181,7 @@ def _team_context(db: Session, user: User) -> dict:
     mine, member_ids, led_member_ids, team_ids = [], set(), set(), []
     for t in teams:
         is_member = uid in [str(m) for m in (t.member_ids or [])]
-        is_lead = uid == str(t.lead_user_id)
+        is_lead = _is_lead(t, user.id)
         if not (is_member or is_lead):
             continue
         mine.append(t)
@@ -177,6 +206,10 @@ def _dispatch_safe(db: Session, event: str, recipient_user_id, ticket: SdTicket,
         return
     try:
         from app.utils.hr.notify import dispatch
+        from app.utils.support_desk import wires
+        wires.post_webhook(db, event, ticket, title)
+        if not wires.allows(db, event):
+            return
         deep = f"{action_url}{'&' if '?' in action_url else '?'}ticket={ticket.id}"
         dispatch(db, event, recipient_user_id,
                  context={"title": title, "message": f"{ticket.ticket_number}: {ticket.subject}",
@@ -356,12 +389,15 @@ def _require_self_actor(db: Session, t: SdTicket, user: User, action: str = "act
     if uid in [str(c) for c in (t.collaborators or [])]:
         return
     ctx = ctx or _team_context(db, user)
-    if t.team_id and any(tm.id == t.team_id and str(tm.lead_user_id) == uid for tm in ctx["teams"]):
+    if t.team_id and any(tm.id == t.team_id and _is_lead(tm, user.id) for tm in ctx["teams"]):
         return
     if not t.assigned_agent_id and _claim_eligible(t, ctx, False):
         return
     if (t.assigned_agent_id in ctx["reports"]) or (
             not t.assigned_agent_id and t.raised_by_user_id in ctx["reports"]):
+        return
+    # Live-swarm participants may act for the duration of the swarm (see _in_active_swarm).
+    if _in_active_swarm(db, t.id, user.id):
         return
     raise HTTPException(
         403, f"This ticket is assigned to another agent — only they, the team lead, or an admin can {action}.")
@@ -672,7 +708,7 @@ def my_capabilities(db: Session = Depends(get_db), user: User = Depends(get_curr
         is_manager=len(ctx["reports"]) > 0,
         team_size=len(ctx["reports"]),
         member_team_ids=list(ctx["team_ids"]),
-        lead_team_ids=[tm.id for tm in ctx["teams"] if str(tm.lead_user_id) == uid],
+        lead_team_ids=[tm.id for tm in ctx["teams"] if _is_lead(tm, user.id)],
     )
 
 
@@ -690,6 +726,7 @@ def my_team(db: Session = Depends(get_db), user: User = Depends(get_current_user
 @router.get("/routing-preview")
 def routing_preview(
     category_id: Optional[UUID] = Query(None),
+    subcategory_id: Optional[UUID] = Query(None),
     ticket_type: str = Query("incident"),
     organization_id: Optional[UUID] = Query(None),
     priority: str = Query("medium"),
@@ -704,8 +741,10 @@ def routing_preview(
     if priority not in _PRIORITIES:
         priority = TicketPriority.MEDIUM.value
     # A transient, un-persisted ticket carrying just enough to drive the matcher.
+    # subcategory_id matters: rules can condition on it and lanes route by it, so a
+    # preview without it would promise the wrong lane for subcategory-scoped routing.
     probe = SdTicket(
-        category_id=category_id, ticket_type=ticket_type,
+        category_id=category_id, subcategory_id=subcategory_id, ticket_type=ticket_type,
         organization_id=organization_id, raised_by_user_id=user.id,
     )
     routed = match_route(db, probe)
@@ -967,6 +1006,7 @@ def list_my_team_tickets(
     scope: Optional[str] = Query(None),
     status_f: Optional[str] = Query(None, alias="status"),
     priority: Optional[str] = None,
+    report_id: Optional[UUID] = Query(None, description="Drill down to ONE direct report — tickets assigned to (or raised by) that report. 403 if the id isn't your report."),
     q: Optional[str] = None,
     sort_by: str = Query("updated_at"),
     sort_dir: str = Query("desc"),
@@ -977,15 +1017,23 @@ def list_my_team_tickets(
 ):
     """The user-panel team board: tickets belonging to a support team the user is on
     (member or lead) PLUS tickets raised-by/assigned-to the user's direct reports.
-    Empty for users with no team and no reports — no 403, graceful. Before /{ticket_id}."""
+    Empty for users with no team and no reports — no 403, graceful. Before /{ticket_id}.
+
+    ``report_id`` narrows to a single direct report (a reporting-manager drill-down; the
+    id must be one of the caller's reports or a 403)."""
     ctx = _team_context(db, user)
     scope_ids = list(ctx["scope_ids"])
     team_ids = ctx["team_ids"]
     if len(scope_ids) <= 1 and not team_ids:   # only {me} — not on a team, no reports
         return TicketListResponse(items=[], total=0, page=page, limit=limit)
-    conds = [SdTicket.raised_by_user_id.in_(scope_ids), SdTicket.assigned_agent_id.in_(scope_ids)]
-    if team_ids:
-        conds.append(SdTicket.team_id.in_(team_ids))
+    if report_id is not None:
+        if report_id not in ctx["reports"]:
+            raise HTTPException(403, "That user isn't one of your direct reports.")
+        conds = [SdTicket.assigned_agent_id == report_id, SdTicket.raised_by_user_id == report_id]
+    else:
+        conds = [SdTicket.raised_by_user_id.in_(scope_ids), SdTicket.assigned_agent_id.in_(scope_ids)]
+        if team_ids:
+            conds.append(SdTicket.team_id.in_(team_ids))
     query = db.query(SdTicket).filter(SdTicket.is_deleted == False, or_(*conds))  # noqa: E712
     if scope and scope not in ("all", "my", "unassigned"):
         query = _apply_self_scope(query, scope)
@@ -1005,6 +1053,85 @@ def list_my_team_tickets(
         items=[TicketResponse.model_validate(t) for t in items],
         total=total, page=page, limit=limit,
     )
+
+
+@router.get("/reports-overview")
+def reports_overview(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Reporting-line oversight for a manager: each DIRECT REPORT with their live support
+    workload (open / breached / critical / due-soon / aging + resolved-today), plus rolled
+    totals. Scoped strictly to the HR reporting line (``ctx['reports']``) — NOT support-team
+    membership — so a manager sees their people's queues even across teams they don't sit on.
+    Empty (is_manager=False) for a caller with no reports. Drill into one report's tickets via
+    GET /me/tickets/team-tickets?report_id=<uid>."""
+    ctx = _team_context(db, user)
+    reports = list(ctx["reports"])
+    now = sla_util.now_utc()
+    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    soon = now + timedelta(hours=4)
+    d7 = now - timedelta(days=7)
+    terminal = list(TERMINAL_TICKET_STATUSES)
+    if not reports:
+        return {"is_manager": False, "generated_at": now, "reports": [],
+                "totals": {"reports": 0, "open": 0, "breached": 0, "critical": 0,
+                           "due_soon": 0, "aging": 0, "resolved_today": 0}}
+
+    is_active = SdTicket.status.notin_(terminal)
+
+    def _sum(cond):
+        return func.sum(case((cond, 1), else_=0))
+
+    rows = (db.query(
+        SdTicket.assigned_agent_id.label("uid"),
+        _sum(is_active).label("open"),
+        _sum(and_(is_active, or_(SdTicket.sla_resolution_breached == True,  # noqa: E712
+                                 SdTicket.sla_response_breached == True))).label("breached"),  # noqa: E712
+        _sum(and_(is_active, or_(SdTicket.priority == "critical",
+                                 SdTicket.is_major_incident == True))).label("critical"),  # noqa: E712
+        _sum(and_(is_active, SdTicket.sla_resolution_breached == False,  # noqa: E712
+                  SdTicket.resolution_due_at.isnot(None),
+                  SdTicket.resolution_due_at <= soon,
+                  SdTicket.resolution_due_at > now)).label("due_soon"),
+        _sum(and_(is_active, SdTicket.created_at < d7)).label("aging"),
+        _sum(and_(SdTicket.status == TicketStatus.RESOLVED.value,
+                  SdTicket.resolved_at >= sod)).label("resolved_today"),
+    ).filter(SdTicket.is_deleted == False,  # noqa: E712
+             SdTicket.merged_into_id.is_(None),
+             SdTicket.assigned_agent_id.in_(reports))
+        .group_by(SdTicket.assigned_agent_id).all())
+
+    by_uid = {str(r.uid): r for r in rows}
+    names = _user_names(db, reports)
+    statuses = _statuses_of(db, reports)
+    out_reports = []
+    tot = {"reports": len(reports), "open": 0, "breached": 0, "critical": 0,
+           "due_soon": 0, "aging": 0, "resolved_today": 0}
+    for uid in reports:
+        r = by_uid.get(str(uid))
+        entry = {
+            "user_id": str(uid), "name": names.get(str(uid)) or "Agent",
+            "status": statuses.get(str(uid), "online"),
+            "open": int(getattr(r, "open", 0) or 0),
+            "breached": int(getattr(r, "breached", 0) or 0),
+            "critical": int(getattr(r, "critical", 0) or 0),
+            "due_soon": int(getattr(r, "due_soon", 0) or 0),
+            "aging": int(getattr(r, "aging", 0) or 0),
+            "resolved_today": int(getattr(r, "resolved_today", 0) or 0),
+        }
+        for k in ("open", "breached", "critical", "due_soon", "aging", "resolved_today"):
+            tot[k] += entry[k]
+        out_reports.append(entry)
+    out_reports.sort(key=lambda e: (-e["breached"], -e["critical"], -e["open"], e["name"].lower()))
+    return {"is_manager": True, "generated_at": now, "reports": out_reports, "totals": tot}
+
+
+def _statuses_of(db: Session, user_ids) -> dict:
+    """{user_id_str: presence status} — absent row reads as 'online' (mirror of queue_ops)."""
+    from app.models.support_desk.workspace import SdAgentStatus
+    ids = {i for i in user_ids if i}
+    if not ids:
+        return {}
+    rows = db.query(SdAgentStatus).filter(SdAgentStatus.user_id.in_(list(ids))).all()
+    return {str(r.user_id): r.status for r in rows}
 
 
 @router.get("/command-center", response_model=TicketListResponse)
@@ -2603,7 +2730,7 @@ def team_queue_stats(
     for tm in (scope_teams if is_su else ctx["teams"])[:50]:
         out.teams.append(TeamSwitcherEntry(
             id=tm.id, name=tm.name, color=tm.color,
-            is_lead=(uid == str(tm.lead_user_id)),
+            is_lead=_is_lead(tm, user.id),
             member_count=len(tm.member_ids or []),
             open_count=tcounts.get(tm.id, 0)))
 
@@ -2613,11 +2740,11 @@ def team_queue_stats(
         out.assignment_method = sel.assignment_method
         out.business_hours = sel.business_hours if isinstance(sel.business_hours, dict) else {}
         out.request_types = [str(x) for x in (sel.request_types or [])]
-        out.can_distribute = is_su or uid == str(sel.lead_user_id)
+        out.can_distribute = is_su or _is_lead(sel, user.id)
         if sel.lead_user_id:
             out.lead_name = _user_names(db, [sel.lead_user_id]).get(str(sel.lead_user_id))
     else:
-        out.can_distribute = is_su or any(uid == str(tm.lead_user_id) for tm in scope_teams)
+        out.can_distribute = is_su or any(_is_lead(tm, user.id) for tm in scope_teams)
 
     # ── queue totals — one conditional-sum pass over the active set ──
     row = active.with_entities(
@@ -2788,7 +2915,7 @@ def distribute_team_queue(
                                    SdTeam.is_active == True).first()  # noqa: E712
     if not team:
         raise HTTPException(404, "Team not found")
-    if not (is_su or str(user.id) == str(team.lead_user_id)):
+    if not (is_su or _is_lead(team, user.id)):
         raise HTTPException(403, "Only the team lead (or an administrator) can distribute the team queue.")
     pool = _agents_of_team(db, team)
     if not pool:
@@ -3403,9 +3530,12 @@ def create_my_ticket(
     write_audit(db, entity_type="ticket", op="created", entity_id=t.id,
                 actor_id=user.id, request=request,
                 details={"ticket_number": number, "self_service": True})
-    # Route to a queue by category + auto-assign an agent (round-robin / load-balanced)
-    # if the routed queue is configured for it. Notify the chosen agent. Best-effort.
+    # Routing chain (first-match): admin-authored automation rules → category/type
+    # router (+ auto-assign when the routed queue is configured for it) → default-queue
+    # fallback. Notify the chosen agent. Best-effort.
+    evaluate_rules(db, t)
     routed = route_and_assign(db, t)
+    apply_default_queue(db, t)
     # Create-time self-claim: only honoured when the requester may actually WORK the
     # ticket (a support agent, or a member of the team that handles it) — mirrors the
     # "team members/agents only" rule. Overrides any auto-assignment.

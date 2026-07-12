@@ -19,6 +19,13 @@ from app.models.support_desk.itil import (
 from app.models.support_desk.ops import (
     SdAnnouncement, SdAutomationRule, SdSetting,
 )
+from app.models.support_desk.workspace import (
+    SdTeam, SdTicketViewer, SdQueue, SdSkill, SdAgentStatus, SdTicketSkip,
+    SdSavedView, SdTicketTemplate, SdTemplateFavorite, SdTemplateUsageEvent,
+)
+from app.models.support_desk.collab import (
+    SdTicketWorklog, SdTicketWatcher, SdSwarmSession,
+)
 
 __all__ = [
     "SdOrganization", "SdCustomer", "SdSlaPackage", "SdContract", "SdCategory",
@@ -26,4 +33,7 @@ __all__ = [
     "SdKbCategory", "SdKnowledgeArticle", "SdServiceItem", "SdServiceRequest",
     "SdChangeRequest", "SdProblem", "SdCustomerAsset",
     "SdAnnouncement", "SdAutomationRule", "SdSetting",
+    "SdTeam", "SdTicketViewer", "SdQueue", "SdSkill", "SdAgentStatus", "SdTicketSkip",
+    "SdSavedView", "SdTicketTemplate", "SdTemplateFavorite", "SdTemplateUsageEvent",
+    "SdTicketWorklog", "SdTicketWatcher", "SdSwarmSession",
 ]

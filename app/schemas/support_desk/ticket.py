@@ -113,6 +113,10 @@ class TicketUpdate(BaseModel):
     attachments: Optional[List[Dict[str, Any]]] = None
     tags: Optional[List[str]] = None
     links: Optional[Dict[str, Any]] = None
+    # L2 workbench — ITIL record links (incident → problem/change), PATCH-editable so
+    # the specialist desk can pin recurring incidents to their problem record.
+    linked_problem_id: Optional[UUID] = None
+    linked_change_id: Optional[UUID] = None
     # Phase 2 — editable vendor + business-impact fields
     vendor_name: Optional[str] = None
     vendor_ticket_ref: Optional[str] = None

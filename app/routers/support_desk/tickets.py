@@ -50,6 +50,7 @@ from app.utils.support_desk import sla as sla_util
 from app.utils.support_desk.audit import write_audit
 from app.utils.support_desk.workbench import compute_workbench
 from app.utils.support_desk.assignment import route_and_assign, match_route, teams_handling
+from app.utils.support_desk.rules import evaluate_rules, apply_default_queue
 from app.routers.support_desk._common import (
     generate_ticket_number, resolve_sla_package, enrich_tickets, enrich_ticket, maybe_auto_close,
     auto_resume_expired_holds, apply_overdue_scope, apply_reopen, apply_close_source,
@@ -114,14 +115,16 @@ def _require_ticket_scope(db: Session, t: SdTicket, admin: User) -> None:
         raise HTTPException(404, "Ticket not found")
 
 
-def _ticket_actor_error(t: SdTicket, admin: User, ctx: dict | None) -> str | None:
+def _ticket_actor_error(t: SdTicket, admin: User, ctx: dict | None, db: Session | None = None) -> str | None:
     """Owner-tier check with a precomputed team context (ctx=None ⇒ superuser, always
     allowed). Returns a deny/skip reason, or None when the caller may command this ticket:
       • the ASSIGNED agent (it's their ticket),
       • a named COLLABORATOR (explicitly invited to work it),
       • the LEAD of the ticket's owning team (ServiceNow-style group manager),
       • anyone claim-eligible when the ticket is UNASSIGNED (triage pool — claiming /
-        assigning formalizes ownership).
+        assigning formalizes ownership),
+      • a participant of a LIVE swarm on this ticket (rights last only for the swarm — db
+        required; passed by every real caller).
     A plain teammate viewing a colleague's assigned ticket gets a reason back."""
     if ctx is None:
         return None
@@ -130,11 +133,16 @@ def _ticket_actor_error(t: SdTicket, admin: User, ctx: dict | None) -> str | Non
         return None
     if uid in [str(c) for c in (t.collaborators or [])]:
         return None
-    if t.team_id and any(tm.id == t.team_id and str(tm.lead_user_id) == uid for tm in ctx["teams"]):
+    from app.routers.support_desk.tickets_self import _is_lead
+    if t.team_id and any(tm.id == t.team_id and _is_lead(tm, admin.id) for tm in ctx["teams"]):
         return None
     if not t.assigned_agent_id:
         from app.routers.support_desk.tickets_self import _claim_eligible
         if _claim_eligible(t, ctx, False):
+            return None
+    if db is not None:
+        from app.routers.support_desk.tickets_self import _in_active_swarm
+        if _in_active_swarm(db, t.id, admin.id):
             return None
     return "Assigned to another agent — only they, the team lead, or an admin can act on it."
 
@@ -148,7 +156,7 @@ def _require_ticket_actor(db: Session, t: SdTicket, admin: User, action: str = "
     if getattr(admin, "is_superuser", False):
         return
     from app.routers.support_desk.tickets_self import _team_context
-    if _ticket_actor_error(t, admin, _team_context(db, admin)) is None:
+    if _ticket_actor_error(t, admin, _team_context(db, admin), db) is None:
         return
     raise HTTPException(
         403, f"This ticket is assigned to another agent — only they, the team lead, or an admin can {action}.")
@@ -229,6 +237,14 @@ def _transition_status(db: Session, t: SdTicket, new: str, actor: User, note: st
         dispatch_safe(db, EVT_TICKET_REOPENED, t.assigned_agent_id, t,
                       title=f"Ticket {t.ticket_number} reopened — back on your desk",
                       action_url=f"{_panel_base(db, t.assigned_agent_id)}/tickets/reopened")
+    # Watchers (notify-only followers) hear about every status move through this single
+    # writer — excluding the actor, the requester and the assignee (already pinged above).
+    from app.utils.support_desk.watchers import notify_ticket_watchers
+    w_evt = EVT_TICKET_RESOLVED if new == TicketStatus.RESOLVED.value else EVT_TICKET_STATUS
+    notify_ticket_watchers(db, t, w_evt,
+                           f"Ticket {t.ticket_number}: {new.replace('_', ' ')}",
+                           actor_id=actor.id if actor else None,
+                           exclude_ids=[t.raised_by_user_id, t.assigned_agent_id])
     return True
 
 
@@ -958,6 +974,27 @@ def create_ticket(
         if not (bool(ctx["reports"]) or team_id in ctx["team_ids"]):
             team_id = None
 
+    # Queue-routing guard (same rule, lane flavour): only a superuser, a reporting
+    # manager, or a member/lead of the lane's OWNING team may pin a ticket to a
+    # SPECIFIC queue. route_and_assign honours an explicit queue and stamps that
+    # lane's team — so an ungated queue_id would sidestep the team guard above.
+    # A dropped/unknown/retired lane falls through to auto-routing instead.
+    queue_id = payload.queue_id
+    if queue_id and not getattr(admin, "is_superuser", False):
+        from app.models.support_desk.workspace import SdQueue
+        from app.routers.support_desk.tickets_self import _team_context
+        _qrow = db.query(SdQueue).filter(
+            SdQueue.id == queue_id, SdQueue.is_deleted == False,  # noqa: E712
+            SdQueue.is_active == True).first()  # noqa: E712
+        if _qrow is None:
+            queue_id = None
+        else:
+            _qctx = _team_context(db, admin)
+            _qtids = {str(x) for x in _qctx["team_ids"]}
+            if not (bool(_qctx["reports"])
+                    or (_qrow.team_id and str(_qrow.team_id) in _qtids)):
+                queue_id = None
+
     # Reporting-manager assignee guard (the rule): a manager who is NOT a superuser may
     # name a specific assignee only if that agent is on the team this ticket routes to
     # (explicit team override, else the type/category match). Plain agents and admins are
@@ -1051,7 +1088,7 @@ def create_ticket(
         assigned_engineer_id=payload.assigned_engineer_id,
         assigned_pm_id=payload.assigned_pm_id,
         team_id=team_id,
-        queue_id=payload.queue_id,
+        queue_id=queue_id,
         collaborators=[str(c) for c in (payload.collaborators or [])],
         business_impact=payload.business_impact,
         affected_users=payload.affected_users,
@@ -1070,9 +1107,12 @@ def create_ticket(
     db.add(t)
     db.flush()  # assign id
     _log_activity(db, t, admin, "created", {"ticket_number": number, "priority": payload.priority})
-    # Route to a queue + (if the queue auto-assigns) pick an agent. Skips assign if the
-    # agent already chose an assignee. Best-effort — never blocks creation.
+    # Routing chain (first-match): admin-authored automation rules → category/type
+    # router → default-queue fallback → (if the queue auto-assigns) pick an agent.
+    # Skips assign if the agent already chose an assignee. Best-effort — never blocks.
+    evaluate_rules(db, t)
     route_and_assign(db, t)
+    apply_default_queue(db, t)
     if t.assigned_agent_id:
         dispatch_safe(db, EVT_TICKET_ASSIGNED, t.assigned_agent_id, t,
                       title=f"Assigned: {t.subject}",
@@ -1132,10 +1172,10 @@ def update_ticket(
     moves_team = ("team_id" in update and update["team_id"] != t.team_id) or \
                  ("queue_id" in update and update["queue_id"] != t.queue_id)
     if moves_team and not getattr(admin, "is_superuser", False):
-        from app.routers.support_desk.tickets_self import _team_context
+        from app.routers.support_desk.tickets_self import _team_context, _is_lead
         _ctx = _team_context(db, admin)
         is_lead_here = bool(t.team_id) and any(
-            tm.id == t.team_id and str(tm.lead_user_id) == str(admin.id) for tm in _ctx["teams"])
+            tm.id == t.team_id and _is_lead(tm, admin.id) for tm in _ctx["teams"])
         if not is_lead_here:
             raise HTTPException(403, "Only the team lead or an admin can move a ticket between teams or queues.")
 
@@ -1181,10 +1221,10 @@ def assign_ticket(
         # A non-superuser routes within their reach: the ticket's owning team, teams they
         # lead, their direct reports, or themselves. Team/queue re-routing stays a
         # lead/superuser act (functional moves go through Escalate, which records why).
-        from app.routers.support_desk.tickets_self import _team_context, _team_members_of
+        from app.routers.support_desk.tickets_self import _team_context, _team_members_of, _is_lead
         ctx = _team_context(db, admin)
         is_lead_here = bool(t.team_id) and any(
-            tm.id == t.team_id and str(tm.lead_user_id) == str(admin.id) for tm in ctx["teams"])
+            tm.id == t.team_id and _is_lead(tm, admin.id) for tm in ctx["teams"])
         if ("team_id" in data or "queue_id" in data) and not is_lead_here:
             raise HTTPException(403, "Only the team lead or an admin can move a ticket between teams or queues.")
         target = data.get("assigned_agent_id")
@@ -1320,6 +1360,19 @@ def escalate_ticket(
             raise HTTPException(404, "Target team not found")
         to_team_id = team.id
         t.team_id = team.id           # the batch actually moves to the receiving team
+        # Re-park the LANE to match (tier boards are queue-scoped): moving the team
+        # while leaving queue_id behind strands the ticket on the OLD team's board
+        # and the receiving team never sees it there. Their own lane if they have
+        # one, else no lane — the team's ticket desks still carry it.
+        from app.utils.support_desk.assignment import _find_queue_for_team
+        _lane = _find_queue_for_team(db, team.id)
+        _new_qid = _lane.id if _lane else None
+        if str(t.queue_id or "") != str(_new_qid or ""):
+            db.add(SdTicketActivity(
+                ticket_id=t.id, actor_user_id=None, actor_name="Routing",
+                action="routed",
+                detail={"queue": _lane.name if _lane else None, "by": "escalation"}))
+            t.queue_id = _new_qid
         if not esc_type:
             esc_type = "functional"   # routing to a team IS a functional escalation
     if payload and payload.support_team:
@@ -1941,9 +1994,11 @@ def restore_ticket(ticket_id: UUID, request: Request, payload: Optional[TicketRe
 def set_legal_hold(ticket_id: UUID, payload: TicketLegalHold, request: Request,
                    db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     """Place / release a legal hold. A held record is exempt from the retention sweep and
-    from purge eligibility, and only a superuser may restore or release it. Any agent may
-    PLACE a hold (raw fetch — works on live AND archived records); only a superuser may
-    RELEASE one (403 otherwise)."""
+    from purge eligibility. Placing a hold is an OWNER-TIER act (assignee / collaborator /
+    owning-team lead / superuser — or claim-eligible on an unassigned ticket): it freezes
+    retention, so a passing teammate shouldn't be able to do it to a colleague's ticket.
+    Only a superuser may RELEASE a hold (403 otherwise). Raw fetch — works on live AND
+    archived records."""
     t = db.query(SdTicket).filter(SdTicket.id == ticket_id).first()
     if not t:
         raise HTTPException(404, "Ticket not found")
@@ -1951,6 +2006,8 @@ def set_legal_hold(ticket_id: UUID, payload: TicketLegalHold, request: Request,
     want = bool(payload.hold)
     if not want and not getattr(admin, "is_superuser", False):
         raise HTTPException(403, "Only a superuser can release a legal hold.")
+    if want:
+        _require_ticket_actor(db, t, admin, "place a legal hold")
     if bool(t.legal_hold) == want:
         enrich_ticket(db, t)
         return TicketResponse.model_validate(t)
@@ -2235,7 +2292,9 @@ def create_follow_up(ticket_id: UUID, payload: TicketFollowUpCreate, request: Re
     db.add(SdTicketComment(ticket_id=child.id, author_user_id=admin.id, author_name=_actor_name(admin),
                            author_kind=CommentAuthorKind.SYSTEM.value,
                            body=f"Opened as a follow-up of {t.ticket_number}.", is_internal=True))
+    evaluate_rules(db, child)
     route_and_assign(db, child)
+    apply_default_queue(db, child)
     if child.assigned_agent_id and child.assigned_agent_id != admin.id:
         dispatch_safe(db, EVT_TICKET_ASSIGNED, child.assigned_agent_id, child,
                       title=f"Assigned: {child.subject}",
@@ -2378,7 +2437,10 @@ _BULK_ACTIONS = {"assign", "escalate", "resolve", "close", "set_status", "set_pr
 # collaborator / team lead / superuser; unassigned rows are team triage). Mirrors the
 # single-ticket _require_ticket_actor gates. add_tag (light edit) and legal_hold
 # (place — any in-scope agent; release is superuser-guarded above) stay team-open.
-_BULK_OWNER_TIER = _BULK_ACTIONS - {"add_tag", "legal_hold"}
+# legal_hold is owner-tier like its single-ticket route (placing a hold freezes retention —
+# not a passing-teammate act); release stays superuser-only (guarded above). add_tag remains
+# team-open (any in-scope agent may tag).
+_BULK_OWNER_TIER = _BULK_ACTIONS - {"add_tag"}
 
 
 @router.post("/bulk", response_model=TicketBulkResponse)
@@ -2479,7 +2541,7 @@ def bulk_action(
         # Per-ticket owner-tier gate (assignee / collaborator / lead / triage) — a teammate's
         # assigned ticket is skipped with the reason, mirroring the single-ticket 403s.
         if action in _BULK_OWNER_TIER:
-            actor_err = _ticket_actor_error(t, admin, _bulk_ctx)
+            actor_err = _ticket_actor_error(t, admin, _bulk_ctx, db)
             if actor_err:
                 skipped += 1
                 results.append(TicketBulkResult(id=tid, ok=True, skipped=True,
@@ -2921,6 +2983,10 @@ def dispatch_safe(db: Session, event: str, recipient_user_id, ticket: SdTicket, 
     """Thin wrapper around HR notify.dispatch — Support Desk's first production caller."""
     try:
         from app.utils.hr.notify import dispatch
+        from app.utils.support_desk import wires
+        wires.post_webhook(db, event, ticket, title)   # external uplink mirrors the event
+        if not wires.allows(db, event):                # panel wire cut → no agent ping
+            return
         # Deep-link straight to the ticket so the bell click opens its drawer.
         deep = f"{action_url}{'&' if '?' in action_url else '?'}ticket={ticket.id}"
         dispatch(db, event, recipient_user_id,

@@ -111,6 +111,10 @@ class SlaPackageBase(BaseModel):
     name: str
     description: Optional[str] = None
     matrix: Dict[str, Any] = Field(default_factory=dict)
+    # Coverage calendar — when the SLA clock runs. {} / mode "24x7" = wall-clock (legacy);
+    # mode "business_hours" = {tz, days[1..7], start "HH:MM", end "HH:MM", holidays[],
+    # priority_overrides{}}. Validated in the router via sla.validate_coverage.
+    coverage: Dict[str, Any] = Field(default_factory=dict)
     escalation_levels: List[Dict[str, Any]] = Field(default_factory=list)
     is_default: bool = False
     is_active: bool = True
@@ -124,6 +128,7 @@ class SlaPackageUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     matrix: Optional[Dict[str, Any]] = None
+    coverage: Optional[Dict[str, Any]] = None
     escalation_levels: Optional[List[Dict[str, Any]]] = None
     is_default: Optional[bool] = None
     is_active: Optional[bool] = None

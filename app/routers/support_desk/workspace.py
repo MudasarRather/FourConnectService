@@ -83,6 +83,37 @@ def _grant_member_agents(db: Session, member_ids, member_roles) -> int:
             .update({User.is_support_agent: True}, synchronize_session=False))
 
 
+def _normalize_lead(data: dict, existing=None) -> None:
+    """Keep SdTeam's two lead definitions in lockstep on every write. If lead_user_id is
+    empty but member_roles designates a 'lead', promote that user to lead_user_id; and
+    always mirror lead_user_id back into member_roles as 'lead'. This closes the drift
+    that left Tier 2 with a member_roles lead but a NULL lead_user_id — invisible to the
+    actor gates (which resolve lead via tickets_self._is_lead, now honoring both).
+    Mutates ``data`` in place; only touches the two keys when there's something to sync."""
+    roles = data.get("member_roles")
+    if roles is None:
+        roles = dict((existing.member_roles or {}) if existing is not None else {})
+    else:
+        roles = dict(roles)
+    if "lead_user_id" in data:
+        lead = data.get("lead_user_id")
+    elif existing is not None:
+        lead = existing.lead_user_id
+    else:
+        lead = None
+    lead = str(lead) if lead else None
+    if not lead:
+        for uid, role in roles.items():
+            if role == "lead":
+                lead = str(uid)
+                break
+    if lead:
+        if roles.get(lead) != "lead":
+            roles[lead] = "lead"
+            data["member_roles"] = roles
+        data["lead_user_id"] = lead
+
+
 def _open_by_team(db: Session, team_ids: set) -> dict:
     team_ids = {i for i in team_ids if i}
     if not team_ids:
@@ -226,6 +257,14 @@ def list_people(q: Optional[str] = None, limit: int = Query(400, ge=1, le=1000),
     """The full employee directory for building a team — active employees enriched
     with designation / department + agent / manager badges. The admin picks team
     MEMBERS from here (employees), not just flagged agents."""
+    # Directory seal: superusers browse the whole directory (team building); agents
+    # get a SEARCH, not a dump — a 2+ character name/email query, capped at 25 rows
+    # (the agent-side pickers are typeaheads). Without this any flagged agent could
+    # enumerate every employee's name + email + department in a single call.
+    if not getattr(admin, "is_superuser", False):
+        if not q or len(q.strip()) < 2:
+            raise HTTPException(422, "Type at least 2 characters to search people.")
+        limit = min(limit, 25)
     # Who is a reporting manager? (distinct managers across active employees.)
     mgr_rows = (db.query(Employee.reporting_manager_id)
                 .filter(Employee.reporting_manager_id.isnot(None), Employee.is_deleted == False)  # noqa: E712
@@ -264,9 +303,10 @@ def list_people(q: Optional[str] = None, limit: int = Query(400, ge=1, le=1000),
 def my_teams(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Support teams the current user belongs to (member or lead) — powers the
     user-panel 'my team's tickets' board. Any authenticated employee."""
+    from app.routers.support_desk.tickets_self import _is_lead
     teams = db.query(SdTeam).filter(SdTeam.is_deleted == False, SdTeam.is_active == True).all()  # noqa: E712
     uid = str(user.id)
-    mine = [t for t in teams if uid == str(t.lead_user_id) or uid in [str(m) for m in (t.member_ids or [])]]
+    mine = [t for t in teams if _is_lead(t, user.id) or uid in [str(m) for m in (t.member_ids or [])]]
     # resolve member + lead names in one pass
     all_ids = set()
     for t in mine:
@@ -285,7 +325,7 @@ def my_teams(db: Session = Depends(get_db), user: User = Depends(get_current_use
         "id": str(t.id), "name": t.name, "code": t.code, "color": t.color,
         "lead_user_id": str(t.lead_user_id) if t.lead_user_id else None,
         "lead_name": names.get(str(t.lead_user_id)) if t.lead_user_id else None,
-        "is_lead": uid == str(t.lead_user_id),
+        "is_lead": _is_lead(t, user.id),
         "member_count": len(t.member_ids or []),
         "open_ticket_count": open_counts.get(str(t.id), 0),
         "members": [{"id": str(m), "name": names.get(str(m)) or "Member"} for m in (t.member_ids or [])],
@@ -316,6 +356,7 @@ def create_team(payload: TeamCreate, request: Request,
     if data.get("member_roles") is not None:
         data["member_roles"] = {str(k): v for k, v in data["member_roles"].items()
                                 if str(k) in set(data["member_ids"])}
+    _normalize_lead(data)
     team = SdTeam(**data)
     db.add(team)
     db.flush()
@@ -374,6 +415,10 @@ def update_team(team_id: UUID, payload: TeamUpdate, request: Request,
     bad = _validate_members(db, check_ids)
     if bad:
         raise HTTPException(422, f"Not active users: {', '.join(bad)}")
+
+    # Keep lead_user_id ⇄ member_roles['lead'] in lockstep (see _normalize_lead). Runs
+    # before the removal-guard below so its new_lead computation sees the synced value.
+    _normalize_lead(update, existing=team)
 
     # ── deactivation guard: is_active=false must not strand live work (a deactivated
     #    team vanishes from every non-superuser scope, so its tickets go unworkable) ──
@@ -835,10 +880,53 @@ def list_queues(include_inactive: bool = False, db: Session = Depends(get_db), a
                          SdTicket.status.in_(OPEN_TICKET_STATUSES))
                  .group_by(SdTicket.queue_id).all()) if queues else []
     open_counts = {str(r[0]): r[1] for r in open_rows}
+    # Team seal on the WORKLOAD numbers (the rows themselves stay desk-wide — cross-team
+    # lanes are legitimate tier-escalation targets, but another crew's live backlog is
+    # not an agent's to read): non-superusers get real counts only for lanes owned by a
+    # team they're on; every other lane reads 0. Mirrors queue_ops._visible_queues.
+    if not getattr(admin, "is_superuser", False):
+        from app.routers.support_desk.tickets_self import _team_context
+        _tids = {str(x) for x in _team_context(db, admin)["team_ids"]}
+        _sealed = {str(x.id) for x in queues if x.team_id and str(x.team_id) in _tids}
+        open_counts = {k: v for k, v in open_counts.items() if k in _sealed}
     for x in queues:
         x.team_name = team_names.get(str(x.team_id)) if x.team_id else None
         x.open_ticket_count = open_counts.get(str(x.id), 0)
     return queues
+
+
+def _clear_other_defaults(db: Session, keep_id=None) -> None:
+    """At most ONE default (fallback) queue — flipping one on flips the others off."""
+    q = db.query(SdQueue).filter(SdQueue.is_default == True, SdQueue.is_deleted == False)  # noqa: E712
+    if keep_id is not None:
+        q = q.filter(SdQueue.id != keep_id)
+    q.update({SdQueue.is_default: False}, synchronize_session=False)
+
+
+def _active_in_queue(db: Session, queue_id) -> int:
+    """ACTIVE = non-terminal work, merged tombstones excluded (delete/deactivate guard —
+    same definition as the team guard, so on-hold work can't be stranded)."""
+    return (db.query(SdTicket)
+            .filter(SdTicket.queue_id == queue_id, SdTicket.is_deleted == False,  # noqa: E712
+                    SdTicket.merged_into_id.is_(None),
+                    SdTicket.status.notin_(list(TERMINAL_TICKET_STATUSES)))
+            .count())
+
+
+def _validate_overflow(db: Session, data: dict, queue_id=None) -> None:
+    """Config-v2 spill guards: the overflow target must be a different, existing lane,
+    and must not already spill back into this one (A→B→A would bounce tickets — the
+    engine only ever hops once, but the config should never encode a loop)."""
+    of = data.get("overflow_queue_id")
+    if of is None:
+        return
+    if queue_id is not None and str(of) == str(queue_id):
+        raise HTTPException(422, "A lane can't overflow into itself — pick a different spill lane.")
+    target = db.query(SdQueue).filter(SdQueue.id == of, SdQueue.is_deleted == False).first()  # noqa: E712
+    if not target:
+        raise HTTPException(422, "overflow_queue_id must name an existing lane.")
+    if queue_id is not None and getattr(target, "overflow_queue_id", None) and str(target.overflow_queue_id) == str(queue_id):
+        raise HTTPException(422, f"Overflow loop: '{target.name}' already spills into this lane — pick a different target for one of them.")
 
 
 @queues_router.post("/", response_model=QueueResponse, status_code=status.HTTP_201_CREATED)
@@ -846,11 +934,16 @@ def create_queue(payload: QueueCreate, db: Session = Depends(get_db), admin: Use
     if payload.code and db.query(SdQueue).filter(SdQueue.code == payload.code).first():
         raise HTTPException(400, "Queue code already exists")
     data = payload.model_dump(exclude_unset=True)
-    if data.get("category_ids") is not None:
-        data["category_ids"] = [str(x) for x in data["category_ids"]]   # JSONB needs JSON-serializable
+    data.pop("reassign_to", None)   # directive, not a column
+    _validate_overflow(db, data)
+    for jsonb_key in ("category_ids", "skill_ids"):
+        if data.get(jsonb_key) is not None:
+            data[jsonb_key] = [str(x) for x in data[jsonb_key]]   # JSONB needs JSON-serializable
     qrow = SdQueue(**data)
     db.add(qrow)
     db.flush()
+    if qrow.is_default:
+        _clear_other_defaults(db, keep_id=qrow.id)
     write_audit(db, entity_type="queue", op="created", entity_id=qrow.id, actor_id=admin.id, details={"name": qrow.name})
     db.commit()
     db.refresh(qrow)
@@ -862,21 +955,78 @@ def update_queue(queue_id: UUID, payload: QueueUpdate, db: Session = Depends(get
     qrow = db.query(SdQueue).filter(SdQueue.id == queue_id, SdQueue.is_deleted == False).first()  # noqa: E712
     if not qrow:
         raise HTTPException(404, "Queue not found")
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        if k == "category_ids" and v is not None:
+    data = payload.model_dump(exclude_unset=True)
+    data.pop("reassign_to", None)   # directive for DELETE, ignored on update
+    # The fallback queue must stay routable: it can't be deactivated or un-defaulted
+    # while it IS the default (make another queue default first).
+    if qrow.is_default and data.get("is_active") is False:
+        raise HTTPException(409, "This is the default (fallback) queue — make another queue the default before deactivating it.")
+    if qrow.is_default and data.get("is_default") is False:
+        raise HTTPException(409, "Make another queue the default first — the desk needs exactly one fallback queue.")
+    _validate_overflow(db, data, queue_id=qrow.id)
+    for k, v in data.items():
+        if k in ("category_ids", "skill_ids") and v is not None:
             v = [str(x) for x in v]   # JSONB needs JSON-serializable
         setattr(qrow, k, v)
+    if data.get("is_default"):
+        _clear_other_defaults(db, keep_id=qrow.id)
+    write_audit(db, entity_type="queue", op="updated", entity_id=qrow.id, actor_id=admin.id,
+                details={"name": qrow.name, "fields": sorted(data.keys())})
     db.commit()
     db.refresh(qrow)
     return qrow
 
 
 @queues_router.delete("/{queue_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_queue(queue_id: UUID, db: Session = Depends(get_db), admin: User = Depends(get_current_superuser)):
+def delete_queue(
+    queue_id: UUID,
+    reassign_to: Optional[UUID] = Query(None, description="Queue that inherits this queue's active tickets"),
+    reason: Optional[str] = Query(None, max_length=300, description="Why the lane is being pulled — lands in the audit ledger"),
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_superuser),
+):
     qrow = db.query(SdQueue).filter(SdQueue.id == queue_id, SdQueue.is_deleted == False).first()  # noqa: E712
     if not qrow:
         raise HTTPException(404, "Queue not found")
+    if qrow.is_default:
+        raise HTTPException(409, "The default (fallback) queue can't be deleted — make another queue the default first.")
+    active = _active_in_queue(db, qrow.id)
+    if active:
+        if not reassign_to:
+            raise HTTPException(409, f"This queue still holds {active} active ticket(s) — pass reassign_to with the queue that inherits them.")
+        target = db.query(SdQueue).filter(
+            SdQueue.id == reassign_to, SdQueue.is_deleted == False,  # noqa: E712
+            SdQueue.is_active == True, SdQueue.id != qrow.id).first()  # noqa: E712
+        if not target:
+            raise HTTPException(422, "reassign_to must name a different, active queue.")
+        # Inheriting a lane means inheriting its CREW: when the target lane belongs to
+        # a (different) team, moved tickets take that team_id too — otherwise they end
+        # up sealed to the old team while parked on the new team's board (queue/team
+        # divergence, same discipline as apply_tier_move). A team-less target keeps
+        # each ticket's existing team so the seal never widens by accident. Assignees
+        # are left untouched (same as a manual PATCH lane move).
+        _updates = {SdTicket.queue_id: target.id}
+        if target.team_id:
+            _updates[SdTicket.team_id] = target.team_id
+        moved = (db.query(SdTicket)
+                 .filter(SdTicket.queue_id == qrow.id, SdTicket.is_deleted == False,  # noqa: E712
+                         SdTicket.merged_into_id.is_(None),
+                         SdTicket.status.notin_(list(TERMINAL_TICKET_STATUSES)))
+                 .update(_updates, synchronize_session=False))
+        write_audit(db, entity_type="queue", op="tickets_reassigned", entity_id=qrow.id, actor_id=admin.id,
+                    details={"to_queue": str(target.id), "moved": int(moved),
+                             "to_team": str(target.team_id) if target.team_id else None,
+                             "assignees_kept": True})
     qrow.is_deleted = True
+    qrow.is_active = False
+    # Release the unique code so a future queue can reuse it (soft-deleted rows
+    # otherwise squat on the code forever).
+    if qrow.code:
+        qrow.code = f"{qrow.code}~{str(qrow.id)[:8]}"
+    details = {"name": qrow.name}
+    if reason and reason.strip():
+        details["reason"] = reason.strip()
+    write_audit(db, entity_type="queue", op="deleted", entity_id=qrow.id, actor_id=admin.id, details=details)
     db.commit()
     return None
 

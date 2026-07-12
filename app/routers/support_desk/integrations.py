@@ -52,9 +52,17 @@ def ticket_to_task(
     admin: User = Depends(get_support_agent),
 ):
     """Spin a project Task off a ticket and remember the link on ticket.links."""
-    t = db.query(SdTicket).filter(SdTicket.id == ticket_id, SdTicket.is_deleted == False).first()  # noqa: E712
-    if not t:
-        raise HTTPException(404, "Ticket not found")
+    # Team seal + owner tier (the raw fetch was a side door: any agent could copy any
+    # ticket's subject/description into a Task across the seal and stamp its links).
+    from app.routers.support_desk.tickets import _get_ticket, _require_ticket_actor
+    t = _get_ticket(db, ticket_id, admin)
+    _require_ticket_actor(db, t, admin, "spin a task off it")
+    if body.project_id:
+        from app.models.project import Project
+        proj = db.query(Project).filter(Project.id == body.project_id,
+                                        Project.is_deleted == False).first()  # noqa: E712
+        if not proj:
+            raise HTTPException(400, "Project not found")
 
     from app.models.task import Task, TaskPriority
     kwargs = dict(

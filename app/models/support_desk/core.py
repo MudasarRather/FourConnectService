@@ -89,6 +89,15 @@ class SdSlaPackage(Base):
     name = Column(String(120), nullable=False, unique=True)
     description = Column(Text, nullable=True)
     matrix = Column(JSONB, nullable=False, default=dict)
+    # SLA coverage calendar — when the clock RUNS. Empty {} ⇒ 24x7 (legacy behaviour).
+    #   { "mode": "24x7" | "business_hours",
+    #     "tz": "Asia/Kolkata", "days": [1..7 ISO weekdays], "start": "09:00", "end": "18:00",
+    #     "holidays": ["YYYY-MM-DD", ...],                       # dates in the coverage tz
+    #     "priority_overrides": { "critical": "24x7" } }         # per-priority mode override
+    # Deadlines are computed calendar-aware in utils/support_desk/sla.compute_deadlines;
+    # existing DBs get this column via add_support_sla_coverage_column.py (create_all
+    # never alters existing tables).
+    coverage = Column(JSONB, nullable=False, default=dict, server_default='{}')
     escalation_levels = Column(JSONB, nullable=False, default=list)
     is_default = Column(Boolean, nullable=False, default=False, index=True)
     is_active = Column(Boolean, nullable=False, default=True, index=True)

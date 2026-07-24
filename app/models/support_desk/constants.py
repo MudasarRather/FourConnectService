@@ -397,6 +397,129 @@ def priority_from_matrix(impact, urgency):
     return IMPACT_URGENCY_MATRIX.get(str(urgency), {}).get(str(impact))
 
 
+# ── Incident Management ("Fault Grid" / "Command Funnel" desks) ──
+# SEV1–SEV4 is a DERIVED classification, never a stored column — a 4th severity axis
+# would drift against priority / impact×urgency / business_impact. The single source
+# of truth is app.utils.support_desk.incidents.ticket_sev():
+#   SEV1 = is_major_incident · SEV2 = priority critical (non-MI) · SEV3 = high · SEV4 = medium|low
+SEV_FROM_PRIORITY = {"critical": 2, "urgent": 3, "high": 3, "medium": 4, "low": 4}
+
+
+class PirStatus(str, enum.Enum):
+    """Post-Incident Report lifecycle: draft → in_review → approved → published.
+    Reject sends an in_review report back to draft (with the reviewer's note)."""
+    DRAFT = "draft"
+    IN_REVIEW = "in_review"
+    APPROVED = "approved"
+    PUBLISHED = "published"
+
+
+PIR_STATUSES = [s.value for s in PirStatus]
+
+# Module key consumed by app.utils.hr.numbering.next_number()
+NUMBERING_MODULE_PIR = "SUPPORT_PIR"
+
+# A terminal SEV1 / major incident older than this many days without a PIR draft is
+# flagged by the pir-missing sweep (nudges the commander/owner, 24h-throttled).
+PIR_REQUIRED_AFTER_DAYS = 3
+
+
+class IncidentRole(str, enum.Enum):
+    """MI command roster (ServiceNow MIM / PagerDuty response-roles parity)."""
+    COMMANDER = "commander"      # incident_commander_id — owns the response
+    COMMS_LEAD = "comms_lead"    # comms_lead_id — owns stakeholder updates
+    OPS_LEAD = "ops_lead"        # ops_lead_id — owns the technical bridge
+
+
+class DecisionKind(str, enum.Enum):
+    """Decision-log taxonomy — command decisions recorded as immutable activity rows
+    (action='decision_logged'). DR/failover/BCP invocations are RECORDED here, not
+    automated (there is no infra-automation seam in this stack)."""
+    MITIGATION = "mitigation"
+    ESCALATE_EXECUTIVE = "escalate_executive"
+    FAILOVER = "failover"
+    ACTIVATE_DR = "activate_dr"
+    INVOKE_BCP = "invoke_bcp"
+    ROLLBACK = "rollback"
+    VENDOR_ENGAGED = "vendor_engaged"
+    COMMS = "comms"
+    STAND_DOWN = "stand_down"
+    OTHER = "other"
+
+
+DECISION_KINDS = [k.value for k in DecisionKind]
+
+
+# ── Response playbooks / incident tasks ("Fault Grid" / "Command Funnel" desks) ──
+# An incident TASK is one check-off row on a live response (table support_incident_tasks).
+# Statuses: open → done (stamps done_at/by) | open → skipped (the tombstone — there is
+# no DELETE; a skipped row keeps the paper trail). done→open is an audited correction.
+INCIDENT_TASK_STATUSES = ("open", "done", "skipped")
+
+# Curated response playbooks (ServiceNow playbook parity). SNAPSHOT-ON-APPLY: applying a
+# playbook copies its task titles into support_incident_tasks rows stamped with the
+# template_key — later edits to this dict never rewrite history already on a ticket.
+# Keys are frozen API contract (GET /incidents/playbooks + apply-template payloads).
+INCIDENT_PLAYBOOKS = {
+    "sev1_bridge": {
+        "label": "SEV1 Bridge Standup",
+        "description": "Stand up the full major-incident command structure: ownership, "
+                       "war room, roster, cadence, impact record and the first mitigation call.",
+        "tasks": [
+            "Acknowledge the incident — a named responder owns eyes on it",
+            "Assign the incident commander",
+            "Open the war-room bridge and post the join link on the ticket",
+            "Staff the comms lead and ops lead seats",
+            "Arm the stakeholder update cadence (30 minutes or tighter)",
+            "Record the impact assessment: affected services, users, business impact",
+            "Identify the last known-good change and evaluate rollback",
+            "Log the first mitigation decision in the decision log",
+        ],
+    },
+    "sev2_response": {
+        "label": "SEV2 First Response",
+        "description": "The first-hour drill for a critical (SEV2) incident: own it, size it, "
+                       "check precedent, communicate, and decide the escalation question early.",
+        "tasks": [
+            "Acknowledge the incident and confirm ownership",
+            "Confirm severity against impact and urgency — is this really SEV2?",
+            "Record affected services and the affected-user count",
+            "Check similar past incidents for a known fix or workaround",
+            "Post the first internal status note with what is known so far",
+            "Decide: mitigate at this tier or propose the major-incident desk",
+        ],
+    },
+    "security_exposure": {
+        "label": "Security Exposure Response",
+        "description": "Containment-first drill when an incident carries security exposure: "
+                       "isolate, preserve evidence, notify the right owners, assess the blast radius.",
+        "tasks": [
+            "Flag security impact on the incident record",
+            "Contain: isolate affected systems or revoke exposed credentials",
+            "Preserve logs and evidence BEFORE remediation changes them",
+            "Notify the security owner and the compliance stakeholder",
+            "Assess data exposure: what data, whose, and how much",
+            "Log the containment decision in the decision log",
+            "Book the post-incident review with security in the room",
+        ],
+    },
+    "public_comms": {
+        "label": "Public Communications",
+        "description": "Outward-facing incident comms: a staffed comms seat, an approved holding "
+                       "statement, an honoured cadence, and a clean all-clear.",
+        "tasks": [
+            "Flag public impact on the incident record",
+            "Staff the comms lead seat",
+            "Draft the holding statement and get it approved",
+            "Publish the first customer-facing status update",
+            "Arm a stakeholder update cadence — and honour it",
+            "Log every outbound statement on the comms trail",
+            "Publish the all-clear and close the loop with stakeholders",
+        ],
+    },
+}
+
+
 # Notification events (consumed by app.utils.hr.notify.dispatch())
 EVT_TICKET_CREATED = "SUPPORT_TICKET_CREATED"
 EVT_TICKET_ASSIGNED = "SUPPORT_TICKET_ASSIGNED"
@@ -414,3 +537,160 @@ EVT_TICKET_RESTORED = "SUPPORT_TICKET_RESTORED"
 EVT_TEAM_MEMBER_ADDED = "SUPPORT_TEAM_MEMBER_ADDED"
 EVT_TEAM_MEMBER_REMOVED = "SUPPORT_TEAM_MEMBER_REMOVED"
 EVT_TEAM_LEAD_ASSIGNED = "SUPPORT_TEAM_LEAD_ASSIGNED"
+
+# Incident Management events (Fault Grid / Command Funnel desks)
+EVT_INCIDENT_ROLES_ASSIGNED = "SUPPORT_INCIDENT_ROLES_ASSIGNED"
+EVT_INCIDENT_DECISION = "SUPPORT_INCIDENT_DECISION_LOGGED"
+EVT_INCIDENT_IMPACT = "SUPPORT_INCIDENT_IMPACT_STAMPED"
+EVT_INCIDENT_CADENCE = "SUPPORT_INCIDENT_CADENCE_CHANGED"
+EVT_PIR_SUBMITTED = "SUPPORT_PIR_SUBMITTED"
+EVT_PIR_APPROVED = "SUPPORT_PIR_APPROVED"
+EVT_PIR_REJECTED = "SUPPORT_PIR_REJECTED"
+EVT_PIR_PUBLISHED = "SUPPORT_PIR_PUBLISHED"
+EVT_PIR_OVERDUE = "SUPPORT_PIR_OVERDUE"
+
+# Major-incident command extensions (proposal workflow / stakeholder broadcast /
+# PIR action-item tracker). Declared MI keeps EVT_TICKET_ESCALATED for back-compat;
+# EVT_INCIDENT_DECLARED is the incident-specific signal layered on top.
+EVT_INCIDENT_DECLARED = "SUPPORT_INCIDENT_DECLARED"
+EVT_INCIDENT_MI_PROPOSED = "SUPPORT_INCIDENT_MI_PROPOSED"
+EVT_INCIDENT_MI_DECLINED = "SUPPORT_INCIDENT_MI_DECLINED"
+EVT_INCIDENT_STATUS_UPDATE = "SUPPORT_INCIDENT_STATUS_UPDATE"
+EVT_PIR_ACTION_UPDATED = "SUPPORT_PIR_ACTION_UPDATED"
+EVT_PIR_ACTION_OVERDUE = "SUPPORT_PIR_ACTION_OVERDUE"
+
+# Critical-desk extensions (response playbooks + severity reclassification).
+# EVT_INCIDENT_TASK_ASSIGNED is a personal ping (a named person got a job) — deliberately
+# NOT webhook-mirrored; EVT_INCIDENT_SEV_CHANGED is command-relevant and rides the uplink.
+EVT_INCIDENT_TASK_ASSIGNED = "SUPPORT_INCIDENT_TASK_ASSIGNED"
+EVT_INCIDENT_SEV_CHANGED = "SUPPORT_INCIDENT_SEV_CHANGED"
+
+# RCA v2 (RCA desks). FILED fans to the team leads for review and rides the uplink;
+# VALIDATED closes the loop to the filer and rides the uplink; RETURNED is a personal
+# "your filing came back" ping — deliberately NOT webhook-mirrored (task-assigned precedent).
+EVT_RCA_FILED = "SUPPORT_RCA_FILED"
+EVT_RCA_VALIDATED = "SUPPORT_RCA_VALIDATED"
+EVT_RCA_RETURNED = "SUPPORT_RCA_RETURNED"
+
+
+# ═══════════════════════ Incident Timeline — event taxonomy ═══════════════════════
+# The catalog is the READ-SIDE registry over `support_ticket_activities.action`:
+# label/category/tone drive the timeline desks' chips and rendering, `milestone`
+# marks the actions a commander may pin, `system` marks sweep/automation-only
+# writers. It is NEVER a write-side constraint — `_log_activity` stays free —
+# but every NEW writer must register its action here or its events render with
+# TIMELINE_DEFAULT_META and its kind can't be filtered (the timeline `kinds`
+# param 422-validates against these keys).
+TIMELINE_CATEGORIES = ("lifecycle", "command", "comms", "sla", "governance", "system")
+
+
+def _tl(label: str, category: str, tone: str, milestone: bool = False,
+        system: bool = False) -> dict:
+    return {"label": label, "category": category, "tone": tone,
+            "milestone": milestone, "system": system}
+
+
+ACTIVITY_CATALOG: dict[str, dict] = {
+    # ── lifecycle ──
+    "created": _tl("Fault raised", "lifecycle", "amber", milestone=True),
+    "updated": _tl("Record updated", "lifecycle", "dim"),
+    "status_changed": _tl("Status moved", "lifecycle", "dim", milestone=True),
+    "resolved": _tl("Resolved", "lifecycle", "live", milestone=True),
+    "reopened": _tl("Reopened", "lifecycle", "arc", milestone=True),
+    "restored": _tl("Restored from archive", "lifecycle", "live"),
+    "archived": _tl("Archived", "lifecycle", "dim"),
+    "merged": _tl("Merged", "lifecycle", "dim"),
+    "withdrawn": _tl("Withdrawn", "lifecycle", "dim"),
+    "follow_up_created": _tl("Follow-up opened", "lifecycle", "hi"),
+    "parent_incident_resolved": _tl("Master incident resolved", "lifecycle", "live"),
+    "requester_changed": _tl("Requester changed", "lifecycle", "dim"),
+    # ── command ──
+    "major_incident": _tl("MI declared", "command", "arc", milestone=True),
+    "mi_proposed": _tl("MI proposed", "command", "warn"),
+    "mi_confirmed": _tl("MI confirmed", "command", "arc", milestone=True),
+    "mi_declined": _tl("MI declined", "command", "dim"),
+    "mi_withdrawn": _tl("MI proposal withdrawn", "command", "dim"),
+    "incident_roles_set": _tl("Roster staffed", "command", "amber", milestone=True),
+    "incident_impact_set": _tl("Impact stamped", "command", "warn", milestone=True),
+    "decision_logged": _tl("Decision logged", "command", "warn", milestone=True),
+    "incident_sev_changed": _tl("SEV reclassified", "command", "warn", milestone=True),
+    "incident_linked": _tl("Linked to master", "command", "hi", milestone=True),
+    "incident_unlinked": _tl("Unlinked from master", "command", "dim"),
+    "child_incident_linked": _tl("Child incident coupled", "command", "hi"),
+    "task_added": _tl("Task added", "command", "dim"),
+    "task_status": _tl("Task moved", "command", "dim"),
+    "task_assigned": _tl("Task assigned", "command", "dim"),
+    "playbook_applied": _tl("Playbook applied", "command", "amber", milestone=True),
+    "swarm_started": _tl("Swarm started", "command", "amber"),
+    "swarm_joined": _tl("Swarm joined", "command", "dim"),
+    "swarm_ended": _tl("Swarm ended", "command", "dim"),
+    "acknowledged": _tl("Acknowledged", "command", "live", milestone=True),
+    "escalated": _tl("Escalated", "command", "warn", milestone=True),
+    "de_escalated": _tl("De-escalated", "command", "dim", milestone=True),
+    "escalation_acknowledged": _tl("Escalation acknowledged", "command", "live"),
+    "tier_moved": _tl("Tier moved", "command", "warn"),
+    "handoff": _tl("Handed off", "command", "warn"),
+    "assigned": _tl("Assigned", "command", "amber"),
+    "unassigned": _tl("Unassigned", "command", "dim"),
+    "routed": _tl("Queue-routed", "command", "dim"),
+    "skipped": _tl("Skipped in queue", "command", "dim"),
+    "collaborator_added": _tl("Collaborator added", "command", "dim"),
+    "collaborator_removed": _tl("Collaborator removed", "command", "dim"),
+    "problem_cascade_resolved": _tl("Problem cascade resolve", "command", "live"),
+    # ── comms ──
+    "replied": _tl("Customer reply", "comms", "hi"),
+    "internal_note": _tl("Internal note", "comms", "dim"),
+    "status_update": _tl("Status update posted", "comms", "amber", milestone=True),
+    "comment_redacted": _tl("Comment redacted", "comms", "dim"),
+    "reminded": _tl("Reminder fired", "comms", "dim"),
+    "owner_nudge": _tl("Owner nudged", "comms", "warn"),
+    "watcher_added": _tl("Watcher added", "comms", "dim"),
+    "watcher_removed": _tl("Watcher removed", "comms", "dim"),
+    "csat": _tl("CSAT received", "comms", "hi"),
+    "template_run": _tl("Template applied", "comms", "dim"),
+    # ── sla ──
+    "sla_breached": _tl("SLA breached", "sla", "arc", milestone=True, system=True),
+    "sla_reclassed": _tl("SLA reclassified", "sla", "warn", system=True),
+    "update_overdue": _tl("Update cadence overdue", "sla", "arc", system=True),
+    "escalation_response_overdue": _tl("Escalation response overdue", "sla", "arc", system=True),
+    "vendor_overdue": _tl("Vendor overdue", "sla", "arc", system=True),
+    "hold_review_due": _tl("Hold review due", "sla", "warn", system=True),
+    "hold_extended": _tl("Hold extended", "sla", "dim"),
+    "vendor_dispatched": _tl("Vendor dispatched", "sla", "warn"),
+    "vendor_chased": _tl("Vendor chased", "sla", "warn"),
+    "vendor_replied": _tl("Vendor replied", "sla", "live"),
+    "time_logged": _tl("Worklog added", "sla", "dim"),
+    "time_log_removed": _tl("Worklog removed", "sla", "dim"),
+    # ── governance ──
+    "pir_created": _tl("PIR opened", "governance", "hi"),
+    "pir_updated": _tl("PIR updated", "governance", "dim"),
+    "pir_submitted": _tl("PIR submitted", "governance", "hi"),
+    "pir_approved": _tl("PIR approved", "governance", "live"),
+    "pir_rejected": _tl("PIR rejected", "governance", "arc"),
+    "pir_published": _tl("PIR published", "governance", "hi", milestone=True),
+    "pir_overdue": _tl("PIR overdue", "governance", "arc", system=True),
+    "pir_action_status": _tl("PIR action moved", "governance", "dim"),
+    "pir_action_overdue": _tl("PIR action overdue", "governance", "arc", system=True),
+    "pir_meeting_set": _tl("PIR review scheduled", "governance", "hi"),
+    "rca_recorded": _tl("RCA recorded", "governance", "hi", milestone=True),
+    "rca_revised": _tl("RCA revised", "governance", "dim"),
+    "rca_validated": _tl("RCA validated", "governance", "live", milestone=True),
+    "rca_returned": _tl("RCA returned", "governance", "warn"),
+    "rca_invalidated": _tl("RCA gone stale", "governance", "warn", system=True),
+    "rca_inherited": _tl("RCA inherited from problem", "governance", "hi"),
+    "cluster_promoted": _tl("Recurrence promoted to problem", "governance", "hi"),
+    "kb_promoted": _tl("Promoted to KB", "governance", "hi"),
+    "legal_hold_set": _tl("Legal hold placed", "governance", "warn"),
+    "legal_hold_released": _tl("Legal hold released", "governance", "dim"),
+    "linked_task": _tl("Task linked", "governance", "dim"),
+    # ── system ──
+    "rule_fired": _tl("Automation rule fired", "system", "dim", system=True),
+}
+
+# Unknown actions are never hidden from the feed — they render with this fallback
+# (forward-compat for writers that land before their catalog entry does).
+TIMELINE_DEFAULT_META = {"label": None, "category": "system", "tone": "dim",
+                         "milestone": False, "system": False}
+
+# Per-ticket cap on pinned milestone events (a curated spine, not a second feed).
+MILESTONES_PER_TICKET = 12

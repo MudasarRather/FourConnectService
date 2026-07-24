@@ -178,11 +178,62 @@ class SdTicket(Base):
     next_update_due_at = Column(DateTime(timezone=True), nullable=True, index=True)
     last_status_update_at = Column(DateTime(timezone=True), nullable=True)
 
+    # ── Incident command (Fault Grid / Command Funnel desks) ──
+    # MI response roster (ServiceNow MIM / PagerDuty response-roles parity): the commander
+    # owns the response, the comms lead owns stakeholder updates, the ops lead owns the
+    # technical bridge. Distinct from assigned_agent_id — the assignee keeps working the
+    # ticket; the roster coordinates the RESPONSE. Written only by /incident-roles.
+    incident_commander_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    comms_lead_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    ops_lead_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    # Impact detail: which named services/systems are hit ([str] — free service labels or
+    # SdServiceItem names), when the disruption actually STARTED vs when it was DETECTED
+    # (both can predate created_at — monitoring lag is real), and the compliance/security/
+    # public exposure flags the SEV1/SEV2 desk surfaces (revenue_impact already exists above).
+    affected_services = Column(JSONB, nullable=False, default=list)
+    incident_started_at = Column(DateTime(timezone=True), nullable=True)
+    incident_detected_at = Column(DateTime(timezone=True), nullable=True)
+    compliance_impact = Column(Boolean, nullable=False, default=False, server_default="false")
+    security_impact = Column(Boolean, nullable=False, default=False, server_default="false")
+    public_impact = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Parent/child linking (ServiceNow child-incident parity, ONE level deep): children
+    # roll up under a master incident. Distinct from merged_into_id (dedup tombstone) and
+    # linked_problem_id (ITIL problem) — a child stays a live, separately-worked ticket.
+    # Written only by /incident-parent.
+    parent_incident_id = Column(UUID(as_uuid=True), ForeignKey("support_tickets.id"),
+                                nullable=True, index=True)
+    # MI-candidate proposal (ServiceNow "major incident candidate" parity): an owner-tier
+    # agent PROPOSES major status; a team lead / superuser confirms (→ is_major_incident)
+    # or declines with a note. Direct declare is lead/superuser-only. Stamps clear on
+    # confirm/decline/direct-declare; history lives in mi_proposed/mi_confirmed/mi_declined
+    # activity rows. mi_proposed_by_id is a bare UUID (no FK) per _INCIDENT_COLUMNS convention.
+    mi_proposed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    mi_proposed_by_id = Column(UUID(as_uuid=True), nullable=True)
+    mi_proposal_note = Column(String(500), nullable=True)
+
     # ── SLA-breach root-cause analysis (Phase 2) ──
     breach_reason = Column(String(240), nullable=True)
     rca_summary = Column(Text, nullable=True)
     rca_corrective = Column(Text, nullable=True)
     rca_preventive = Column(Text, nullable=True)
+    # ── RCA v2 (RCA desks): structured capture + review workflow ──
+    # rca_status = filed|validated|returned|stale (NULL = no RCA). Legacy rows with
+    # rca_summary but NULL status READ as 'filed' — always go through
+    # utils/support_desk/rca.rca_effective_status(_expr), never the raw column.
+    # rca_category mirrors the PIR RootCauseCategory taxonomy at ticket level.
+    # rca_five_whys ([str] ≤5) / rca_factors ([str] ≤10) = structured methodology.
+    # filed/reviewed stamps are bare UUIDs per the incident-column convention.
+    # rca_inherited_from_problem_id = provenance when a problem cascade stamped it.
+    rca_status = Column(String(20), nullable=True, index=True)
+    rca_category = Column(String(40), nullable=True)
+    rca_five_whys = Column(JSONB, nullable=True)
+    rca_factors = Column(JSONB, nullable=True)
+    rca_filed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    rca_filed_by_id = Column(UUID(as_uuid=True), nullable=True)
+    rca_reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    rca_reviewed_by_id = Column(UUID(as_uuid=True), nullable=True)
+    rca_review_note = Column(String(500), nullable=True)
+    rca_inherited_from_problem_id = Column(UUID(as_uuid=True), nullable=True)
 
     # ── Agent workbench (ITIL triage + resolve + merge + time) ──
     sub_status = Column(String(40), nullable=True)               # finer state within a status
@@ -293,6 +344,13 @@ class SdTicketActivity(Base):
     action = Column(String(60), nullable=False)  # created/assigned/status_changed/escalated/...
     detail = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    # Timeline milestone pin (Incident Timeline desks): a commander/owner-tier actor
+    # curates the key beats of an incident. Pins are audit-logged (write_audit), never
+    # re-logged as activities — a pin must not spam the very feed it curates.
+    is_milestone = Column(Boolean, nullable=False, default=False, server_default="false")
+    pinned_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    pinned_at = Column(DateTime(timezone=True), nullable=True)
 
     ticket = relationship("SdTicket", back_populates="activities")
 

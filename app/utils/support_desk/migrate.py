@@ -176,6 +176,119 @@ _TEMPLATE_STUDIO_INDEXES = [
 ]
 
 
+# ── Incident Management ("Fault Grid" / "Command Funnel" desks) — command roster +
+# impact-detail columns. incident_commander/comms_lead/ops_lead = the MI response roster
+# (distinct from assigned_agent_id); affected_services = named systems hit ([str] JSONB);
+# incident_started_at/detected_at = the real disruption clock (can predate created_at);
+# compliance/security/public_impact = the SEV1/SEV2 exposure flags. UUID columns land
+# bare (the ORM declares the FKs) to dodge create-order issues.
+_INCIDENT_COLUMNS = [
+    ("support_tickets", "incident_commander_id", "UUID"),
+    ("support_tickets", "comms_lead_id", "UUID"),
+    ("support_tickets", "ops_lead_id", "UUID"),
+    ("support_tickets", "affected_services", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+    ("support_tickets", "incident_started_at", "TIMESTAMPTZ"),
+    ("support_tickets", "incident_detected_at", "TIMESTAMPTZ"),
+    ("support_tickets", "compliance_impact", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("support_tickets", "security_impact", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("support_tickets", "public_impact", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    # Parent/child incident linking (one level deep) — child rows roll up under a master.
+    ("support_tickets", "parent_incident_id", "UUID"),
+]
+
+_INCIDENT_INDEXES = [
+    # Speeds the roles-unassigned MI stat + the commander's "my incidents" lens.
+    ("ix_support_tickets_incident_commander", "support_tickets", "incident_commander_id"),
+    # Speeds the per-master child rollup + the children list.
+    ("ix_support_tickets_parent_incident", "support_tickets", "parent_incident_id"),
+]
+
+
+# ── MI-candidate proposal workflow (ServiceNow "major incident candidate" parity) —
+# an owner-tier agent proposes major status; a team lead / superuser confirms or
+# declines with a note. Stamps clear on decision; history lives in activity rows.
+_MI_PROPOSAL_COLUMNS = [
+    ("support_tickets", "mi_proposed_at", "TIMESTAMPTZ"),
+    ("support_tickets", "mi_proposed_by_id", "UUID"),
+    ("support_tickets", "mi_proposal_note", "VARCHAR(500)"),
+]
+
+_MI_PROPOSAL_INDEXES = [
+    # Speeds the mi_proposed flag lens + the admin docket count.
+    ("ix_support_tickets_mi_proposed_at", "support_tickets", "mi_proposed_at"),
+]
+
+
+# ── Incident Timeline desks — milestone-pin columns on the activity stream ──
+# is_milestone/pinned_by_id/pinned_at let a commander curate the key beats of an
+# incident directly on `support_ticket_activities`. SQL-composable (milestones=1
+# feed filter, pulse counts) and indexable — deliberately NOT a JSONB set on the
+# ticket. The action btree also serves the `kinds` filter, the pulse category
+# case-expr and build_phase_track's action scans.
+_TIMELINE_MILESTONE_COLUMNS = [
+    ("support_ticket_activities", "is_milestone", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("support_ticket_activities", "pinned_by_id", "UUID"),
+    ("support_ticket_activities", "pinned_at", "TIMESTAMPTZ"),
+]
+
+_TIMELINE_MILESTONE_INDEXES = [
+    ("ix_support_ticket_activities_action", "support_ticket_activities", "action"),
+]
+
+
+# ── RCA v2 (Root Cause Analysis desks) — structured RCA + review workflow columns ──
+# rca_status = the review machine (filed|validated|returned|stale; NULL = no RCA yet;
+# legacy rca_summary-only rows READ as 'filed' via rca_effective_status_expr and are
+# eagerly stamped by the backfill below). rca_category mirrors the PIR's
+# RootCauseCategory taxonomy at ticket level; rca_five_whys / rca_factors are the
+# structured methodology (JSONB lists, ServiceNow parity). filed/reviewed stamps are
+# bare UUIDs per the _INCIDENT_COLUMNS convention. rca_inherited_from_problem_id =
+# provenance when a problem cascade stamps the RCA (never overwrites a live filing).
+_RCA_V2_COLUMNS = [
+    ("support_tickets", "rca_status", "VARCHAR(20)"),
+    ("support_tickets", "rca_category", "VARCHAR(40)"),
+    ("support_tickets", "rca_five_whys", "JSONB"),
+    ("support_tickets", "rca_factors", "JSONB"),
+    ("support_tickets", "rca_filed_at", "TIMESTAMPTZ"),
+    ("support_tickets", "rca_filed_by_id", "UUID"),
+    ("support_tickets", "rca_reviewed_at", "TIMESTAMPTZ"),
+    ("support_tickets", "rca_reviewed_by_id", "UUID"),
+    ("support_tickets", "rca_review_note", "VARCHAR(500)"),
+    ("support_tickets", "rca_inherited_from_problem_id", "UUID"),
+]
+
+_RCA_V2_INDEXES = [
+    # Speeds the RCA board lenses (owed/pending/returned/validated) + review docket.
+    ("ix_support_tickets_rca_status", "support_tickets", "rca_status"),
+    # Speeds cycle-time analytics + the board's filed_at sort.
+    ("ix_support_tickets_rca_filed_at", "support_tickets", "rca_filed_at"),
+]
+
+
+# ── PIR v2 (Post-Incident Review desks) — parity-pack document columns ──
+# metrics_snapshot = the FROZEN clock/impact record stamped at submit; retro registers
+# (went_well/went_wrong/contributing_factors) + participants + review-meeting fields are
+# the ServiceNow-grade review-document surfaces; revisions = append-only edit trail;
+# distribution = the publish fan-out receipt. All additive; JSONB registers default '[]'.
+_PIR_V2_COLUMNS = [
+    ("support_incident_reports", "metrics_snapshot", "JSONB"),
+    ("support_incident_reports", "contributing_factors", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+    ("support_incident_reports", "went_well", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+    ("support_incident_reports", "went_wrong", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+    ("support_incident_reports", "participants", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+    ("support_incident_reports", "review_meeting_at", "TIMESTAMPTZ"),
+    ("support_incident_reports", "review_meeting_notes", "TEXT"),
+    ("support_incident_reports", "revisions", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+    ("support_incident_reports", "distribution", "JSONB"),
+]
+
+_PIR_V2_INDEXES = [
+    # Speeds the Chrono Desk calendar's pir_review window scan.
+    ("ix_support_incident_reports_review_meeting_at",
+     "support_incident_reports", "review_meeting_at"),
+]
+
+
 def _apply_additive(engine, columns, indexes) -> list[str]:
     """Run guarded ADD COLUMN / CREATE INDEX statements, one transaction each."""
     applied: list[str] = []
@@ -270,6 +383,160 @@ def ensure_template_studio_columns(engine) -> list[str]:
         applied.append("backfill: inactive templates -> status='archived'")
     except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
         print(f"[support_desk.migrate] skipped template-status backfill ({exc})")
+    return applied
+
+
+def ensure_ticket_incident_columns(engine) -> list[str]:
+    """Add the incident-command roster + impact-detail columns + index (Fault Grid /
+    Command Funnel desks). Idempotent + guarded."""
+    return _apply_additive(engine, _INCIDENT_COLUMNS, _INCIDENT_INDEXES)
+
+
+def ensure_ticket_mi_proposal_columns(engine) -> list[str]:
+    """Add the MI-candidate proposal columns + index (propose → confirm/decline
+    workflow on the Major Incident desks). Idempotent + guarded."""
+    return _apply_additive(engine, _MI_PROPOSAL_COLUMNS, _MI_PROPOSAL_INDEXES)
+
+
+def ensure_incident_tasks_table(engine) -> list[str]:
+    """Create the ``support_incident_tasks`` table (response playbooks / incident tasks
+    on the Critical desks) if it doesn't exist yet. A whole NEW table, so the ORM DDL
+    with ``checkfirst`` is the idempotent path — no ALTER dance. Guarded: a failure
+    prints and returns empty, never blocks boot."""
+    try:
+        from app.models.support_desk.incident import SdIncidentTask
+        SdIncidentTask.__table__.create(bind=engine, checkfirst=True)
+        return ["CREATE TABLE IF NOT EXISTS support_incident_tasks (ORM create, checkfirst)"]
+    except Exception as exc:  # noqa: BLE001 — additive, never fatal
+        print(f"[support_desk.migrate] skipped: create support_incident_tasks ({exc})")
+        return []
+
+
+def ensure_timeline_milestone_columns(engine) -> list[str]:
+    """Add the milestone-pin columns to `support_ticket_activities` + the action btree
+    + a partial index over pinned rows (Incident Timeline desks). Idempotent + guarded."""
+    applied = _apply_additive(engine, _TIMELINE_MILESTONE_COLUMNS, _TIMELINE_MILESTONE_INDEXES)
+    partial = ("CREATE INDEX IF NOT EXISTS ix_sta_milestone_at "
+               "ON support_ticket_activities (created_at) WHERE is_milestone")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(partial))
+        applied.append(partial)
+    except Exception as exc:  # noqa: BLE001 — partial indexes are PG-only; never fatal
+        print(f"[support_desk.migrate] skipped: {partial} ({exc})")
+    return applied
+
+
+def ensure_ticket_rca_v2_columns(engine) -> list[str]:
+    """Add the RCA v2 structured-capture + review-workflow columns + indexes, then
+    best-effort backfill legacy rows (rca_summary present, rca_status NULL):
+
+    - older than 90 days  → 'validated' (system-grandfathered — keeps years of
+      pre-review-era RCAs out of the fresh pending-review docket; rca_reviewed_by_id
+      stays NULL so grandfathering is distinguishable from a human ruling),
+    - within 90 days      → 'filed' (recent filings enter the review lane),
+    - rca_filed_at        → recovered from each ticket's newest 'rca_recorded'
+      activity row where missing.
+
+    If the JSONB variant fails (non-Postgres test engine) the two structured columns
+    retry as TEXT so the attribute always exists. Idempotent + guarded."""
+    applied = _apply_additive(engine, _RCA_V2_COLUMNS, _RCA_V2_INDEXES)
+    if not any("rca_five_whys" in s for s in applied):
+        applied += _apply_additive(
+            engine,
+            [("support_tickets", "rca_five_whys", "TEXT"),
+             ("support_tickets", "rca_factors", "TEXT")],
+            [],
+        )
+    backfills = [
+        ("grandfather >90d → validated", """
+            UPDATE support_tickets
+            SET rca_status = 'validated'
+            WHERE rca_status IS NULL
+              AND rca_summary IS NOT NULL AND btrim(rca_summary) <> ''
+              AND COALESCE(resolved_at, closed_at, created_at) < now() - interval '90 days'
+        """),
+        ("recent ≤90d → filed", """
+            UPDATE support_tickets
+            SET rca_status = 'filed'
+            WHERE rca_status IS NULL
+              AND rca_summary IS NOT NULL AND btrim(rca_summary) <> ''
+        """),
+        ("rca_filed_at from rca_recorded activities", """
+            UPDATE support_tickets t SET rca_filed_at = a.created_at
+            FROM (
+                SELECT DISTINCT ON (ticket_id) ticket_id, created_at
+                FROM support_ticket_activities
+                WHERE action = 'rca_recorded'
+                ORDER BY ticket_id, created_at DESC
+            ) a
+            WHERE a.ticket_id = t.id AND t.rca_status IS NOT NULL AND t.rca_filed_at IS NULL
+        """),
+    ]
+    for label, stmt in backfills:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+            applied.append(f"backfill: {label}")
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            print(f"[support_desk.migrate] skipped RCA backfill ({label}): {exc}")
+    return applied
+
+
+def ensure_pir_v2_columns(engine) -> list[str]:
+    """Add the PIR v2 parity-pack columns + review-meeting index, then backfill a stable
+    ``aid`` onto every existing corrective/preventive action item that lacks one (an
+    8-hex address derived from md5(pir id · kind · position) so the backfill is
+    deterministic and idempotent). If the JSONB variants fail (non-Postgres test
+    engine) the register columns retry as TEXT so the attribute always exists."""
+    applied = _apply_additive(engine, _PIR_V2_COLUMNS, _PIR_V2_INDEXES)
+    if not any("went_well" in s for s in applied):
+        applied += _apply_additive(
+            engine,
+            [("support_incident_reports", "metrics_snapshot", "TEXT"),
+             ("support_incident_reports", "contributing_factors", "TEXT"),
+             ("support_incident_reports", "went_well", "TEXT"),
+             ("support_incident_reports", "went_wrong", "TEXT"),
+             ("support_incident_reports", "participants", "TEXT"),
+             ("support_incident_reports", "revisions", "TEXT"),
+             ("support_incident_reports", "distribution", "TEXT")],
+            [],
+        )
+    backfills = [
+        ("stable aid on corrective actions", """
+            UPDATE support_incident_reports SET corrective_actions = (
+                SELECT COALESCE(jsonb_agg(
+                    CASE WHEN jsonb_typeof(e.item) = 'object' AND (e.item->>'aid') IS NULL
+                         THEN e.item || jsonb_build_object(
+                             'aid', left(md5(id::text || 'corrective' || (e.ord - 1)::text), 8))
+                         ELSE e.item END ORDER BY e.ord), '[]'::jsonb)
+                FROM jsonb_array_elements(corrective_actions) WITH ORDINALITY AS e(item, ord))
+            WHERE jsonb_typeof(corrective_actions) = 'array'
+              AND jsonb_array_length(corrective_actions) > 0
+              AND EXISTS (SELECT 1 FROM jsonb_array_elements(corrective_actions) x
+                          WHERE jsonb_typeof(x) = 'object' AND (x->>'aid') IS NULL)
+        """),
+        ("stable aid on preventive actions", """
+            UPDATE support_incident_reports SET preventive_actions = (
+                SELECT COALESCE(jsonb_agg(
+                    CASE WHEN jsonb_typeof(e.item) = 'object' AND (e.item->>'aid') IS NULL
+                         THEN e.item || jsonb_build_object(
+                             'aid', left(md5(id::text || 'preventive' || (e.ord - 1)::text), 8))
+                         ELSE e.item END ORDER BY e.ord), '[]'::jsonb)
+                FROM jsonb_array_elements(preventive_actions) WITH ORDINALITY AS e(item, ord))
+            WHERE jsonb_typeof(preventive_actions) = 'array'
+              AND jsonb_array_length(preventive_actions) > 0
+              AND EXISTS (SELECT 1 FROM jsonb_array_elements(preventive_actions) x
+                          WHERE jsonb_typeof(x) = 'object' AND (x->>'aid') IS NULL)
+        """),
+    ]
+    for label, stmt in backfills:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+            applied.append(f"backfill: {label}")
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            print(f"[support_desk.migrate] skipped PIR backfill ({label}): {exc}")
     return applied
 
 

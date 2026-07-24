@@ -58,6 +58,7 @@ def support_dashboard(
         TicketStatus.PENDING_CUSTOMER.value, TicketStatus.PENDING_VENDOR.value])))
     resp.on_hold = count(base.filter(SdTicket.status == TicketStatus.ON_HOLD.value))
     resp.critical = count(open_q.filter(SdTicket.priority == TicketPriority.CRITICAL.value))
+    resp.major_incidents = count(open_q.filter(SdTicket.is_major_incident == True))  # noqa: E712
     resp.escalated = count(base.filter(SdTicket.is_escalated == True,  # noqa: E712
                                        SdTicket.status.in_(OPEN_TICKET_STATUSES)))
     resp.overdue = count(open_q.filter(SdTicket.sla_resolution_breached == True))  # noqa: E712

@@ -54,6 +54,7 @@ from app.routers.support_desk.queue_ops import (
 from app.routers.support_desk.l2_ops import l2_router as _l2_router
 from app.routers.support_desk.l3_ops import l3_router as _l3_router
 from app.routers.support_desk.templates import templates_router as _templates_router
+from app.routers.support_desk.incidents import router as _incidents_router
 from app.routers.support_desk.tickets import router as _tickets_router
 
 router = APIRouter()
@@ -107,6 +108,10 @@ router.include_router(_l2_router)
 router.include_router(_l3_router)
 router.include_router(_saved_views_router)
 router.include_router(_templates_router)
+# Incident Management (Fault Grid / Command Funnel): /support-desk/incidents/* literals +
+# /tickets/{id}/{incident-roles,incident-impact,decision,pir} suffixes — registered
+# BEFORE the broad tickets router (route-shadowing discipline, same as integrations).
+router.include_router(_incidents_router)
 
 # Broad tickets router (has /support-desk/tickets/{ticket_id}) — last.
 router.include_router(_tickets_router)

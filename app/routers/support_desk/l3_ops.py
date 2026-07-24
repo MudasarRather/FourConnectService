@@ -37,6 +37,7 @@ from app.schemas.support_desk.l3 import (
     ProblemCascadeRequest, ProblemCascadeResponse, CascadeTicketResult,
 )
 from app.utils.dependencies import get_support_agent
+from app.utils.support_desk import sla as sla_util
 from app.utils.support_desk.audit import write_audit
 
 l3_router = APIRouter(prefix="/support-desk", tags=["Support Desk — L3 Workbench"])
@@ -137,6 +138,8 @@ def resolve_linked(pid: UUID, payload: ProblemCascadeRequest, request: Request,
         raise HTTPException(422, f"Invalid resolution_code '{payload.resolution_code}'")
     if payload.resolution_category and payload.resolution_category not in _ROOT_CAUSES:
         raise HTTPException(422, f"Invalid resolution_category '{payload.resolution_category}'")
+    if payload.root_cause_category and payload.root_cause_category not in _ROOT_CAUSES:
+        raise HTTPException(422, f"Invalid root_cause_category '{payload.root_cause_category}'")
     require_resolution_summary(payload.resolution_summary)
 
     p = db.query(SdProblem).filter(SdProblem.id == pid,
@@ -183,7 +186,34 @@ def resolve_linked(pid: UUID, payload: ProblemCascadeRequest, request: Request,
                               time_spent_minutes=None, note=None, attachments=None, close=False)
             _log_activity(db, t, admin, "problem_cascade_resolved",
                           {"problem_id": str(p.id), "problem_number": p.problem_number})
-            results.append(CascadeTicketResult(ticket_id=tid, ticket_number=number, ok=True))
+            # RCA v2 propagation: the problem's known root cause IS this ticket's root
+            # cause — stamp it (as a provenance-marked filing) so the cascade never
+            # mints fresh RCA debt. Fills only EMPTY/stale slots; a live human filing
+            # (filed/validated) is never overwritten.
+            inherited = False
+            cause_text = (payload.root_cause or p.root_cause or "").strip()
+            if payload.propagate_rca and len(cause_text) >= 10:
+                from app.utils.support_desk.rca import (
+                    RCA_LIVE_STATUSES, rca_effective_status,
+                )
+                if rca_effective_status(t) not in RCA_LIVE_STATUSES:
+                    t.rca_summary = cause_text
+                    if not (t.rca_preventive or "").strip() and (p.preventive_measures or "").strip():
+                        t.rca_preventive = p.preventive_measures.strip()
+                    if payload.root_cause_category:
+                        t.rca_category = payload.root_cause_category
+                    t.rca_status = "filed"
+                    t.rca_filed_at = sla_util.now_utc()
+                    t.rca_filed_by_id = admin.id
+                    t.rca_reviewed_at = None
+                    t.rca_reviewed_by_id = None
+                    t.rca_review_note = None
+                    t.rca_inherited_from_problem_id = p.id
+                    _log_activity(db, t, admin, "rca_inherited",
+                                  {"problem_id": str(p.id), "problem_number": p.problem_number})
+                    inherited = True
+            results.append(CascadeTicketResult(ticket_id=tid, ticket_number=number, ok=True,
+                                               rca_inherited=inherited))
             resolved += 1
         except HTTPException as e:
             results.append(CascadeTicketResult(ticket_id=tid, ticket_number=number,

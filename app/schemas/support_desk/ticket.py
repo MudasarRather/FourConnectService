@@ -252,10 +252,36 @@ class TicketVendorReply(BaseModel):
 
 
 class TicketRca(BaseModel):
+    """RCA v2 capture payload. Every field optional — legacy callers send subsets —
+    but the router enforces: no empty strings, summary ≥10 chars when provided,
+    category ∈ RootCauseCategory, and ancillary-content-needs-a-summary."""
     breach_reason: Optional[str] = None
     rca_summary: Optional[str] = None
     rca_corrective: Optional[str] = None
     rca_preventive: Optional[str] = None
+    rca_category: Optional[str] = None
+    rca_five_whys: Optional[List[str]] = Field(default=None, max_length=5)
+    rca_factors: Optional[List[str]] = Field(default=None, max_length=10)
+
+    @field_validator("rca_five_whys")
+    @classmethod
+    def _whys_items(cls, v):
+        if v is not None and any(len(str(w)) > 500 for w in v):
+            raise ValueError("each why is capped at 500 characters")
+        return v
+
+    @field_validator("rca_factors")
+    @classmethod
+    def _factor_items(cls, v):
+        if v is not None and any(len(str(f)) > 240 for f in v):
+            raise ValueError("each contributing factor is capped at 240 characters")
+        return v
+
+
+class TicketRcaReview(BaseModel):
+    """Lead/superuser ruling on a filed RCA. Note is REQUIRED on return (the router
+    422s without it — a returned filing must say what to fix), optional on validate."""
+    note: Optional[str] = Field(default=None, max_length=500)
 
 
 class TicketMajorIncident(BaseModel):
@@ -267,6 +293,10 @@ class TicketMajorIncident(BaseModel):
     # Optionally arm the stakeholder status-update cadence on declare (minutes between
     # promised updates). None = leave the cadence as it is.
     update_interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+    # Auto-open an L2 swarm session as the war room on declare (reuses a live swarm if
+    # one exists) and stamp war_room_url with its deep link when the field is blank.
+    # An explicit war_room_url in this payload always wins over the auto-stamp.
+    open_war_room: bool = False
 
 
 # ─────────────────────── War Room action bodies ───────────────────────
@@ -279,13 +309,43 @@ class TicketAck(BaseModel):
 
 class TicketStatusUpdate(BaseModel):
     """Post a stakeholder status update (war-room comms). Lands as a ticket comment —
-    internal work-note or public reply — and re-arms the update-cadence timer."""
-    body: str = Field(min_length=2)
+    internal work-note or public reply — and re-arms the update-cadence timer.
+    ``phase`` tags the update on the incident-lifecycle track (recorded, optional).
+    ``note`` is the stand-down reason — REQUIRED (enforced in the router) when
+    ``stop_cadence`` stands down an ARMED cadence; comms never go dark silently."""
+    body: str = Field(min_length=2, max_length=4000)
     is_internal: bool = False
     # Re-arm override: minutes until the NEXT promised update. None = keep the current
     # interval (still re-arms from now when an interval is set).
     interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
     stop_cadence: bool = False              # stand the update timer down
+    phase: Optional[str] = None             # investigating|identified|mitigating|monitoring|resolved
+    note: Optional[str] = Field(default=None, max_length=500)
+    # Broadcast audience (additive; None = legacy behavior — requester only on public
+    # replies). 'stakeholder' additionally fans the update to the ticket's watchers +
+    # incident roster; 'internal' just tags the comms log without extra fan-out.
+    audience: Optional[str] = None
+
+    @field_validator("phase")
+    @classmethod
+    def _known_phase(cls, v):
+        if v is None or not str(v).strip():
+            return None
+        v = str(v).strip().lower()
+        allowed = {"investigating", "identified", "mitigating", "monitoring", "resolved"}
+        if v not in allowed:
+            raise ValueError(f"phase must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("audience")
+    @classmethod
+    def _known_audience(cls, v):
+        if v is None or not str(v).strip():
+            return None
+        v = str(v).strip().lower()
+        if v not in ("internal", "stakeholder"):
+            raise ValueError("audience must be 'internal' or 'stakeholder'")
+        return v
 
 
 class TicketHold(BaseModel):
@@ -559,10 +619,33 @@ class TicketResponse(BaseModel):
     update_interval_minutes: Optional[int] = None
     next_update_due_at: Optional[datetime] = None
     last_status_update_at: Optional[datetime] = None
+    # Incident command (Fault Grid) — roster + impact detail + parent rollup, so the
+    # drawer's incident modals open pre-filled (all additive; non-incidents stay None)
+    incident_commander_id: Optional[UUID] = None
+    comms_lead_id: Optional[UUID] = None
+    ops_lead_id: Optional[UUID] = None
+    affected_services: List[str] = Field(default_factory=list)
+    incident_started_at: Optional[datetime] = None
+    incident_detected_at: Optional[datetime] = None
+    compliance_impact: bool = False
+    security_impact: bool = False
+    public_impact: bool = False
+    parent_incident_id: Optional[UUID] = None
     breach_reason: Optional[str] = None
     rca_summary: Optional[str] = None
     rca_corrective: Optional[str] = None
     rca_preventive: Optional[str] = None
+    # RCA v2 — structured capture + review workflow (all additive)
+    rca_status: Optional[str] = None               # filed|validated|returned|stale (raw column)
+    rca_category: Optional[str] = None             # RootCauseCategory value
+    rca_five_whys: Optional[List[str]] = None
+    rca_factors: Optional[List[str]] = None
+    rca_filed_at: Optional[datetime] = None
+    rca_filed_by_id: Optional[UUID] = None
+    rca_reviewed_at: Optional[datetime] = None
+    rca_reviewed_by_id: Optional[UUID] = None
+    rca_review_note: Optional[str] = None
+    rca_inherited_from_problem_id: Optional[UUID] = None
 
     # Agent workbench (ITIL triage + resolve + merge + time)
     sub_status: Optional[str] = None

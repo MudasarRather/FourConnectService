@@ -30,13 +30,15 @@ from app.models.support_desk.constants import (
     ARCHIVE_REASON_CODES, ArchiveReason, SUPPORT_ARCHIVE_RETENTION_DAYS,
     EVT_TICKET_CREATED, EVT_TICKET_ASSIGNED, EVT_TICKET_REPLIED,
     EVT_TICKET_STATUS, EVT_TICKET_ESCALATED, EVT_TICKET_RESOLVED, EVT_TICKET_MERGED,
-    EVT_TICKET_REOPENED, EVT_TICKET_ARCHIVED, EVT_TICKET_RESTORED,
+    EVT_TICKET_REOPENED, EVT_TICKET_ARCHIVED, EVT_TICKET_RESTORED, EVT_INCIDENT_CADENCE,
+    EVT_INCIDENT_DECLARED, EVT_INCIDENT_STATUS_UPDATE,
+    EVT_RCA_FILED, EVT_RCA_VALIDATED, EVT_RCA_RETURNED,
 )
 from app.schemas.support_desk.ticket import (
     TicketCreate, TicketUpdate, TicketResponse, TicketDetailResponse, TicketListResponse,
     TicketAssign, TicketStatusChange, TicketCsat, CommentCreate, CommentResponse, ActivityResponse,
     TicketBulkAction, TicketBulkResponse, TicketBulkResult,
-    TicketRemind, TicketNudgeOwner, TicketRca, TicketMajorIncident, TicketHold, TicketReopen, TicketEscalate,
+    TicketRemind, TicketNudgeOwner, TicketRca, TicketRcaReview, TicketMajorIncident, TicketHold, TicketReopen, TicketEscalate,
     TicketResume, TicketHoldExtend,
     TicketResolve, TicketMerge, TicketTimeLog, WorkbenchStats, CollaboratorChange,
     TicketFollowUpCreate, TicketKbPromote, TicketMergeChain, MergeChainNode,
@@ -245,6 +247,24 @@ def _transition_status(db: Session, t: SdTicket, new: str, actor: User, note: st
                            f"Ticket {t.ticket_number}: {new.replace('_', ' ')}",
                            actor_id=actor.id if actor else None,
                            exclude_ids=[t.raised_by_user_id, t.assigned_agent_id])
+    # Parent/child incident linking: a MASTER incident reaching terminal notes every live
+    # child + nudges its owner — recorded, never auto-resolved (each child's fix must be
+    # verified on its own ticket; ServiceNow-style child rollup, decision-log philosophy).
+    if new in (TicketStatus.RESOLVED.value, TicketStatus.CLOSED.value):
+        kids = (db.query(SdTicket)
+                .filter(SdTicket.parent_incident_id == t.id,
+                        SdTicket.is_deleted == False,  # noqa: E712
+                        SdTicket.merged_into_id.is_(None),
+                        SdTicket.status.notin_(list(TERMINAL_TICKET_STATUSES)))
+                .limit(50).all())
+        for k in kids:
+            _log_activity(db, k, actor, "parent_incident_resolved",
+                          {"parent": t.ticket_number, "parent_status": new})
+            if k.assigned_agent_id:
+                dispatch_safe(db, EVT_TICKET_STATUS, k.assigned_agent_id, k,
+                              title=(f"Master incident {t.ticket_number} is {new.replace('_', ' ')} — "
+                                     f"verify {k.ticket_number} and resolve it if the fix covers it"),
+                              action_url=f"{_panel_base(db, k.assigned_agent_id)}/incidents/active")
     return True
 
 
@@ -621,8 +641,9 @@ def list_tickets(
         query = query.filter(SdTicket.sla_response_breached == True,    # noqa: E712
                              SdTicket.sla_resolution_breached == True)  # noqa: E712
     if missing_rca:
-        query = query.filter(or_(SdTicket.breach_reason.is_(None), SdTicket.breach_reason == ""),
-                             or_(SdTicket.rca_summary.is_(None), SdTicket.rca_summary == ""))
+        # RCA v2 single truth: returned/stale filings correctly count as missing.
+        from app.utils.support_desk.rca import rca_missing_legacy_cond
+        query = query.filter(rca_missing_legacy_cond())
     if active_only:
         query = query.filter(SdTicket.status.notin_(list(TERMINAL_TICKET_STATUSES)))
     # Reopened-desk refinements (server-side so pagination/count stay correct).
@@ -1618,13 +1639,128 @@ def vendor_reply(ticket_id: UUID, payload: TicketVendorReply, request: Request,
 
 @router.post("/{ticket_id}/rca", response_model=TicketResponse)
 def set_rca(ticket_id: UUID, payload: TicketRca, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    """RCA v2 capture. Every field optional (legacy subset payloads stay valid), but
+    nothing empty ever lands: provided strings must carry content, a summary must be
+    ≥10 chars, the category must be a RootCauseCategory value, and ancillary content
+    (whys/factors/corrective/preventive/category) needs a summary on record. Content
+    payloads (re-)FILE the RCA — status → 'filed', review stamps clear; a
+    breach_reason-only payload is an annotation and never touches the machine."""
+    from app.utils.support_desk.rca import RCA_CATEGORY_VALUES, rca_effective_status
     t = _get_ticket(db, ticket_id, admin)
     _require_ticket_actor(db, t, admin, "record its RCA")
+    if t.merged_into_id is not None:
+        raise HTTPException(409, "This record was merged — file the RCA on the surviving ticket.")
     data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(422, "Nothing to record — send at least one RCA field.")
+    # Strings: strip; empty-after-strip is a 422, never a silent clear.
+    for k in ("breach_reason", "rca_summary", "rca_corrective", "rca_preventive", "rca_category"):
+        if k in data:
+            data[k] = (data[k] or "").strip()
+            if not data[k]:
+                raise HTTPException(422, f"{k} came through empty — clearing an RCA field is not supported.")
+    if "rca_summary" in data and len(data["rca_summary"]) < 10:
+        raise HTTPException(422, "The root-cause summary needs at least 10 characters — say what actually broke.")
+    if "rca_category" in data and data["rca_category"] not in RCA_CATEGORY_VALUES:
+        raise HTTPException(422, f"Unknown root-cause category '{data['rca_category']}'.")
+    for k in ("rca_five_whys", "rca_factors"):
+        if k in data and data[k] is not None:
+            data[k] = [str(x).strip() for x in data[k] if str(x or "").strip()]
+    prev_status = rca_effective_status(t)
+    content_keys = {"rca_summary", "rca_corrective", "rca_preventive",
+                    "rca_category", "rca_five_whys", "rca_factors"}
+    has_content = bool(content_keys & set(data.keys()))
+    if has_content and "rca_summary" not in data and not (t.rca_summary or "").strip():
+        raise HTTPException(422, "File the root-cause summary first — whys, factors and "
+                                 "follow-ups hang off the summary.")
     for k, v in data.items():
         setattr(t, k, v)
-    _log_activity(db, t, admin, "rca_recorded", {"fields": list(data.keys())})
-    write_audit(db, entity_type="ticket", op="rca", entity_id=t.id, actor_id=admin.id, request=request, details={"fields": list(data.keys())})
+    if has_content:
+        # (Re-)filing: enter/return-to 'filed' and clear the previous ruling — a changed
+        # story is unreviewed by definition. Provenance resets too (human filing now).
+        t.rca_status = "filed"
+        t.rca_filed_at = sla_util.now_utc()
+        t.rca_filed_by_id = admin.id
+        t.rca_reviewed_at = None
+        t.rca_reviewed_by_id = None
+        t.rca_review_note = None
+        t.rca_inherited_from_problem_id = None
+        action = "rca_recorded" if prev_status is None else "rca_revised"
+        _log_activity(db, t, admin, action,
+                      {"fields": sorted(data.keys()), "prev_status": prev_status})
+        # Leads hear first filings and re-files after a return/reopen — not every
+        # touch-up revision (webhook noise discipline).
+        if prev_status in (None, "returned", "stale"):
+            from app.routers.support_desk.incidents import _team_lead_ids
+            for lead_id in _team_lead_ids(db, t.team_id):
+                if lead_id and lead_id != admin.id:
+                    dispatch_safe(db, EVT_RCA_FILED, lead_id, t,
+                                  title=f"Root cause filed for review — {t.ticket_number}",
+                                  action_url=f"{_panel_base(db, lead_id)}/incidents/rca?lens=pending")
+    else:
+        _log_activity(db, t, admin, "rca_recorded",
+                      {"fields": sorted(data.keys()), "annotation": True,
+                       "prev_status": prev_status})
+    write_audit(db, entity_type="ticket", op="rca", entity_id=t.id, actor_id=admin.id,
+                request=request, details={"fields": sorted(data.keys()), "prev_status": prev_status})
+    db.commit(); db.refresh(t)
+    return TicketResponse.model_validate(enrich_ticket(db, t))
+
+
+@router.post("/{ticket_id}/rca/validate", response_model=TicketResponse)
+def validate_rca(ticket_id: UUID, payload: TicketRcaReview, request: Request,
+                 db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    """Lead/superuser sign-off on a filed RCA. Four-eyes: a lead can't validate their
+    own filing (a superuser can — someone has to break ties on one-person teams)."""
+    from app.utils.support_desk.rca import rca_effective_status
+    from app.routers.support_desk.incidents import _require_incident_lead
+    t = _get_ticket(db, ticket_id, admin)
+    _require_incident_lead(db, t, admin)
+    if rca_effective_status(t) != "filed":
+        raise HTTPException(409, "Only a FILED root-cause analysis can be validated.")
+    if t.rca_filed_by_id == admin.id and not admin.is_superuser:
+        raise HTTPException(409, "Your own RCA needs a second pair of eyes — another lead or an admin validates it.")
+    note = (payload.note or "").strip() or None
+    t.rca_status = "validated"
+    t.rca_reviewed_at = sla_util.now_utc()
+    t.rca_reviewed_by_id = admin.id
+    t.rca_review_note = note
+    _log_activity(db, t, admin, "rca_validated", {"note": note})
+    if t.rca_filed_by_id and t.rca_filed_by_id != admin.id:
+        dispatch_safe(db, EVT_RCA_VALIDATED, t.rca_filed_by_id, t,
+                      title=f"Your root-cause analysis was validated — {t.ticket_number}",
+                      action_url=f"{_panel_base(db, t.rca_filed_by_id)}/incidents/rca?lens=validated")
+    write_audit(db, entity_type="ticket", op="rca_validated", entity_id=t.id,
+                actor_id=admin.id, request=request, details={"note": note})
+    db.commit(); db.refresh(t)
+    return TicketResponse.model_validate(enrich_ticket(db, t))
+
+
+@router.post("/{ticket_id}/rca/return", response_model=TicketResponse)
+def return_rca(ticket_id: UUID, payload: TicketRcaReview, request: Request,
+               db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    """Send a filed RCA back with a mandatory note — the filing survives (content
+    preserved, status 'returned') and re-filing puts it back in the review lane."""
+    from app.utils.support_desk.rca import rca_effective_status
+    from app.routers.support_desk.incidents import _require_incident_lead
+    t = _get_ticket(db, ticket_id, admin)
+    _require_incident_lead(db, t, admin)
+    if rca_effective_status(t) != "filed":
+        raise HTTPException(409, "Only a FILED root-cause analysis can be returned.")
+    note = (payload.note or "").strip()
+    if len(note) < 3:
+        raise HTTPException(422, "A returned RCA must say what to fix — add a note.")
+    t.rca_status = "returned"
+    t.rca_reviewed_at = sla_util.now_utc()
+    t.rca_reviewed_by_id = admin.id
+    t.rca_review_note = note
+    _log_activity(db, t, admin, "rca_returned", {"note": note})
+    if t.rca_filed_by_id and t.rca_filed_by_id != admin.id:
+        dispatch_safe(db, EVT_RCA_RETURNED, t.rca_filed_by_id, t,
+                      title=f"Root-cause analysis returned — {t.ticket_number}: {note[:80]}",
+                      action_url=f"{_panel_base(db, t.rca_filed_by_id)}/incidents/rca?lens=returned")
+    write_audit(db, entity_type="ticket", op="rca_returned", entity_id=t.id,
+                actor_id=admin.id, request=request, details={"note": note})
     db.commit(); db.refresh(t)
     return TicketResponse.model_validate(enrich_ticket(db, t))
 
@@ -1633,11 +1769,23 @@ def set_rca(ticket_id: UUID, payload: TicketRca, request: Request, db: Session =
 def major_incident(ticket_id: UUID, payload: TicketMajorIncident, request: Request, db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
     t = _get_ticket(db, ticket_id, admin)
     _require_ticket_actor(db, t, admin, "change its major-incident state")
+    declaring = payload.is_major_incident and not t.is_major_incident
+    # Declaring FRESH major status is a team-lead/superuser call (ServiceNow MI-manager
+    # parity) — regular responders make the case through the MI-candidate flow instead.
+    # Stand-down and impact-field edits on an already-major incident stay owner-tier.
+    if declaring:
+        from app.routers.support_desk.incidents import _require_incident_lead
+        try:
+            _require_incident_lead(db, t, admin)
+        except HTTPException:
+            raise HTTPException(403, "Declaring a major incident is a team-lead/admin call — "
+                                     "propose it via the MI-candidate flow instead "
+                                     "(POST /tickets/{id}/mi-proposal).")
     # A major incident is an ACTIVE-disruption op (war room, desk-wide visibility). You can't
     # DECLARE one on a resolved/closed ticket — there's nothing live to coordinate. Reopen it
     # first if the issue recurred; use RCA for the historical record. (Editing an already-major
     # incident's impact fields post-resolution stays allowed for the post-incident review.)
-    if payload.is_major_incident and not t.is_major_incident and t.status in TERMINAL_TICKET_STATUSES:
+    if declaring and t.status in TERMINAL_TICKET_STATUSES:
         raise HTTPException(409, "Reopen this resolved/closed ticket before declaring a major incident — there's no active disruption to escalate.")
     t.is_major_incident = payload.is_major_incident
     for k in ("business_impact", "affected_users", "revenue_impact", "war_room_url"):
@@ -1649,12 +1797,43 @@ def major_incident(ticket_id: UUID, payload: TicketMajorIncident, request: Reque
     if payload.is_major_incident and payload.update_interval_minutes:
         t.update_interval_minutes = payload.update_interval_minutes
         t.next_update_due_at = sla_util.now_utc() + timedelta(minutes=payload.update_interval_minutes)
-    _log_activity(db, t, admin, "major_incident", {"on": payload.is_major_incident, "impact": payload.business_impact,
-                                                   "cadence_min": payload.update_interval_minutes})
+    detail = {"on": payload.is_major_incident, "impact": payload.business_impact,
+              "cadence_min": payload.update_interval_minutes}
+    # War-room auto-link: open (or reuse) an L2 swarm and stamp war_room_url with its
+    # deep link IF still blank — runs AFTER the payload-field loop so an explicit URL
+    # always wins. Declare must never fail on this convenience.
+    if declaring and payload.open_war_room:
+        try:
+            from app.routers.support_desk.l2_ops import _active_swarm
+            from app.models.support_desk.collab import SdSwarmSession
+            if _active_swarm(db, t.id) is None:
+                db.add(SdSwarmSession(ticket_id=t.id, started_by_id=admin.id,
+                                      participant_ids=[str(admin.id)]))
+                _log_activity(db, t, admin, "swarm_started",
+                              {"auto": True, "via": "major_incident"})
+            if not t.war_room_url:
+                t.war_room_url = f"/user/support/queues/l2?ticket={t.id}"
+            detail["war_room"] = True
+        except Exception:
+            pass
+    # A direct declare consumes any pending MI-candidate proposal (the call was made).
+    if declaring and t.mi_proposed_at is not None:
+        detail["consumed_proposal_by"] = str(t.mi_proposed_by_id) if t.mi_proposed_by_id else None
+        t.mi_proposed_at = None
+        t.mi_proposed_by_id = None
+        t.mi_proposal_note = None
+    _log_activity(db, t, admin, "major_incident", detail)
     if payload.is_major_incident and t.assigned_agent_id:
         dispatch_safe(db, EVT_TICKET_ESCALATED, t.assigned_agent_id, t,
                       title=f"MAJOR INCIDENT — {t.subject}",
                       action_url=f"{_panel_base(db, t.assigned_agent_id)}/tickets/critical?ticket={t.id}")
+    # Incident-specific declared signal, layered on top of the escalation ping (which is
+    # kept for back-compat): commander + assignee hear it; the webhook uplink mirrors it.
+    if declaring:
+        for uid in {t.incident_commander_id, t.assigned_agent_id} - {None, admin.id}:
+            dispatch_safe(db, EVT_INCIDENT_DECLARED, uid, t,
+                          title=f"Major incident declared — {t.ticket_number}",
+                          action_url="/user/support/incidents/major")
     write_audit(db, entity_type="ticket", op="major_incident", entity_id=t.id, actor_id=admin.id, request=request, details={"on": payload.is_major_incident})
     db.commit(); db.refresh(t)
     return TicketResponse.model_validate(enrich_ticket(db, t))
@@ -1737,9 +1916,19 @@ def post_status_update(ticket_id: UUID, payload: TicketStatusUpdate, request: Re
     _require_ticket_actor(db, t, admin, "post a stakeholder update")
     if t.status in TERMINAL_TICKET_STATUSES:
         raise HTTPException(409, "This ticket is resolved/closed — post a reopen or RCA instead.")
+    if t.merged_into_id:
+        raise HTTPException(409, "This ticket was merged — post updates on the surviving ticket.")
     body = (payload.body or "").strip()
     if not body:
         raise HTTPException(422, "A status update needs a body.")
+    note = (payload.note or "").strip() or None
+    prev_interval = t.update_interval_minutes
+    # Stand-down drop-gate: an ARMED cadence is a promise to stakeholders — silencing it
+    # must carry a reason the comms log can show. Stopping a cadence that was never armed
+    # is a no-op and stays free.
+    if payload.stop_cadence and prev_interval and not note:
+        raise HTTPException(422, "Standing down an armed update cadence needs a short reason "
+                                 "note — stakeholders were promised the next update.")
     db.add(SdTicketComment(
         ticket_id=t.id, author_user_id=admin.id, author_name=_actor_name(admin),
         author_kind=CommentAuthorKind.STAFF.value, body=body,
@@ -1765,15 +1954,59 @@ def post_status_update(ticket_id: UUID, payload: TicketStatusUpdate, request: Re
         if iv:
             t.update_interval_minutes = iv
             t.next_update_due_at = nowt + timedelta(minutes=iv)
-    _log_activity(db, t, admin, "status_update", {
+    detail = {
         "internal": payload.is_internal, "chars": len(body),
         "interval_min": t.update_interval_minutes,
         "next_due": t.next_update_due_at.isoformat() if t.next_update_due_at else None,
         "stopped": payload.stop_cadence,
-    })
+        # the comms-log rail reads this — a timeline of updates without their text is blind
+        "preview": body[:160],
+    }
+    if payload.phase:
+        detail["phase"] = payload.phase
+    if note:
+        detail["note"] = note
+    if prev_interval != t.update_interval_minutes:
+        detail["prev_interval_min"] = prev_interval
+    if payload.audience:
+        detail["audience"] = payload.audience
+    # Stakeholder broadcast: fan the update to the ticket's watchers (notify-only
+    # subscribers) + the incident roster BEFORE logging, so the comms-log row carries
+    # the fan-out count. The requester was already pinged by the public-reply branch;
+    # notify_ticket_watchers excludes actor + repeats.
+    if payload.audience == "stakeholder":
+        from app.utils.support_desk.watchers import notify_ticket_watchers
+        already = {t.raised_by_user_id} if not payload.is_internal else set()
+        pinged = notify_ticket_watchers(
+            db, t, EVT_INCIDENT_STATUS_UPDATE,
+            title=f"Status update on {t.ticket_number}: {body[:80]}",
+            actor_id=admin.id, exclude_ids=[x for x in already if x],
+            action_url="/user/support/incidents/major")
+        roster = {t.incident_commander_id, t.comms_lead_id, t.ops_lead_id,
+                  t.assigned_agent_id} - {None, admin.id} - already
+        for uid in roster:
+            dispatch_safe(db, EVT_INCIDENT_STATUS_UPDATE, uid, t,
+                          title=f"Status update on {t.ticket_number}: {body[:80]}",
+                          action_url="/user/support/incidents/major")
+        detail["broadcast_watchers"] = pinged
+        detail["broadcast_roster"] = len(roster)
+    _log_activity(db, t, admin, "status_update", detail)
+    # Standing down (or retiming) a promised cadence is command-relevant — the commander
+    # hears about it the moment it lands, not at the next sync.
+    cadence_changed = (payload.stop_cadence and prev_interval) or \
+        (prev_interval is not None and prev_interval != t.update_interval_minutes)
+    if (cadence_changed and t.incident_commander_id
+            and str(t.incident_commander_id) != str(admin.id)):
+        what = ("stood down" if payload.stop_cadence
+                else f"retimed to every {t.update_interval_minutes} min")
+        dispatch_safe(db, EVT_INCIDENT_CADENCE, t.incident_commander_id, t,
+                      title=f"Update cadence {what} on {t.ticket_number}",
+                      action_url="/user/support/incidents/major")
     write_audit(db, entity_type="ticket", op="status_update", entity_id=t.id,
                 actor_id=admin.id, request=request,
-                details={"internal": payload.is_internal, "stopped": payload.stop_cadence})
+                details={"internal": payload.is_internal, "stopped": payload.stop_cadence,
+                         **({"phase": payload.phase} if payload.phase else {}),
+                         **({"note": note} if note else {})})
     db.commit(); db.refresh(t)
     return TicketResponse.model_validate(enrich_ticket(db, t))
 
@@ -2160,6 +2393,11 @@ def resolve_ticket(ticket_id: UUID, payload: TicketResolve, request: Request,
     # resolved→closed step, and it was assigned to be resolved in the first place.)
     if t.status not in TERMINAL_TICKET_STATUSES and not t.assigned_agent_id:
         raise HTTPException(409, "Assign an owner before resolving — nobody is working this ticket.")
+    # RCA close gate (breached ∪ MI ∪ critical): CLOSING demands a live RCA on file.
+    # Resolve stays free — the fix isn't blocked mid-shift, only the final seal.
+    if payload.close:
+        from app.utils.support_desk.rca import require_rca_before_close
+        require_rca_before_close(t, payload.resolution_code)
     _apply_resolution(db, t, admin, resolution_code=payload.resolution_code,
                       resolution_category=payload.resolution_category,
                       resolution_summary=payload.resolution_summary,
@@ -2615,8 +2853,16 @@ def bulk_action(
                     changed = True
 
             elif action in ("resolve", "close"):
+                # Bulk RCA close gate: per-item SKIP (the batch survives) — mirrors the
+                # single-close 422 for breached/SEV1-2 records with no live RCA.
+                rca_block = None
+                if action == "close":
+                    from app.utils.support_desk.rca import rca_close_block_reason
+                    rca_block = rca_close_block_reason(t, payload.resolution_code)
                 if terminal:
                     skip_reason = "Already resolved/closed."
+                elif rca_block:
+                    skip_reason = rca_block
                 elif not t.assigned_agent_id:
                     skip_reason = "Assign an owner before resolving — nobody is working this ticket."
                 else:

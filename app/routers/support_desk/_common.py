@@ -421,6 +421,17 @@ def apply_reopen(db: Session, t: SdTicket, actor_id, actor_name, *,
         t.resolution_due_at = new_due
     t.sla_paused_since = None   # terminal states are never paused; belt-and-braces
     sla_util.recompute_breach_flags(t, nowt)
+    # 4b. RCA goes STALE on reopen (RCA v2): the fix's root-cause story predates the
+    # failure that just reopened the record — mark it stale (text + the old ruling
+    # stamps survive for history; re-filing puts it back through review). Legacy rows
+    # (summary, NULL status) count too — they READ as 'filed' and must also stale.
+    if (t.rca_summary or "").strip() and getattr(t, "rca_status", None) != "stale":
+        prev_rca = t.rca_status or "filed"
+        t.rca_status = "stale"
+        db.add(SdTicketActivity(
+            ticket_id=t.id, actor_user_id=None, actor_name="System",
+            action="rca_invalidated",
+            detail={"auto": True, "prev_status": prev_rca, "cycle": t.reopened_count}))
     # 5. the single 'reopened' activity row. "from" = the terminal status being left
     # (the caller flips t.status AFTER this runs) — it powers the Closed desk's
     # "exhumed from closed" permanence metric, so keep it on every reopen path.

@@ -121,8 +121,13 @@ if tid:
     check("status-update re-arms", s == 200 and j.get("next_update_due_at") and j.get("next_update_due_at") != first_due
           and j.get("update_interval_minutes") == 60, f"(status {s})")
 
+    # Standing down an ARMED cadence now requires a reason note (drop-gate, 2026-07-14).
     s, j = req("POST", f"/support-desk/tickets/{tid}/status-update", su_tok,
                {"body": "probe: standing down", "is_internal": True, "stop_cadence": True})
+    check("stop_cadence w/o note -> 422 (drop-gate)", s == 422, f"(status {s})")
+    s, j = req("POST", f"/support-desk/tickets/{tid}/status-update", su_tok,
+               {"body": "probe: standing down", "is_internal": True, "stop_cadence": True,
+                "note": "probe: war-room regression stand-down"})
     check("status-update stop_cadence", s == 200 and j.get("next_update_due_at") is None, f"(status {s})")
 
     s, j = req("POST", f"/support-desk/tickets/{tid}/presence", su_tok)

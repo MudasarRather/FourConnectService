@@ -31,7 +31,12 @@ import urllib.request
 from app.models.support_desk.ops import SdSetting
 from app.models.support_desk.constants import (
     EVT_TICKET_CREATED, EVT_TICKET_ASSIGNED, EVT_TICKET_ESCALATED,
-    EVT_TICKET_RESOLVED, EVT_TICKET_SLA_BREACH,
+    EVT_TICKET_RESOLVED, EVT_TICKET_SLA_BREACH, EVT_PIR_PUBLISHED,
+    EVT_INCIDENT_ROLES_ASSIGNED, EVT_INCIDENT_DECISION, EVT_INCIDENT_IMPACT,
+    EVT_INCIDENT_CADENCE, EVT_INCIDENT_DECLARED, EVT_INCIDENT_MI_PROPOSED,
+    EVT_INCIDENT_STATUS_UPDATE, EVT_PIR_SUBMITTED, EVT_PIR_APPROVED,
+    EVT_PIR_REJECTED, EVT_INCIDENT_SEV_CHANGED,
+    EVT_RCA_FILED, EVT_RCA_VALIDATED,
 )
 
 # Which panel switch gates which event's per-user delivery.
@@ -39,10 +44,24 @@ _GATED = {
     EVT_TICKET_ASSIGNED: "assign_email",
     EVT_TICKET_SLA_BREACH: "breach_warning",
 }
-# Lifecycle events mirrored to the external uplink when a URL is wired.
+# Lifecycle events mirrored to the external uplink when a URL is wired. Live
+# incident-command events ride the same wire — an outage bridge (Slack webhook)
+# hears declares, roster changes, decisions, impact stamps, cadence changes and
+# stakeholder broadcasts, plus the PIR review trail. post_webhook's 30s
+# (event, ticket) dedupe collapses multi-recipient fan-outs to one post.
 WEBHOOK_EVENTS = {
     EVT_TICKET_CREATED, EVT_TICKET_ASSIGNED, EVT_TICKET_ESCALATED,
-    EVT_TICKET_RESOLVED, EVT_TICKET_SLA_BREACH,
+    EVT_TICKET_RESOLVED, EVT_TICKET_SLA_BREACH, EVT_PIR_PUBLISHED,
+    EVT_INCIDENT_ROLES_ASSIGNED, EVT_INCIDENT_DECISION, EVT_INCIDENT_IMPACT,
+    EVT_INCIDENT_CADENCE, EVT_INCIDENT_DECLARED, EVT_INCIDENT_MI_PROPOSED,
+    EVT_INCIDENT_STATUS_UPDATE, EVT_PIR_SUBMITTED, EVT_PIR_APPROVED,
+    EVT_PIR_REJECTED,
+    # Severity reclassification is command-relevant — the bridge hears it. The sibling
+    # EVT_INCIDENT_TASK_ASSIGNED is a personal ping and deliberately NOT mirrored here.
+    EVT_INCIDENT_SEV_CHANGED,
+    # RCA governance beats ride the uplink; EVT_RCA_RETURNED is a personal
+    # "your filing came back" ping and deliberately NOT mirrored (same precedent).
+    EVT_RCA_FILED, EVT_RCA_VALIDATED,
 }
 
 _DEFAULTS = {"assign_email": True, "breach_warning": True, "webhook_url": ""}

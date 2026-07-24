@@ -930,8 +930,9 @@ def list_my_tickets(
         query = query.filter(SdTicket.sla_response_breached == True,    # noqa: E712
                              SdTicket.sla_resolution_breached == True)  # noqa: E712
     if missing_rca:
-        query = query.filter(or_(SdTicket.breach_reason.is_(None), SdTicket.breach_reason == ""),
-                             or_(SdTicket.rca_summary.is_(None), SdTicket.rca_summary == ""))
+        # RCA v2 single truth: returned/stale filings correctly count as missing.
+        from app.utils.support_desk.rca import rca_missing_legacy_cond
+        query = query.filter(rca_missing_legacy_cond())
     if active_only:
         query = query.filter(SdTicket.status.notin_(list(TERMINAL_TICKET_STATUSES)))
     # Reopened-desk refinements (mirror the agent list so both panels paginate correctly).
@@ -1073,9 +1074,12 @@ def reports_overview(db: Session = Depends(get_db), user: User = Depends(get_cur
     if not reports:
         return {"is_manager": False, "generated_at": now, "reports": [],
                 "totals": {"reports": 0, "open": 0, "breached": 0, "critical": 0,
-                           "due_soon": 0, "aging": 0, "resolved_today": 0}}
+                           "critical_unacked": 0, "major_incidents": 0, "due_soon": 0,
+                           "aging": 0, "resolved_today": 0, "rca_owed": 0, "pir_owed": 0}}
 
     is_active = SdTicket.status.notin_(terminal)
+    from app.utils.support_desk.rca import rca_owed_cond
+    from app.utils.support_desk.incidents import pir_owed_cond
 
     def _sum(cond):
         return func.sum(case((cond, 1), else_=0))
@@ -1087,6 +1091,11 @@ def reports_overview(db: Session = Depends(get_db), user: User = Depends(get_cur
                                  SdTicket.sla_response_breached == True))).label("breached"),  # noqa: E712
         _sum(and_(is_active, or_(SdTicket.priority == "critical",
                                  SdTicket.is_major_incident == True))).label("critical"),  # noqa: E712
+        # critical/MI with nobody's eyes on it yet — the one actionable manager signal
+        _sum(and_(is_active, or_(SdTicket.priority == "critical",
+                                 SdTicket.is_major_incident == True),  # noqa: E712
+                  SdTicket.acknowledged_at.is_(None))).label("critical_unacked"),
+        _sum(and_(is_active, SdTicket.is_major_incident == True)).label("major_incidents"),  # noqa: E712
         _sum(and_(is_active, SdTicket.sla_resolution_breached == False,  # noqa: E712
                   SdTicket.resolution_due_at.isnot(None),
                   SdTicket.resolution_due_at <= soon,
@@ -1094,6 +1103,12 @@ def reports_overview(db: Session = Depends(get_db), user: User = Depends(get_cur
         _sum(and_(is_active, SdTicket.created_at < d7)).label("aging"),
         _sum(and_(SdTicket.status == TicketStatus.RESOLVED.value,
                   SdTicket.resolved_at >= sod)).label("resolved_today"),
+        # RCA v2: terminal breached/SEV1-2 records in the 30d window still owing a
+        # root-cause analysis — the manager's review-debt signal (rca.py single truth).
+        _sum(rca_owed_cond(now)).label("rca_owed"),
+        # PIR v2: terminal SEV1/2 incidents (90d) still owing a post-incident review
+        # (incidents.pir_owed_cond single truth — same predicate as the PIR board).
+        _sum(pir_owed_cond(now)).label("pir_owed"),
     ).filter(SdTicket.is_deleted == False,  # noqa: E712
              SdTicket.merged_into_id.is_(None),
              SdTicket.assigned_agent_id.in_(reports))
@@ -1104,7 +1119,8 @@ def reports_overview(db: Session = Depends(get_db), user: User = Depends(get_cur
     statuses = _statuses_of(db, reports)
     out_reports = []
     tot = {"reports": len(reports), "open": 0, "breached": 0, "critical": 0,
-           "due_soon": 0, "aging": 0, "resolved_today": 0}
+           "critical_unacked": 0, "major_incidents": 0, "due_soon": 0, "aging": 0,
+           "resolved_today": 0, "rca_owed": 0, "pir_owed": 0}
     for uid in reports:
         r = by_uid.get(str(uid))
         entry = {
@@ -1113,11 +1129,16 @@ def reports_overview(db: Session = Depends(get_db), user: User = Depends(get_cur
             "open": int(getattr(r, "open", 0) or 0),
             "breached": int(getattr(r, "breached", 0) or 0),
             "critical": int(getattr(r, "critical", 0) or 0),
+            "critical_unacked": int(getattr(r, "critical_unacked", 0) or 0),
+            "major_incidents": int(getattr(r, "major_incidents", 0) or 0),
             "due_soon": int(getattr(r, "due_soon", 0) or 0),
             "aging": int(getattr(r, "aging", 0) or 0),
             "resolved_today": int(getattr(r, "resolved_today", 0) or 0),
+            "rca_owed": int(getattr(r, "rca_owed", 0) or 0),
+            "pir_owed": int(getattr(r, "pir_owed", 0) or 0),
         }
-        for k in ("open", "breached", "critical", "due_soon", "aging", "resolved_today"):
+        for k in ("open", "breached", "critical", "critical_unacked", "major_incidents",
+                  "due_soon", "aging", "resolved_today", "rca_owed", "pir_owed"):
             tot[k] += entry[k]
         out_reports.append(entry)
     out_reports.sort(key=lambda e: (-e["breached"], -e["critical"], -e["open"], e["name"].lower()))
@@ -1330,10 +1351,11 @@ def critical_stats(mine: bool = Query(False), db: Session = Depends(get_db), use
     out.ack_coverage = (int(round(100 * (out.active_critical - out.unacked) / out.active_critical))
                         if out.active_critical else 100)
     # PIR gap — terminal criticals from the last 30 days with no root-cause record.
+    from app.utils.support_desk.rca import rca_absent_cond
     out.missing_rca = base.filter(SdTicket.status.in_(terminal),
                                   SdTicket.merged_into_id.is_(None),
                                   SdTicket.resolved_at.isnot(None), SdTicket.resolved_at >= d30,
-                                  or_(SdTicket.rca_summary.is_(None), SdTicket.rca_summary == "")).count()
+                                  rca_absent_cond()).count()
     # Business-impact composition of the active board.
     out.by_business_impact = {(bi or "unset"): int(c or 0) for bi, c in
                               active.with_entities(SdTicket.business_impact, func.count(SdTicket.id))
@@ -1566,10 +1588,10 @@ def breached_stats(mine: bool = Query(False), db: Session = Depends(get_db), use
                .with_entities(func.avg(func.extract("epoch",
                               SdTicket.resolved_at - SdTicket.resolution_due_at))).scalar())
     out.avg_repair_overrun_minutes = round(float(overrun) / 60.0, 1) if overrun is not None else None
-    # RCA discipline — every breach owes a root cause.
-    out.missing_rca = base.filter(
-        or_(SdTicket.breach_reason.is_(None), SdTicket.breach_reason == ""),
-        or_(SdTicket.rca_summary.is_(None), SdTicket.rca_summary == "")).count()
+    # RCA discipline — every breach owes a root cause (v2 single truth: returned/
+    # stale filings correctly read as missing).
+    from app.utils.support_desk.rca import rca_missing_legacy_cond
+    out.missing_rca = base.filter(rca_missing_legacy_cond()).count()
     total_base = base.count()
     out.rca_coverage = (int(round(100 * (total_base - out.missing_rca) / total_base))
                         if total_base else 100)
@@ -2990,7 +3012,7 @@ def distribute_team_queue(
 # never a per-day/per-desk fan-out. All literal paths here sit BEFORE /{ticket_id}.
 
 _CAL_DUE_KINDS = ("resolution_due", "response_due", "escalation_ack", "cadence_due",
-                  "hold_resume", "vendor_due", "auto_close")
+                  "hold_resume", "vendor_due", "auto_close", "pir_review")
 _CAL_HISTORY_KINDS = ("created", "resolved", "closed")
 _CAL_ALL_KINDS = set(_CAL_DUE_KINDS) | set(_CAL_HISTORY_KINDS) | {"reminder"}
 _CAL_DEFAULT_KINDS = set(_CAL_DUE_KINDS) | {"reminder"}
@@ -3133,6 +3155,37 @@ def _cal_collect(db: Session, user: User, *, from_dt, to_dt, kinds: set, mine: b
             at = _cal_aware(t.closed_at)
             if in_range(at):
                 emit(t, "closed", at, False)
+
+    # PIR review meetings — sealed like every ticket kind (the PIR rides its incident's
+    # team seal). Overdue = a meeting clock in the past on a still-unapproved report.
+    if "pir_review" in kinds:
+        from app.models.support_desk.incident import SdIncidentReport
+        pq = (db.query(SdIncidentReport, SdTicket)
+              .join(SdTicket, SdTicket.id == SdIncidentReport.ticket_id)
+              .filter(SdIncidentReport.is_deleted == False,  # noqa: E712
+                      SdTicket.is_deleted == False,  # noqa: E712
+                      SdIncidentReport.review_meeting_at.isnot(None),
+                      SdIncidentReport.review_meeting_at >= from_dt,
+                      SdIncidentReport.review_meeting_at <= to_dt))
+        if seal is not None:
+            pq = pq.filter(seal)
+        if team_id and (is_su or team_id in set(ctx["team_ids"])):
+            pq = pq.filter(SdTicket.team_id == team_id)
+        if priority and priority in _PRIORITIES:
+            pq = pq.filter(SdTicket.priority == priority)
+        if status_f and status_f in {s.value for s in TicketStatus}:
+            pq = pq.filter(SdTicket.status == status_f)
+        for p_, t_ in pq.order_by(SdIncidentReport.review_meeting_at.asc()).limit(500).all():
+            at = _cal_aware(p_.review_meeting_at)
+            events.append(CalendarEvent(
+                id=p_.id, ticket_id=t_.id, ticket_number=t_.ticket_number,
+                subject=f"PIR review — {p_.title}"[:300],
+                priority=t_.priority, status=t_.status, kind="pir_review", at=at,
+                is_breached=bool(at < now and p_.status in ("draft", "in_review")),
+                note=p_.report_number,
+                assigned_agent_id=t_.assigned_agent_id, team_id=t_.team_id,
+                is_major_incident=bool(getattr(t_, "is_major_incident", False)),
+            ))
 
     # Reminders are OWNER-PRIVATE — always scoped to the caller, never the team seal.
     if "reminder" in kinds:
@@ -3287,6 +3340,7 @@ _ICS_KIND_LABEL = {
     "escalation_ack": "Escalation ACK due", "cadence_due": "Status update due",
     "hold_resume": "Hold auto-resumes", "vendor_due": "Vendor reply due",
     "auto_close": "Auto-closes", "reminder": "Reminder",
+    "pir_review": "PIR review meeting",
     "created": "Opened", "resolved": "Resolved", "closed": "Closed",
 }
 
@@ -4064,6 +4118,11 @@ def resolve_my_ticket(
         raise HTTPException(409, "Assign an owner before resolving — nobody is working this ticket.")
     if t.status in TERMINAL_TICKET_STATUSES and not payload.close:
         raise HTTPException(409, "Ticket is already resolved or closed.")
+    # RCA close gate (breached ∪ MI ∪ critical): the final seal demands a live RCA.
+    # Resolve stays free — mirrors the agent-router resolve gate exactly.
+    if payload.close:
+        from app.utils.support_desk.rca import require_rca_before_close
+        require_rca_before_close(t, payload.resolution_code)
     nowt = sla_util.now_utc()
     if t.first_responded_at is None:
         t.first_responded_at = nowt

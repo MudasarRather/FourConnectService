@@ -37,7 +37,7 @@ from app.models.support_desk.collab import SdTicketWorklog, SdTicketWatcher, SdS
 from app.models.support_desk.constants import TicketStatus, CommentAuthorKind, EVT_TICKET_ASSIGNED
 from app.schemas.support_desk.l2 import (
     WorklogCreate, WorklogResponse, WorklogListResponse,
-    WatcherEntry, WatchersResponse, WatchToggleResponse,
+    WatcherEntry, WatchersResponse, WatchToggleResponse, WatcherAdd,
     SwarmStartRequest, SwarmEndRequest, SwarmParticipant, SwarmResponse, SwarmStateResponse,
 )
 from app.utils.dependencies import get_support_agent
@@ -195,6 +195,58 @@ def unwatch_ticket(ticket_id: UUID, db: Session = Depends(get_db),
     (db.query(SdTicketWatcher)
      .filter(SdTicketWatcher.ticket_id == t.id, SdTicketWatcher.user_id == admin.id)
      .delete(synchronize_session=False))
+    db.commit()
+    total = db.query(func.count(SdTicketWatcher.id)).filter(SdTicketWatcher.ticket_id == t.id).scalar() or 0
+    return WatchToggleResponse(watching=False, total=int(total))
+
+
+@l2_router.post("/{ticket_id}/watchers", response_model=WatchToggleResponse)
+def add_watcher(ticket_id: UUID, payload: WatcherAdd, request: Request,
+                db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    """Subscribe ANOTHER user as a stakeholder (incident comms hub) — owner-tier only;
+    self-service follow stays on POST /watch. Idempotent: an existing subscription
+    returns the current state. Watching a resolved ticket is allowed (reopen news);
+    merged tombstones refuse."""
+    from app.routers.support_desk.tickets import _get_ticket, _require_ticket_actor, _log_activity
+    t = _get_ticket(db, ticket_id, admin)
+    _require_ticket_actor(db, t, admin, "subscribe a stakeholder to it")
+    if t.merged_into_id:
+        raise HTTPException(409, "This ticket was merged — subscribe on the surviving ticket instead.")
+    u = db.query(User).filter(User.id == payload.user_id, User.is_active == True).first()  # noqa: E712
+    if not u:
+        raise HTTPException(400, "Stakeholder user not found or inactive")
+    exists = (db.query(SdTicketWatcher)
+              .filter(SdTicketWatcher.ticket_id == t.id,
+                      SdTicketWatcher.user_id == payload.user_id).first())
+    if not exists:
+        db.add(SdTicketWatcher(ticket_id=t.id, user_id=payload.user_id))
+        _log_activity(db, t, admin, "watcher_added",
+                      {"user": u.full_name or str(payload.user_id)})
+        write_audit(db, entity_type="ticket", op="watcher_added", entity_id=t.id,
+                    actor_id=admin.id, request=request, details={"user_id": str(payload.user_id)})
+        db.commit()
+    total = db.query(func.count(SdTicketWatcher.id)).filter(SdTicketWatcher.ticket_id == t.id).scalar() or 0
+    return WatchToggleResponse(watching=True, total=int(total))
+
+
+@l2_router.delete("/{ticket_id}/watchers/{user_id}", response_model=WatchToggleResponse)
+def remove_watcher(ticket_id: UUID, user_id: UUID, request: Request,
+                   db: Session = Depends(get_db), admin: User = Depends(get_support_agent)):
+    """Unsubscribe a stakeholder. Self-removal is always allowed (parity with
+    DELETE /watch); removing SOMEONE ELSE is owner-tier. Idempotent."""
+    from app.routers.support_desk.tickets import _get_ticket, _require_ticket_actor, _log_activity
+    t = _get_ticket(db, ticket_id, admin)
+    if str(user_id) != str(admin.id):
+        _require_ticket_actor(db, t, admin, "manage its stakeholder subscriptions")
+    removed = (db.query(SdTicketWatcher)
+               .filter(SdTicketWatcher.ticket_id == t.id, SdTicketWatcher.user_id == user_id)
+               .delete(synchronize_session=False))
+    if removed:
+        names = _names_of(db, [user_id])
+        _log_activity(db, t, admin, "watcher_removed",
+                      {"user": names.get(str(user_id), str(user_id))})
+        write_audit(db, entity_type="ticket", op="watcher_removed", entity_id=t.id,
+                    actor_id=admin.id, request=request, details={"user_id": str(user_id)})
     db.commit()
     total = db.query(func.count(SdTicketWatcher.id)).filter(SdTicketWatcher.ticket_id == t.id).scalar() or 0
     return WatchToggleResponse(watching=False, total=int(total))

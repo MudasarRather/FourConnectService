@@ -52,6 +52,7 @@ from app.schemas.support_desk.ops import ConfigLedgerEntry, ConfigLedgerResponse
 from app.utils.dependencies import get_current_superuser, get_support_agent
 from app.utils.support_desk import sla as sla_util
 from app.utils.support_desk.audit import write_audit
+from app.utils.support_desk.rca import rca_missing_legacy_cond as _rca_missing
 from app.utils.support_desk.rules import find_tier_queue, apply_tier_move, sweep_time_based_rules
 from app.utils.support_desk.team_ops import team_ops_conds, team_on_shift
 
@@ -1095,10 +1096,9 @@ def tier_board(
         # ── L3 workbench telemetry (additive; mirror any new key in the no_queues dict above) ──
         # Live major incidents on this tier.
         "mi_active": active.filter(SdTicket.is_major_incident == True).count(),  # noqa: E712
-        # Breached tier tickets with NO root-cause record at all — the RCA debt.
-        "missing_rca": active.filter(conds["breach"],
-                                     or_(SdTicket.breach_reason.is_(None), SdTicket.breach_reason == ""),
-                                     or_(SdTicket.rca_summary.is_(None), SdTicket.rca_summary == "")).count(),
+        # Breached tier tickets with NO root-cause record at all — the RCA debt
+        # (v2 single truth: returned/stale filings correctly read as missing).
+        "missing_rca": active.filter(conds["breach"], _rca_missing()).count(),
         # Tier tickets whose linked change request is actually moving (approved →
         # implemented) — the "permanent fix in flight" lens.
         "fix_in_progress": int(db.query(func.count(SdTicket.id))

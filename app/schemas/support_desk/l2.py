@@ -65,6 +65,12 @@ class WatchToggleResponse(BaseModel):
     total: int
 
 
+class WatcherAdd(BaseModel):
+    """Subscribe ANOTHER user as a stakeholder (comms-hub verb — owner-tier only;
+    /watch stays the self-service path)."""
+    user_id: UUID
+
+
 # ─────────────────────────────── Swarm ───────────────────────────────
 class SwarmStartRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=2000)

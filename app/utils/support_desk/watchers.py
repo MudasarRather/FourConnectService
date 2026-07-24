@@ -15,9 +15,12 @@ from sqlalchemy.orm import Session
 
 
 def notify_ticket_watchers(db: Session, ticket, event: str, title: str, *,
-                           actor_id=None, exclude_ids=None) -> int:
+                           actor_id=None, exclude_ids=None,
+                           action_url: str | None = None) -> int:
     """Ping every watcher of ``ticket`` except the actor + ``exclude_ids``.
-    Returns how many notifications were queued. Never raises."""
+    ``action_url`` overrides the default my-tickets deep link (the incident
+    broadcast lands people on the Major desk instead). Returns how many
+    notifications were queued. Never raises."""
     try:
         from app.models.support_desk.collab import SdTicketWatcher
         from app.utils.hr.notify import dispatch
@@ -25,6 +28,8 @@ def notify_ticket_watchers(db: Session, ticket, event: str, title: str, *,
         skip = {str(x) for x in (exclude_ids or []) if x}
         if actor_id:
             skip.add(str(actor_id))
+        base = action_url or "/user/support/tickets/my"
+        deep = f"{base}{'&' if '?' in base else '?'}ticket={ticket.id}"
         rows = (db.query(SdTicketWatcher.user_id)
                 .filter(SdTicketWatcher.ticket_id == ticket.id).all())
         sent = 0
@@ -34,7 +39,7 @@ def notify_ticket_watchers(db: Session, ticket, event: str, title: str, *,
             dispatch(db, event, uid,
                      context={"title": title,
                               "message": f"{ticket.ticket_number}: {ticket.subject}",
-                              "action_url": f"/user/support/tickets/my?ticket={ticket.id}"},
+                              "action_url": deep},
                      audience="SUPPORT")
             sent += 1
         return sent

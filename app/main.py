@@ -122,6 +122,62 @@ def startup_db():
     except Exception:
         import traceback as _tb
         _tb.print_exc()
+    # Support Desk ("Fault Grid" / "Command Funnel" Incident desks): MI command-roster
+    # (commander/comms/ops leads) + impact-detail columns (affected_services, started/
+    # detected clocks, compliance/security/public flags) + commander index.
+    # Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_incident_columns
+        ensure_ticket_incident_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk (Major Incident desks): MI-candidate proposal stamps
+    # (mi_proposed_at/by/note) for the propose → confirm/decline workflow.
+    # Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_mi_proposal_columns
+        ensure_ticket_mi_proposal_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk (Critical desks): response-playbook / incident-task table
+    # (support_incident_tasks — ORM create with checkfirst). Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_incident_tasks_table
+        ensure_incident_tasks_table(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk (Incident Timeline desks): milestone-pin columns on the activity
+    # stream (is_milestone/pinned_by_id/pinned_at) + action btree + pinned partial
+    # index. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_timeline_milestone_columns
+        ensure_timeline_milestone_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk (RCA desks): structured RCA + review-workflow columns
+    # (rca_status machine, category, five-whys/factors JSONB, filed/reviewed stamps,
+    # cascade provenance) + status/filed_at indexes + legacy-row backfill.
+    # Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_ticket_rca_v2_columns
+        ensure_ticket_rca_v2_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
+    # Support Desk (Post-Incident desks): PIR v2 parity-pack columns on
+    # support_incident_reports (frozen metrics snapshot, retro registers, participants,
+    # review-meeting fields, revisions trail, distribution receipt) + stable-aid
+    # backfill on the action registers. Idempotent + guarded.
+    try:
+        from app.utils.support_desk.migrate import ensure_pir_v2_columns
+        ensure_pir_v2_columns(engine)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc()
     # Start the certification-expiry monitor + compliance auto-reassign engine on a
     # daily-ish cadence. Both run on their own NullPool engine, are idempotent, and
     # are fully guarded so they can never block boot or contend with StaticPool.

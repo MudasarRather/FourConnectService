@@ -78,6 +78,11 @@ class ProblemCascadeRequest(BaseModel):
     resolution_category: Optional[str] = None  # RootCauseCategory value
     root_cause: Optional[str] = None         # stamped onto the problem record
     mark_problem_resolved: bool = True
+    # RCA v2: stamp the problem's root cause into each cascade-resolved ticket's RCA
+    # (as 'filed', provenance-marked) so known-cause resolutions never land in the
+    # owed lens. Only fills EMPTY/stale RCA slots — a live human filing always wins.
+    propagate_rca: bool = True
+    root_cause_category: Optional[str] = None  # RootCauseCategory value for the stamp
 
 
 class CascadeTicketResult(BaseModel):
@@ -85,6 +90,7 @@ class CascadeTicketResult(BaseModel):
     ticket_number: Optional[str] = None
     ok: bool
     reason: Optional[str] = None             # skipped-why, when ok=False
+    rca_inherited: bool = False              # RCA v2: this ticket got the problem's RCA
 
 
 class ProblemCascadeResponse(BaseModel):

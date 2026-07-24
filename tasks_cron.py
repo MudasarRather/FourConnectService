@@ -139,6 +139,21 @@ def run_cron():
             db.commit()
         print(f"- Support time-based rules: fired on {tb} ticket(s).")
 
+        # 15c. Support Desk: PIR-missing sweep — nudge the commander/owner of terminal
+        #      MAJOR incidents that aged past PIR_REQUIRED_AFTER_DAYS without a
+        #      post-incident report. 24h-throttled per ticket; the PIR desk list-load
+        #      also runs it opportunistically.
+        from app.utils.support_desk.incidents import sweep_pir_missing
+        pm = sweep_pir_missing(db)
+        print(f"- Support PIR-missing sweep: {pm} nudge(s).")
+
+        # 15d. Support Desk: PIR action-item overdue sweep — chase open corrective/
+        #      preventive actions on approved/published reports whose target_date
+        #      lapsed. One digest nudge per ticket per 24h (owner → commander → assignee).
+        from app.utils.support_desk.incidents import sweep_pir_actions_overdue
+        pa = sweep_pir_actions_overdue(db)
+        print(f"- Support PIR action-overdue sweep: {pa} digest nudge(s).")
+
         # 16. Support Desk: retention sweep — auto-archive CLOSED records older than
         #     SUPPORT_CLOSED_AUTOARCHIVE_DAYS into deep storage (auto_retention; legal-hold
         #     exempt). Runs AFTER the auto-close sweep so a record can close and age out in

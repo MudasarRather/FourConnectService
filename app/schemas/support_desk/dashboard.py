@@ -26,6 +26,9 @@ class SupportDashboardResponse(BaseModel):
     total_tickets: int = 0
     # Suspension Dock — deliberately parked tickets (SLA clock frozen)
     on_hold: int = 0
+    # Live declared major incidents (SEV1) — the main board previously had an MI
+    # blind spot; only /dashboard/intel carried this. Additive with a default.
+    major_incidents: int = 0
     # Averages / satisfaction
     avg_response_mins: Optional[float] = None
     avg_resolution_mins: Optional[float] = None

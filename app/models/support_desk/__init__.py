@@ -26,6 +26,7 @@ from app.models.support_desk.workspace import (
 from app.models.support_desk.collab import (
     SdTicketWorklog, SdTicketWatcher, SdSwarmSession,
 )
+from app.models.support_desk.incident import SdIncidentReport, SdIncidentTask
 
 __all__ = [
     "SdOrganization", "SdCustomer", "SdSlaPackage", "SdContract", "SdCategory",
@@ -36,4 +37,5 @@ __all__ = [
     "SdTeam", "SdTicketViewer", "SdQueue", "SdSkill", "SdAgentStatus", "SdTicketSkip",
     "SdSavedView", "SdTicketTemplate", "SdTemplateFavorite", "SdTemplateUsageEvent",
     "SdTicketWorklog", "SdTicketWatcher", "SdSwarmSession",
+    "SdIncidentReport", "SdIncidentTask",
 ]
